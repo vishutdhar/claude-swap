@@ -22,7 +22,7 @@ from claude_swap.exceptions import (
     TransferError,
 )
 from claude_swap.fsutil import replace_with_retry
-from claude_swap.models import Platform, get_timestamp, normalize_alias
+from claude_swap.models import Platform, alias_key, get_timestamp, normalize_alias
 from claude_swap.oauth import credential_fingerprint
 
 if TYPE_CHECKING:
@@ -367,7 +367,7 @@ def import_accounts(
     # later in the list must not leave earlier accounts half-imported.
     local_data = switcher._get_sequence_data_migrated() or {}
     local_aliases: dict[str, tuple[str, str]] = {
-        (acc.get("alias") or "").lower(): (
+        alias_key(acc.get("alias") or ""): (
             acc.get("email", ""), acc.get("organizationUuid", "") or "",
         )
         for acc in local_data.get("accounts", {}).values()
@@ -407,19 +407,20 @@ def import_accounts(
 
         alias = raw.get("alias") or None
         if alias:
-            alias_key = normalize_alias(alias)  # already validated in pass-1 above
-            if alias_key in seen_aliases:
-                raise TransferError(f"duplicate alias in export: {alias_key}")
-            seen_aliases.add(alias_key)
-            owner = local_aliases.get(alias_key)
+            typed = normalize_alias(alias)  # already validated in pass-1 above
+            folded = alias_key(typed)  # compared without regard to case
+            if folded in seen_aliases:
+                raise TransferError(f"duplicate alias in export: {typed}")
+            seen_aliases.add(folded)
+            owner = local_aliases.get(folded)
             if owner is not None and owner != (email, org_uuid):
                 _eprint(
-                    f"Warning: alias '{alias_key}' for {email} already used by an "
+                    f"Warning: alias '{typed}' for {email} already used by an "
                     "existing account, dropping the imported alias"
                 )
                 alias = None
             else:
-                alias = alias_key
+                alias = typed
 
         normalized.append(
             {
