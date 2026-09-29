@@ -1689,3 +1689,12 @@ def test_launcher_thread_start_failure_does_not_raise_or_wedge():
     launcher.start()
     assert launcher.in_flight is False
     assert launcher.take_error() == "can't start new thread"
+
+
+def test_adapt_snapshot_records_each_accounts_organization():
+    a = _FakeAcct("1", "a@x.com", True, _FakeEntry())
+    a.org_uuid = "org-a"
+    b = _FakeAcct("2", "a@x.com", False, _FakeEntry())
+    b.org_uuid = ""
+    snap = menubar._adapt_snapshot(_FakeSnap([a, b]))
+    assert snap["orgs"] == {"1": "org-a", "2": ""}
