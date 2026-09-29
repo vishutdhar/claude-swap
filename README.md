@@ -219,6 +219,7 @@ The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working
   preserved instead of being overwritten by a slot's older snapshot
 - Account credentials stored securely using platform-appropriate methods
 - Switches (manual and automatic) hold Claude Code's own credential locks while writing, so a swap never interleaves with a token refresh
+- Every change to the account list (add, remove, rename, swap, disable, import) re-reads the list and writes it under one account lock, so the CLI, the menu bar and the auto-switch engine never undo each other's changes; an add or remove that waited at a prompt checks the slot again before touching it
 - Auto-switch freshens a target's token before activating it, and quarantines accounts whose refresh token has died (recover by re-adding it with `cswap add --slot N`, or by replacing its stored credentials from a known-good export — a plain `cswap import backup.cswap` replaces dead-token slots automatically)
 - Usage numbers refresh every few minutes — faster for an account being used or close to switching, slower for idle ones — keeping cswap comfortably inside Anthropic's rate limits however many dashboards you keep open on a machine. An age note like `· 6m ago` just means the next scheduled check hasn't come yet, not that something is stuck.
 

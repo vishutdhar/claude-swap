@@ -1788,6 +1788,19 @@ class TestFreshening:
         assert "sk-2-new" in live_creds_path.read_text()
         assert live_creds_path.read_text() != live_before
 
+    def test_a_candidate_disabled_before_freshening_is_skipped(self, temp_home):
+        # Disabled after the candidates were listed (by the user, or by a
+        # failed add that left the slot unusable): never switched to.
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com", expires_at=int(h.clock() * 1000) + 3_600_000)
+        h.seed(3, "c@example.com", expires_at=int(h.clock() * 1000) + 3_600_000)
+        h.make_live("a@example.com", 1)
+        with patch.object(h.switcher, "is_account_disabled", side_effect=lambda num: str(num) == "2"):
+            outcome = h.tick_with_usage({"1": _usage(95), "2": _usage(10), "3": _usage(20)})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
     def test_fresh_target_is_not_refreshed(self, temp_home):
         h = EngineHarness(temp_home)
         h.seed(1, "a@example.com")

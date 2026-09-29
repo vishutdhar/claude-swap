@@ -1387,22 +1387,25 @@ class CredentialStore:
         never serve them. The best-effort variant remains right for
         post-commit cleanup, where a failure only leaks an unreferenced file.
         """
-        # Best-effort sweep first: same cruft cleanup (legacy alias, .prev,
-        # quiet Keychain) a normal delete performs.
-        self._delete_account_credentials(account_num, email)
-        # Then assure the served key really is gone, propagating failures.
-        # Unconditional unlink: exists() returns False on an inaccessible
-        # directory, which would fail open here — missing is fine
-        # (missing_ok), permission/I/O errors must abort the commit.
+        # The served key first, propagating failures, Keychain before file:
+        # the Keychain can fail for reasons other than "missing" (locked,
+        # denied), and when it does nothing else may be touched, so the slot
+        # keeps its working credential and its history. Unconditional
+        # unlink: exists() returns False on an inaccessible directory, which
+        # would fail open here; missing is fine (missing_ok), permission/I/O
+        # errors must abort the commit.
         try:
-            self._backup_enc_path(account_num, email).unlink(missing_ok=True)
             if self._host.platform == Platform.MACOS:
                 self._kc_delete_backup(account_num, email)
+            self._backup_enc_path(account_num, email).unlink(missing_ok=True)
         except (OSError, *macos_keychain.KEYCHAIN_ERRORS) as e:
             raise CredentialError(
                 f"Could not clear stored credentials for slot {account_num} "
                 f"({email}) — aborting before commit: {e}"
             ) from e
+        # Then the best-effort sweep a normal delete performs (legacy alias,
+        # .prev history), once the served key is known to be gone.
+        self._delete_account_credentials(account_num, email)
         # Final belt: catches any backend view the deletes above missed. The
         # plain reader cannot serve this — it is the exact reader this
         # docstring says "conflates absent with unreadable" — so an

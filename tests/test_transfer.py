@@ -212,6 +212,39 @@ class TestAliasTransfer:
                 )
                 assert "alias" not in seq["accounts"][imported_num]
 
+    def test_import_rechecks_an_alias_taken_after_validation(self, temp_home: Path, capsys):
+        """`cswap alias 9 work` landing between the import's validation and
+        its locked write: the imported alias is dropped, as validation would
+        have dropped it."""
+        dst_home = temp_home.parent / "dst"
+        dst_home.mkdir()
+        src = _linux_switcher(temp_home)
+        _seed_account(src, 1, "alice@example.com", alias="work")
+        out_file = temp_home / "backup.cswap"
+        export_accounts(src, str(out_file))
+
+        with patch("pathlib.Path.home", return_value=dst_home):
+            with patch.dict(os.environ, {"HOME": str(dst_home)}):
+                dst = _linux_switcher(dst_home)
+                _seed_account(dst, 9, "existing@example.com")
+                real_init = dst._init_sequence_file
+
+                def init_then_alias():
+                    real_init()
+                    assert not getattr(dst._roster_state(), "depth", 0)
+                    data = json.loads(dst.sequence_file.read_text())
+                    data["accounts"]["9"]["alias"] = "work"  # another process
+                    dst.sequence_file.write_text(json.dumps(data))
+
+                with patch.object(dst, "_init_sequence_file", side_effect=init_then_alias):
+                    import_accounts(dst, str(out_file))
+
+                seq = dst._get_sequence_data()
+                assert seq["accounts"]["9"]["alias"] == "work"
+                alice = next(a for a in seq["accounts"].values() if a["email"] == "alice@example.com")
+                assert "alias" not in alice
+                assert "alias 'work' for alice@example.com already used" in capsys.readouterr().err
+
     def test_import_reexport_of_same_account_keeps_own_alias(self, temp_home: Path):
         """Re-importing a backup of an account that already carries the same
         alias locally must not be treated as a collision with itself."""

@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
@@ -18,6 +19,7 @@ from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRE
 from claude_swap.exceptions import (
     AccountNotFoundError,
     ConfigError,
+    CredentialError,
     CredentialReadError,
     SessionError,
     SwitchError,
@@ -505,6 +507,1483 @@ class TestAliasCommand:
         self._write(switcher, sample_sequence_data)
 
         assert switcher.list_aliases() == []
+
+
+class TestAliasWritesUnderTheSwitchLock:
+    """An alias change is a read-modify-write of sequence.json, like a switch.
+
+    Both must hold the account lock for the whole of it, or a rename racing
+    the auto-switch engine or the rotate daemon writes back a stale roster:
+    an undone switch, or a lost rename.
+    """
+
+    def _setup(self, data):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, data)
+        return switcher
+
+    @staticmethod
+    def _switch_to_2(switcher):
+        """What a concurrent switch does to the roster, under the same lock."""
+        from claude_swap.locking import FileLock
+
+        with FileLock(switcher.lock_file):
+            data = json.loads(switcher.sequence_file.read_text())
+            data["activeAccountNumber"] = 2
+            switcher._write_json(switcher.sequence_file, data)
+
+    @staticmethod
+    def _change(switcher, kind):
+        if kind == "set":
+            switcher.set_alias("1", "home")
+        else:
+            switcher.unset_alias("1")
+
+    @pytest.mark.parametrize("kind", ["set", "unset"])
+    def test_switch_racing_a_rename_is_not_undone(
+        self, temp_home: Path, sample_sequence_data: dict, kind
+    ):
+        import threading
+
+        sample_sequence_data["accounts"]["1"]["alias"] = "old"
+        switcher = self._setup(sample_sequence_data)
+        racer = threading.Thread(target=self._switch_to_2, args=(switcher,))
+        real_write = switcher._write_json
+
+        def write_with_a_racer(path, data):
+            # Between the rename's read and its write, a switch tries to land.
+            if path == switcher.sequence_file and not racer.is_alive() and racer.ident is None:
+                racer.start()
+                racer.join(timeout=0.5)  # with the lock held it must still be waiting
+            real_write(path, data)
+
+        switcher._write_json = write_with_a_racer
+        self._change(switcher, kind)
+        switcher._write_json = real_write
+        racer.join(timeout=10)
+        assert not racer.is_alive()
+        data = json.loads(switcher.sequence_file.read_text())
+        assert data["activeAccountNumber"] == 2  # the switch survived
+        expected = "home" if kind == "set" else None
+        assert data["accounts"]["1"].get("alias") == expected  # and so did the rename
+
+    @pytest.mark.parametrize("kind", ["set", "unset"])
+    def test_rename_rereads_after_a_switch_that_landed_first(
+        self, temp_home: Path, sample_sequence_data: dict, kind, monkeypatch
+    ):
+        from claude_swap import locking
+
+        sample_sequence_data["accounts"]["1"]["alias"] = "old"
+        switcher = self._setup(sample_sequence_data)
+        real_acquire = locking.FileLock.acquire
+        landed = []
+
+        def acquire(self_lock, *a, **k):
+            # The switch completes after the rename started, just before it
+            # gets the lock: the rename must build on what is on disk now.
+            if not landed:
+                landed.append(1)
+                data = json.loads(switcher.sequence_file.read_text())
+                data["activeAccountNumber"] = 2
+                real_write(switcher.sequence_file, data)
+            return real_acquire(self_lock, *a, **k)
+
+        real_write = switcher._write_json
+        monkeypatch.setattr(locking.FileLock, "acquire", acquire)
+        self._change(switcher, kind)
+        assert landed == [1]  # the rename took the lock
+        data = json.loads(switcher.sequence_file.read_text())
+        assert data["activeAccountNumber"] == 2
+        expected = "home" if kind == "set" else None
+        assert data["accounts"]["1"].get("alias") == expected
+
+    def test_rename_changes_only_the_alias(self, temp_home: Path, sample_sequence_data: dict):
+        switcher = self._setup(sample_sequence_data)
+        switcher._get_sequence_data_migrated()  # the roster migration's own, legitimate fields
+        before = json.loads(switcher.sequence_file.read_text())
+        switcher.set_alias("2", "dev")
+        after = json.loads(switcher.sequence_file.read_text())
+        before["accounts"]["2"]["alias"] = "dev"
+        after.pop("lastUpdated"), before.pop("lastUpdated")
+        assert after == before
+
+
+class TestAliasExpectedEmail:
+    """The menu bar names the account by slot and the email it showed.
+
+    A swap between opening the prompt and submitting it moves that email to
+    another slot; the change must follow the account, not the slot, and be
+    refused when the account is gone.
+    """
+
+    def _setup(self, data):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, data)
+        return switcher
+
+    def _aliases(self, switcher):
+        data = json.loads(switcher.sequence_file.read_text())
+        return {n: a.get("alias") for n, a in data["accounts"].items()}
+
+    def test_set_follows_the_account_after_a_swap(self, temp_home: Path, sample_sequence_data: dict):
+        switcher = self._setup(sample_sequence_data)
+        # The prompt was for slot 1 (account2@...), but a swap moved it to slot 2.
+        num, normalized = switcher.set_alias("1", "home", expected_email="account2@example.com")
+        assert (num, normalized) == ("2", "home")
+        assert self._aliases(switcher) == {"1": None, "2": "home"}
+
+    def test_unset_follows_the_account_after_a_swap(self, temp_home: Path, sample_sequence_data: dict):
+        sample_sequence_data["accounts"]["2"]["alias"] = "old"
+        sample_sequence_data["accounts"]["1"]["alias"] = "keep"
+        switcher = self._setup(sample_sequence_data)
+        assert switcher.unset_alias("1", expected_email="account2@example.com") == "2"
+        assert self._aliases(switcher) == {"1": "keep", "2": None}
+
+    def test_slot_still_holding_the_email_is_used(self, temp_home: Path, sample_sequence_data: dict):
+        switcher = self._setup(sample_sequence_data)
+        assert switcher.set_alias("1", "home", expected_email="account1@example.com")[0] == "1"
+
+    def test_shared_email_uses_the_slot_that_still_holds_it(self, temp_home: Path, sample_sequence_data: dict):
+        # One person in two organizations: the email alone is ambiguous.
+        sample_sequence_data["accounts"]["3"] = dict(
+            sample_sequence_data["accounts"]["1"], uuid="uuid-3", organizationUuid="org-b"
+        )
+        sample_sequence_data["sequence"].append(3)
+        switcher = self._setup(sample_sequence_data)
+        assert switcher.set_alias("3", "work", expected_email="account1@example.com")[0] == "3"
+        assert self._aliases(switcher)["3"] == "work"
+
+    @pytest.mark.parametrize("kind", ["set", "unset"])
+    def test_account_gone_is_refused_and_nothing_changes(
+        self, temp_home: Path, sample_sequence_data: dict, kind
+    ):
+        from claude_swap.exceptions import AccountNotFoundError
+
+        sample_sequence_data["accounts"]["1"]["alias"] = "keep"
+        switcher = self._setup(sample_sequence_data)
+        switcher._get_sequence_data_migrated()  # the migration's own first-run write
+        before = switcher.sequence_file.read_text()
+        with pytest.raises(AccountNotFoundError):
+            if kind == "set":
+                switcher.set_alias("1", "home", expected_email="gone@example.com")
+            else:
+                switcher.unset_alias("1", expected_email="gone@example.com")
+        assert switcher.sequence_file.read_text() == before
+
+    def test_shared_email_moved_away_from_the_slot_is_refused(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        from claude_swap.exceptions import AccountNotFoundError
+
+        for extra in ("3", "4"):
+            sample_sequence_data["accounts"][extra] = dict(
+                sample_sequence_data["accounts"]["2"], uuid=f"uuid-{extra}", email="shared@example.com"
+            )
+        switcher = self._setup(sample_sequence_data)
+        # Slot 1 no longer holds it and two slots do: which one is unknowable.
+        with pytest.raises(AccountNotFoundError):
+            switcher.set_alias("1", "home", expected_email="shared@example.com")
+
+
+class TestRosterWritesGoThroughOnePrimitive:
+    """Every write of sequence.json is a locked read-modify-write.
+
+    ``_write_roster`` is the only writer: it refuses unless this thread holds
+    the account lock and the dict it is given was read under that same hold.
+    A mutation that read before the lock (a remove whose confirmation prompt
+    sat between read and write) would write a stale roster back over a
+    concurrent change.
+    """
+
+    def _setup(self, data):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, data)
+        switcher._get_sequence_data_migrated()
+        return switcher
+
+    def test_no_source_file_writes_the_roster_except_the_primitive(self):
+        import re
+
+        src = Path(__file__).resolve().parents[1] / "src" / "claude_swap"
+        offenders = []
+        for path in sorted(src.glob("*.py")):
+            for n, line in enumerate(path.read_text().splitlines(), 1):
+                if re.search(r"_write_json\(\s*[\w.]*sequence_file", line):
+                    offenders.append(f"{path.name}:{n}: {line.strip()}")
+        assert offenders == [
+            "switcher.py:{}: self._write_json(self.sequence_file, data)".format(
+                next(
+                    n for n, l in enumerate((src / "switcher.py").read_text().splitlines(), 1)
+                    if "self._write_json(self.sequence_file, data)" in l
+                )
+            )
+        ], offenders
+
+    def test_write_outside_the_lock_is_refused(self, temp_home: Path, sample_sequence_data: dict):
+        switcher = self._setup(sample_sequence_data)
+        data = switcher._get_sequence_data()
+        with pytest.raises(RuntimeError, match="account lock"):
+            switcher._write_roster(data)
+
+    def test_write_of_a_roster_read_before_the_lock_is_refused(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = self._setup(sample_sequence_data)
+        stale = switcher._get_sequence_data()
+        with switcher._account_lock():
+            with pytest.raises(RuntimeError, match="read outside"):
+                switcher._write_roster(stale)
+
+    def test_account_lock_is_reentrant_in_one_thread(self, temp_home: Path, sample_sequence_data: dict):
+        switcher = self._setup(sample_sequence_data)
+        with switcher._account_lock():
+            with switcher._account_lock():
+                switcher._mutate_roster(lambda d: d.update(marker=1) or True)
+        assert json.loads(switcher.sequence_file.read_text())["marker"] == 1
+
+    def test_remove_racing_a_rename_does_not_resurrect_the_slot(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch
+    ):
+        switcher = self._setup(sample_sequence_data)
+        monkeypatch.setattr(switcher, "_delete_account_files", lambda *a, **k: None)
+        monkeypatch.setattr(switcher, "_prune_mappings", lambda *a, **k: None)
+        answers = iter(["y"])
+
+        def confirm(_prompt=""):
+            # While remove waits for its confirmation, a rename lands.
+            switcher.set_alias("1", "home")
+            return next(answers)
+
+        monkeypatch.setattr("builtins.input", confirm)
+        switcher.remove_account("2")
+        data = json.loads(switcher.sequence_file.read_text())
+        assert "2" not in data["accounts"] and 2 not in data["sequence"]  # stays removed
+        assert data["accounts"]["1"]["alias"] == "home"  # and the rename survived
+
+    def test_rename_racing_a_remove_does_not_resurrect_the_slot(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch
+    ):
+        switcher = self._setup(sample_sequence_data)
+        monkeypatch.setattr(switcher, "_delete_account_files", lambda *a, **k: None)
+        monkeypatch.setattr(switcher, "_prune_mappings", lambda *a, **k: None)
+        real_in_use = switcher._alias_in_use
+
+        def remove_lands(alias, **kw):
+            # Between the rename's read and its write, a remove of slot 2 tries to land.
+            import threading
+            t = threading.Thread(target=switcher.remove_account, args=("2",), kwargs={"assume_yes": True})
+            t.start()
+            t.join(timeout=0.5)
+            remove_lands.thread = t
+            return real_in_use(alias, **kw)
+
+        monkeypatch.setattr(switcher, "_alias_in_use", remove_lands)
+        switcher.set_alias("1", "home")
+        remove_lands.thread.join(timeout=10)
+        data = json.loads(switcher.sequence_file.read_text())
+        assert "2" not in data["accounts"] and 2 not in data["sequence"]
+        assert data["accounts"]["1"]["alias"] == "home"
+
+    def test_remove_refuses_when_a_swap_moved_another_account_into_the_slot(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch
+    ):
+        from claude_swap.exceptions import ConfigError
+
+        switcher = self._setup(sample_sequence_data)
+        deleted = []
+        monkeypatch.setattr(switcher, "_delete_account_files", lambda *a, **k: deleted.append(a))
+        monkeypatch.setattr(switcher, "_prune_mappings", lambda *a, **k: None)
+
+        def confirm(_prompt=""):
+            # While the prompt for account2@ in slot 2 is open, a swap lands.
+            def swap(d):
+                d["accounts"]["1"], d["accounts"]["2"] = d["accounts"]["2"], d["accounts"]["1"]
+                return True
+            switcher._mutate_roster(swap)
+            return "y"
+
+        monkeypatch.setattr("builtins.input", confirm)
+        with pytest.raises(ConfigError, match="changed while waiting"):
+            switcher.remove_account("2")
+        data = json.loads(switcher.sequence_file.read_text())
+        assert set(data["accounts"]) == {"1", "2"} and deleted == []  # nobody removed
+
+    def test_rename_racing_an_add_keeps_both(self, temp_home: Path, sample_sequence_data: dict, monkeypatch):
+        switcher = self._setup(sample_sequence_data)
+        real_in_use = switcher._alias_in_use
+
+        def add_lands(alias, **kw):
+            import threading
+
+            def add():
+                def fn(d):
+                    d["accounts"]["3"] = {"email": "new@example.com", "uuid": "u3",
+                                          "organizationUuid": "", "organizationName": "", "added": "x"}
+                    d["sequence"].append(3)
+                    return True
+                switcher._mutate_roster(fn)
+
+            t = threading.Thread(target=add)
+            t.start()
+            t.join(timeout=0.5)
+            add_lands.thread = t
+            return real_in_use(alias, **kw)
+
+        monkeypatch.setattr(switcher, "_alias_in_use", add_lands)
+        switcher.set_alias("1", "home")
+        add_lands.thread.join(timeout=10)
+        data = json.loads(switcher.sequence_file.read_text())
+        assert data["accounts"]["3"]["email"] == "new@example.com"
+        assert data["accounts"]["1"]["alias"] == "home"
+
+
+class TestAliasExpectedIdentity:
+    """The pin is the (email, organization) pair the prompt showed."""
+
+    def _setup(self, data):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, data)
+        return switcher
+
+    def _org(self, data, num, org):
+        data["accounts"][num]["organizationUuid"] = org
+        data["accounts"][num]["organizationName"] = org
+
+    def test_same_email_readded_under_another_org_is_refused(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        from claude_swap.exceptions import AccountNotFoundError
+
+        self._org(sample_sequence_data, "1", "org-b")  # slot 1 now holds the org-B login
+        self._org(sample_sequence_data, "2", "org-x")
+        switcher = self._setup(sample_sequence_data)
+        with pytest.raises(AccountNotFoundError):
+            switcher.set_alias(
+                "1", "home", expected_email="account1@example.com", expected_org="org-a"
+            )
+
+    def test_original_replaced_and_a_surviving_same_email_other_org_is_refused(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        from claude_swap.exceptions import AccountNotFoundError
+
+        # The prompt showed slot 1 = account1@ in org-a. It was removed; slot 3
+        # holds account1@ in org-b. Following by email alone would pick slot 3.
+        self._org(sample_sequence_data, "2", "org-x")
+        sample_sequence_data["accounts"]["3"] = dict(
+            sample_sequence_data["accounts"]["1"], uuid="uuid-3",
+            organizationUuid="org-b", organizationName="org-b",
+        )
+        del sample_sequence_data["accounts"]["1"]
+        sample_sequence_data["sequence"] = [2, 3]
+        switcher = self._setup(sample_sequence_data)
+        with pytest.raises(AccountNotFoundError):
+            switcher.set_alias("1", "home", expected_email="account1@example.com", expected_org="org-a")
+
+    def test_follows_the_same_pair_after_a_swap(self, temp_home: Path, sample_sequence_data: dict):
+        self._org(sample_sequence_data, "1", "org-x")
+        self._org(sample_sequence_data, "2", "org-a")
+        switcher = self._setup(sample_sequence_data)
+        num, _ = switcher.set_alias("1", "home", expected_email="account2@example.com", expected_org="org-a")
+        assert num == "2"
+
+
+class TestWriteJsonTempFiles:
+    def test_each_write_uses_its_own_temp_file(self, temp_home: Path, monkeypatch):
+        # Two writers in one process must not share a temp path (a PID-named
+        # temp is the same for every thread of the menu bar).
+        from claude_swap import switcher as sw
+
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        sources = []
+        real_replace = sw.replace_with_retry  # Windows-aware: retries a scanner's brief lock
+        monkeypatch.setattr(sw, "replace_with_retry", lambda src, dst: sources.append(src) or real_replace(src, dst))
+        s._write_json(s.sequence_file, {"a": 1})
+        s._write_json(s.sequence_file, {"a": 2})
+        assert len(sources) == 2 and sources[0] != sources[1]
+        assert all(Path(p).parent == s.sequence_file.parent for p in sources)
+        assert not any(str(os.getpid()) + ".tmp" in str(p) for p in sources)
+        assert json.loads(s.sequence_file.read_text()) == {"a": 2}
+        assert sorted(p.name for p in s.sequence_file.parent.iterdir() if p.name.endswith(".tmp")) == []
+
+    def test_invalid_json_leaves_no_temp_file(self, temp_home: Path, monkeypatch):
+        from claude_swap import switcher as sw
+        from claude_swap.exceptions import ConfigError
+
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        monkeypatch.setattr(sw.json, "loads", lambda *_a, **_k: (_ for _ in ()).throw(json.JSONDecodeError("x", "", 0)))
+        with pytest.raises(ConfigError):
+            s._write_json(s.sequence_file, {"a": 1})
+        assert [p for p in s.sequence_file.parent.iterdir() if p.name.endswith(".tmp")] == []
+
+    @pytest.mark.parametrize("step", ["write", "chmod", "replace"])
+    def test_a_failed_step_leaves_no_temp_file(self, temp_home: Path, monkeypatch, step):
+        import errno
+        from claude_swap import switcher as sw
+
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, {"a": 1})
+        full = OSError(errno.ENOSPC, "No space left on device")
+
+        def boom(*_a, **_k):
+            raise full
+
+        if step == "write":
+            real_fdopen = sw.os.fdopen
+
+            def fdopen(fd, *a, **k):
+                fh = real_fdopen(fd, *a, **k)
+                fh.write = boom
+                return fh
+
+            monkeypatch.setattr(sw.os, "fdopen", fdopen)
+        elif step == "chmod":
+            if sys.platform == "win32":
+                pytest.skip("no chmod step on Windows")
+            monkeypatch.setattr(sw.os, "chmod", boom)
+        else:
+            from claude_swap import fsutil
+
+            monkeypatch.setattr(fsutil.os, "replace", boom)  # under replace_with_retry
+        with pytest.raises(OSError) as raised:
+            s._write_json(s.sequence_file, {"a": 2})
+        assert raised.value is full
+        assert [p.name for p in s.sequence_file.parent.iterdir() if p.name.endswith(".tmp")] == []
+        assert json.loads(s.sequence_file.read_text()) == {"a": 1}
+
+
+class TestAddRevalidatesUnderTheLock:
+    """An add decides its slot, overwrite and alias before taking the account
+    lock (it prompts, and reads the login). Every such decision is checked
+    again under the lock, against the roster as it is then."""
+
+    CREDS = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
+
+    def _login(self, temp_home: Path, email: str) -> None:
+        (temp_home / ".claude.json").write_text(json.dumps({"oauthAccount": {
+            "emailAddress": email, "accountUuid": "uuid-" + email,
+            "organizationUuid": "", "organizationName": "",
+        }}))
+
+    def _switcher(self, temp_home: Path, login: str, accounts: dict) -> ClaudeAccountSwitcher:
+        """``accounts`` maps slot to ``(email, alias or None)``, all personal."""
+        self._login(temp_home, login)
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        data = {"activeAccountNumber": None, "lastUpdated": "t", "sequence": [], "accounts": {}}
+        for num, (email, alias) in accounts.items():
+            record = {"email": email, "uuid": "uuid-" + email, "organizationUuid": "",
+                      "organizationName": "", "added": "t"}
+            if alias:
+                record["alias"] = alias
+            data["accounts"][num] = record
+            data["sequence"].append(int(num))
+        data["sequence"].sort()
+        s.sequence_file.write_text(json.dumps(data))
+        return s
+
+    @staticmethod
+    def _elsewhere(s: ClaudeAccountSwitcher, change) -> None:
+        """Another cswap process edits the roster (this thread holds no lock)."""
+        assert not getattr(s._roster_state(), "depth", 0)
+        data = json.loads(s.sequence_file.read_text())
+        change(data)
+        s.sequence_file.write_text(json.dumps(data))
+
+    @staticmethod
+    def _rename(num: str, alias: str | None):
+        def change(data):
+            if alias is None:
+                data["accounts"][num].pop("alias", None)
+            else:
+                data["accounts"][num]["alias"] = alias
+        return change
+
+    @staticmethod
+    def _swap(a: str, b: str):
+        def change(data):
+            acc = data["accounts"]
+            acc[a], acc[b] = acc[b], acc[a]
+        return change
+
+    @staticmethod
+    def _remove(num: str):
+        def change(data):
+            del data["accounts"][num]
+            data["sequence"].remove(int(num))
+        return change
+
+    def _hook_capture(self, s: ClaudeAccountSwitcher, before):
+        """Run ``before`` once as the add reads the login's credential: after
+        its slot and alias decisions, before it takes the lock."""
+        real = s._read_capture_credentials
+        fired = []
+
+        def hooked(*a, **k):
+            if not fired:
+                fired.append(1)
+                before()
+            return real(*a, **k)
+
+        return patch.object(s, "_read_capture_credentials", side_effect=hooked)
+
+    def _active(self, s):
+        return patch.object(s, "_read_active_credentials",
+                            return_value=ActiveCredentials(self.CREDS, False))
+
+    def _accounts(self, s):
+        data = json.loads(s.sequence_file.read_text())
+        return {n: (a["email"], a.get("alias")) for n, a in data["accounts"].items()}
+
+    # -- add_account --------------------------------------------------------
+
+    def test_readd_to_own_slot_keeps_a_rename_that_landed_meanwhile(self, temp_home: Path):
+        s = self._switcher(temp_home, "a@example.com", {"3": ("a@example.com", "old")})
+        with self._active(s), self._hook_capture(s, lambda: self._elsewhere(s, self._rename("3", "new"))):
+            s.add_account(slot=3)
+        assert self._accounts(s) == {"3": ("a@example.com", "new")}
+
+    def test_readd_to_own_slot_keeps_an_alias_cleared_meanwhile(self, temp_home: Path):
+        s = self._switcher(temp_home, "a@example.com", {"3": ("a@example.com", "old")})
+        with self._active(s), self._hook_capture(s, lambda: self._elsewhere(s, self._rename("3", None))):
+            s.add_account(slot=3)
+        assert self._accounts(s) == {"3": ("a@example.com", None)}
+
+    def test_move_carries_the_alias_as_it_is_under_the_lock(self, temp_home: Path):
+        s = self._switcher(temp_home, "a@example.com", {"1": ("a@example.com", "old")})
+        with self._active(s), self._hook_capture(s, lambda: self._elsewhere(s, self._rename("1", "new"))):
+            s.add_account(slot=5)
+        assert self._accounts(s) == {"5": ("a@example.com", "new")}
+
+    def test_an_alias_passed_to_the_add_still_wins(self, temp_home: Path):
+        s = self._switcher(temp_home, "a@example.com", {"3": ("a@example.com", "old")})
+        with self._active(s), self._hook_capture(s, lambda: self._elsewhere(s, self._rename("3", "new"))):
+            s.add_account(slot=3, alias="mine")
+        assert self._accounts(s) == {"3": ("a@example.com", "mine")}
+
+    @pytest.mark.parametrize("change", ["swap", "remove"])
+    def test_confirmed_overwrite_aborts_when_the_slot_changed(self, temp_home: Path, change):
+        s = self._switcher(temp_home, "b@example.com", {
+            "2": ("c@example.com", "cee"), "3": ("a@example.com", "ay"),
+        })
+        before = self._accounts(s)
+        edit = self._swap("2", "3") if change == "swap" else self._remove("3")
+
+        def confirm(_prompt):
+            self._elsewhere(s, edit)  # lands after the user said yes
+            return "y"
+
+        with self._active(s), patch("builtins.input", side_effect=confirm), \
+                patch.object(s, "_delete_account_credentials_strict") as deleted, \
+                patch.object(s, "_write_account_credentials") as written:
+            with pytest.raises(ConfigError, match="Slot changed, nothing overwritten"):
+                s.add_account(slot=3)
+        deleted.assert_not_called()
+        written.assert_not_called()
+        after = self._accounts(s)
+        if change == "swap":
+            assert after == {"2": before["3"], "3": before["2"]}
+        else:
+            assert after == {"2": before["2"]}
+
+    def test_empty_slot_filled_meanwhile_is_not_overwritten(self, temp_home: Path):
+        s = self._switcher(temp_home, "a@example.com", {})
+
+        def fill(data):
+            data["accounts"]["5"] = {"email": "c@example.com", "uuid": "u", "organizationUuid": "",
+                                     "organizationName": "", "added": "t"}
+            data["sequence"].append(5)
+
+        with self._active(s), self._hook_capture(s, lambda: self._elsewhere(s, fill)), \
+                patch.object(s, "_write_account_credentials") as written:
+            with pytest.raises(ConfigError, match="Slot changed, nothing overwritten"):
+                s.add_account(slot=5)
+        written.assert_not_called()
+        assert self._accounts(s) == {"5": ("c@example.com", None)}
+
+    def test_auto_slot_taken_meanwhile_picks_the_next_free_one(self, temp_home: Path):
+        s = self._switcher(temp_home, "a@example.com", {"1": ("c@example.com", None)})
+
+        def fill(data):
+            data["accounts"]["2"] = {"email": "d@example.com", "uuid": "u", "organizationUuid": "",
+                                     "organizationName": "", "added": "t"}
+            data["sequence"].append(2)
+
+        with self._active(s), self._hook_capture(s, lambda: self._elsewhere(s, fill)):
+            s.add_account()
+        assert self._accounts(s) == {
+            "1": ("c@example.com", None), "2": ("d@example.com", None), "3": ("a@example.com", None),
+        }
+
+    def test_token_add_to_a_slot_filled_meanwhile_writes_nothing(self, temp_home: Path):
+        s = self._switcher(temp_home, "x@example.com", {})
+
+        def fill(data):
+            data["accounts"]["5"] = {"email": "c@example.com", "uuid": "u", "organizationUuid": "",
+                                     "organizationName": "", "added": "t"}
+            data["sequence"].append(5)
+
+        with self._hook_token(s, lambda: self._elsewhere(s, fill)), \
+                patch.object(s, "_write_account_credentials") as written:
+            with pytest.raises(ConfigError, match="Slot changed, nothing overwritten"):
+                s.add_account_from_token("tok-1", email="t@example.com", slot=5)
+        written.assert_not_called()
+        assert self._accounts(s) == {"5": ("c@example.com", None)}
+
+    def test_alias_taken_meanwhile_is_refused_before_anything_is_dropped(self, temp_home: Path):
+        s = self._switcher(temp_home, "b@example.com", {
+            "1": ("c@example.com", None), "3": ("a@example.com", None),
+        })
+        with self._active(s), self._hook_capture(s, lambda: self._elsewhere(s, self._rename("1", "mine"))), \
+                patch.object(s, "_delete_account_credentials_strict") as deleted:
+            with pytest.raises(ValidationError, match="already used by account 1"):
+                s.add_account(slot=3, assume_yes=True, alias="mine")
+        deleted.assert_not_called()
+        assert self._accounts(s) == {"1": ("c@example.com", "mine"), "3": ("a@example.com", None)}
+
+    def test_live_session_on_the_displaced_slot_drops_nothing(self, temp_home: Path):
+        s = self._switcher(temp_home, "b@example.com", {"3": ("a@example.com", "ay")})
+
+        def live(num, email, action):
+            raise SessionError("live")
+
+        with self._active(s), patch.object(s, "_ensure_no_live_session", side_effect=live), \
+                patch.object(s, "_delete_account_credentials_strict") as deleted:
+            with pytest.raises(SessionError):
+                s.add_account(slot=3, assume_yes=True)
+        deleted.assert_not_called()
+        assert self._accounts(s) == {"3": ("a@example.com", "ay")}
+
+    # -- round 5: claim first, then write the credential, in one hold --------
+
+    def _stored(self, s, num, email):
+        return s._read_account_credentials(num, email)
+
+    def test_credential_is_written_under_the_lock_after_the_slot_is_claimed(self, temp_home: Path):
+        s = self._switcher(temp_home, "a@example.com", {})
+        real = s._write_account_credentials
+        seen = []
+
+        def write(num, email, creds):
+            data = json.loads(s.sequence_file.read_text())
+            seen.append((num, bool(getattr(s._roster_state(), "depth", 0)),
+                         data["accounts"].get(num, {}).get("email")))
+            return real(num, email, creds)
+
+        with self._active(s), patch.object(s, "_write_account_credentials", side_effect=write):
+            s.add_account(slot=5)
+        assert seen == [("5", True, "a@example.com")]
+
+    def test_same_email_other_org_loser_leaves_the_winners_credential(self, temp_home: Path):
+        # The loser adds a@ (personal) to slot 5; the winner puts a@ in org-b
+        # there first and stores its credential under the same (5, a@) key.
+        s = self._switcher(temp_home, "a@example.com", {})
+        winner = json.dumps({"claudeAiOauth": {"accessToken": "winner"}})
+
+        def win():
+            def fill(data):
+                data["accounts"]["5"] = {"email": "a@example.com", "uuid": "u", "organizationUuid": "org-b",
+                                         "organizationName": "B", "added": "t"}
+                data["sequence"].append(5)
+            self._elsewhere(s, fill)
+            s._write_account_credentials("5", "a@example.com", winner)
+
+        with self._active(s), self._hook_capture(s, win):
+            with pytest.raises(ConfigError, match="Slot changed, nothing overwritten"):
+                s.add_account(slot=5)
+        assert self._stored(s, "5", "a@example.com") == winner
+
+    def test_credential_write_failure_leaves_no_roster_row(self, temp_home: Path):
+        s = self._switcher(temp_home, "a@example.com", {"1": ("c@example.com", None)})
+        before = s.sequence_file.read_text()
+        with self._active(s), patch.object(s, "_write_account_credentials", side_effect=OSError("disk full")):
+            with pytest.raises(OSError):
+                s.add_account(slot=5)
+        assert json.loads(s.sequence_file.read_text())["accounts"] == json.loads(before)["accounts"]
+
+    def test_credential_write_failure_during_a_move_restores_the_old_slot(self, temp_home: Path):
+        s = self._switcher(temp_home, "a@example.com", {"1": ("a@example.com", "ay")})
+        old = json.dumps({"claudeAiOauth": {"accessToken": "old"}})
+        s._write_account_credentials("1", "a@example.com", old)
+        with self._active(s), patch.object(s, "_write_account_credentials", side_effect=OSError("disk full")):
+            with pytest.raises(OSError):
+                s.add_account(slot=5)
+        assert self._accounts(s) == {"1": ("a@example.com", "ay")}
+        assert self._stored(s, "1", "a@example.com") == old
+
+    def test_refresh_follows_a_swap_during_credential_capture(self, temp_home: Path):
+        # `cswap add` with no slot for an account already managed refreshes
+        # it in place. A swap moved it from slot 1 to slot 2 meanwhile.
+        s = self._switcher(temp_home, "a@example.com", {
+            "1": ("a@example.com", None), "2": ("b@example.com", None),
+        })
+        writes = []
+        with self._active(s), self._hook_capture(s, lambda: self._elsewhere(s, self._swap("1", "2"))), \
+                patch.object(s, "_write_account_credentials",
+                             side_effect=lambda num, email, creds: writes.append((num, email))):
+            s.add_account()
+        data = json.loads(s.sequence_file.read_text())
+        assert writes == [("2", "a@example.com")]
+        assert data["activeAccountNumber"] == 2
+        assert self._accounts(s) == {"1": ("b@example.com", None), "2": ("a@example.com", None)}
+
+    def test_token_refresh_writes_under_the_lock_into_the_slot_it_holds(self, temp_home: Path):
+        # A token refresh (no slot) of t@: its credential write and the slot
+        # it names must come from one lock hold. A swap can land whenever
+        # this thread holds no lock.
+        s = self._switcher(temp_home, "x@example.com", {
+            "1": ("t@example.com", None), "2": ("c@example.com", None),
+        })
+        real = s._write_account_credentials
+        writes = []
+
+        def write(num, email, creds):
+            if not getattr(s._roster_state(), "depth", 0):
+                self._elsewhere(s, self._swap("1", "2"))
+            writes.append(num)
+            return real(num, email, creds)
+
+        with patch.object(s, "_write_account_credentials", side_effect=write):
+            s.add_account_from_token("tok-2", email="t@example.com")
+        holder = [n for n, (e, _a) in self._accounts(s).items() if e == "t@example.com"]
+        assert writes == holder
+
+    def test_token_refresh_follows_a_swap_just_before_the_lock(self, temp_home: Path):
+        s = self._switcher(temp_home, "x@example.com", {
+            "1": ("t@example.com", None), "2": ("c@example.com", None),
+        })
+        writes = []
+        real = s._write_account_credentials
+        with self._hook_token(s, lambda: self._elsewhere(s, self._swap("1", "2"))), \
+                patch.object(s, "_write_account_credentials",
+                             side_effect=lambda n, e, c: writes.append(n) or real(n, e, c)):
+            s.add_account_from_token("tok-2", email="t@example.com")
+        assert writes == ["2"]
+        assert self._accounts(s) == {"1": ("c@example.com", None), "2": ("t@example.com", None)}
+
+    def test_move_refuses_a_live_session_on_the_old_slot_before_writing(self, temp_home: Path):
+        s = self._switcher(temp_home, "a@example.com", {"1": ("a@example.com", "ay")})
+        before = self._accounts(s)
+
+        def live(num, email, action):
+            if num == "1":
+                raise SessionError("live")
+
+        with self._active(s), patch.object(s, "_ensure_no_live_session", side_effect=live), \
+                patch.object(s, "_write_account_credentials") as written:
+            with pytest.raises(SessionError):
+                s.add_account(slot=5)
+        written.assert_not_called()
+        assert self._accounts(s) == before
+
+    def test_move_deletes_the_old_slots_credential(self, temp_home: Path):
+        s = self._switcher(temp_home, "a@example.com", {"1": ("a@example.com", None)})
+        s._write_account_credentials("1", "a@example.com", json.dumps({"claudeAiOauth": {"accessToken": "old"}}))
+        with self._active(s):
+            s.add_account(slot=5)
+        assert not self._stored(s, "1", "a@example.com")
+        assert self._stored(s, "5", "a@example.com") == self.CREDS
+
+    @pytest.mark.parametrize("path", ["login", "token"])
+    def test_refresh_keeps_the_rest_of_the_record(self, temp_home: Path, path):
+        email = "a@example.com" if path == "login" else "t@example.com"
+        s = self._switcher(temp_home, "a@example.com", {"1": (email, None)})
+        self._elsewhere(s, lambda d: d["accounts"]["1"].update(disabled=True, added="2020-01-01"))
+        with self._active(s):
+            if path == "login":
+                s.add_account()
+            else:
+                s.add_account_from_token("tok-2", email=email)
+        record = json.loads(s.sequence_file.read_text())["accounts"]["1"]
+        assert record["disabled"] is True and record["added"] == "2020-01-01"
+
+    def test_api_key_added_meanwhile_under_the_same_email_is_refused(self, temp_home: Path):
+        s = self._switcher(temp_home, "x@example.com", {})
+        real = s._reject_cross_kind_collision
+
+        def check_then_race(email, is_api_key, *a, **k):
+            real(email, is_api_key, *a, **k)
+            if getattr(s._roster_state(), "depth", 0):
+                return  # the check under the lock: nothing can land now
+
+            def add_key(data):
+                data["accounts"]["3"] = {"email": "e@example.com", "uuid": "", "organizationUuid": "",
+                                         "organizationName": "", "added": "t", "kind": "api_key"}
+                data["sequence"].append(3)
+            self._elsewhere(s, add_key)
+
+        with patch.object(s, "_reject_cross_kind_collision", side_effect=check_then_race), \
+                patch.object(s, "_write_account_credentials") as written:
+            with pytest.raises(ValidationError, match="already exists as an API-key account"):
+                s.add_account_from_token("oauth-tok", email="e@example.com", slot=3)
+        written.assert_not_called()
+        assert json.loads(s.sequence_file.read_text())["accounts"]["3"]["kind"] == "api_key"
+
+    # -- round 6: a failed add puts the slot's files back exactly ------------
+
+    CREDS_A = json.dumps({"claudeAiOauth": {"accessToken": "cred-A"}})
+    CONFIG_A = json.dumps({"oauthAccount": {"emailAddress": "a@example.com", "organizationUuid": "org-A"}})
+
+    def _org_a_in_slot_5(self, temp_home: Path, login_org: str):
+        """Slot 5 holds a@ in org-A with its credential and config stored;
+        the login is a@ in ``login_org``. Both org accounts share the
+        (5, a@) backup key."""
+        s = self._switcher(temp_home, "a@example.com", {"5": ("a@example.com", None)})
+        self._elsewhere(s, lambda d: d["accounts"]["5"].update(organizationUuid="org-A", organizationName="A"))
+        (temp_home / ".claude.json").write_text(json.dumps({"oauthAccount": {
+            "emailAddress": "a@example.com", "accountUuid": "uuid-login",
+            "organizationUuid": login_org, "organizationName": login_org,
+        }}))
+        s._write_account_credentials("5", "a@example.com", self.CREDS_A)
+        s._write_account_config("5", "a@example.com", self.CONFIG_A)
+        return s
+
+    def _slot_5(self, s):
+        record = json.loads(s.sequence_file.read_text())["accounts"].get("5")
+        return (
+            record and (record["email"], record.get("organizationUuid")),
+            s._read_account_credentials("5", "a@example.com"),
+            s._read_account_config("5", "a@example.com"),
+        )
+
+    def _chmod_fails_on_the_config(self, monkeypatch):
+        from claude_swap import switcher as sw
+
+        real = sw.os.chmod
+        failed = []
+
+        def chmod(path, mode, *a, **k):
+            # The add's own chmod fails, once; putting the files back works.
+            if Path(path).name.startswith(".claude-config-5-") and not failed:
+                failed.append(path)
+                raise PermissionError(1, "Operation not permitted", str(path))
+            return real(path, mode, *a, **k)
+
+        monkeypatch.setattr(sw.os, "chmod", chmod)
+
+    def test_failure_after_both_writes_restores_the_displaced_account(self, temp_home: Path, monkeypatch):
+        s = self._org_a_in_slot_5(temp_home, "org-B")
+        self._chmod_fails_on_the_config(monkeypatch)
+        with self._active(s):
+            with pytest.raises(PermissionError):
+                s.add_account(slot=5, assume_yes=True)
+        assert self._slot_5(s) == (("a@example.com", "org-A"), self.CREDS_A, self.CONFIG_A)
+
+    def test_failure_before_writing_leaves_the_displaced_files_intact(self, temp_home: Path):
+        s = self._org_a_in_slot_5(temp_home, "org-B")
+        with self._active(s), patch.object(s, "_write_account_credentials", side_effect=OSError("disk full")):
+            with pytest.raises(OSError):
+                s.add_account(slot=5, assume_yes=True)
+        assert self._slot_5(s) == (("a@example.com", "org-A"), self.CREDS_A, self.CONFIG_A)
+
+    def test_failed_refresh_puts_the_accounts_own_files_back(self, temp_home: Path, monkeypatch):
+        s = self._org_a_in_slot_5(temp_home, "org-A")  # the same account, re-added
+        self._chmod_fails_on_the_config(monkeypatch)
+        with self._active(s):
+            with pytest.raises(PermissionError):
+                s.add_account(slot=5)
+        assert self._slot_5(s) == (("a@example.com", "org-A"), self.CREDS_A, self.CONFIG_A)
+
+    def test_an_unreadable_credential_it_would_replace_stops_the_add(self, temp_home: Path):
+        # It could not be put back if the add failed, so nothing is touched.
+        s = self._org_a_in_slot_5(temp_home, "org-B")
+        real = s._read_account_credentials_ex
+
+        def read_ex(num, email):
+            if (num, email) == ("5", "a@example.com"):
+                return "", True
+            return real(num, email)
+
+        with self._active(s), patch.object(s, "_read_account_credentials_ex", side_effect=read_ex), \
+                patch.object(s, "_write_account_credentials") as written:
+            with pytest.raises(CredentialError, match="nothing overwritten"):
+                s.add_account(slot=5, assume_yes=True)
+        written.assert_not_called()
+        assert self._slot_5(s) == (("a@example.com", "org-A"), self.CREDS_A, self.CONFIG_A)
+
+    def test_failure_restores_a_displaced_account_under_another_email(self, temp_home: Path, monkeypatch):
+        s = self._switcher(temp_home, "a@example.com", {"5": ("b@example.com", None)})
+        creds_b = json.dumps({"claudeAiOauth": {"accessToken": "cred-b"}})
+        config_b = json.dumps({"oauthAccount": {"emailAddress": "b@example.com"}})
+        s._write_account_credentials("5", "b@example.com", creds_b)
+        s._write_account_config("5", "b@example.com", config_b)
+        self._chmod_fails_on_the_config(monkeypatch)
+        with self._active(s):
+            with pytest.raises(PermissionError):
+                s.add_account(slot=5, assume_yes=True)
+        assert self._accounts(s) == {"5": ("b@example.com", None)}
+        assert s._read_account_credentials("5", "b@example.com") == creds_b
+        assert s._read_account_config("5", "b@example.com") == config_b
+        assert s._read_account_credentials("5", "a@example.com") == ""
+
+    def test_failed_add_leaves_no_history_of_its_credential(self, temp_home: Path, monkeypatch):
+        # Recovery from .prev must never hand org-A's key the failed add's token.
+        s = self._org_a_in_slot_5(temp_home, "org-B")
+        self._chmod_fails_on_the_config(monkeypatch)
+        with self._active(s):
+            with pytest.raises(PermissionError):
+                s.add_account(slot=5, assume_yes=True)
+        assert s._store._read_previous_backup("5", "a@example.com") != self.CREDS
+
+    # -- round 8: after a failed add, the roster follows what is on disk -----
+
+    def _restore_write_fails(self, s):
+        """The add's credential write works; every later one (the restore) fails."""
+        real = s._store._write_account_credentials
+        calls = []
+
+        def write(num, email, creds):
+            calls.append(creds)
+            if len(calls) > 1:
+                raise KeychainError("security add-generic-password failed (rc=51): locked")
+            return real(num, email, creds)
+
+        return patch.object(s._store, "_write_account_credentials", side_effect=write)
+
+    def _config_write_fails_after_writing(self, s, *, restore_fails=False):
+        """The add's config write lands, then fails (a chmod after the write);
+        with ``restore_fails`` the restore's config write fails before writing."""
+        real = s._write_account_config
+        calls = []
+
+        def write(num, email, config):
+            calls.append(config)
+            if len(calls) == 1:
+                real(num, email, config)
+                raise PermissionError(1, "Operation not permitted")
+            if restore_fails:
+                raise PermissionError(1, "Operation not permitted")
+            return real(num, email, config)
+
+        return patch.object(s, "_write_account_config", side_effect=write)
+
+    def _new_config(self, s):
+        data = json.loads((s.configs_dir / ".claude-config-5-a@example.com.json").read_text())
+        return data["oauthAccount"]["organizationUuid"]
+
+    def test_a_rollback_deletes_what_it_wrote_even_when_the_quiet_delete_does_nothing(self, temp_home: Path):
+        # (a) The slot was empty: the add's files must really go.
+        s = self._switcher(temp_home, "a@example.com", {})
+        with self._active(s), self._config_write_fails_after_writing(s), \
+                patch.object(s._store, "_delete_account_credentials"):  # best effort, silently nothing
+            with pytest.raises(PermissionError):
+                s.add_account(slot=5)
+        assert self._slot_5(s) == (None, "", "")
+
+    def test_files_left_on_the_new_account_keep_the_add(self, temp_home: Path, capsys):
+        # (b) Nothing could be put back: the files are the new account's, so is the row.
+        s = self._org_a_in_slot_5(temp_home, "org-B")
+        with self._active(s), self._restore_write_fails(s), \
+                self._config_write_fails_after_writing(s, restore_fails=True):
+            s.add_account(slot=5, assume_yes=True)
+        row, creds, _config = self._slot_5(s)
+        assert row == ("a@example.com", "org-B") and creds == self.CREDS
+        assert self._new_config(s) == "org-B"
+        assert "committed despite" in capsys.readouterr().out
+
+    def test_an_interrupt_after_the_files_landed_keeps_the_add_and_still_interrupts(self, temp_home: Path):
+        s = self._org_a_in_slot_5(temp_home, "org-B")
+        real = s._write_account_config
+        calls = []
+
+        def write(num, email, config):
+            calls.append(config)
+            if len(calls) == 1:
+                real(num, email, config)
+                raise KeyboardInterrupt
+            raise PermissionError(1, "Operation not permitted")
+
+        with self._active(s), self._restore_write_fails(s), \
+                patch.object(s, "_write_account_config", side_effect=write):
+            with pytest.raises(KeyboardInterrupt):
+                s.add_account(slot=5, assume_yes=True)
+        row, creds, _config = self._slot_5(s)
+        assert row == ("a@example.com", "org-B") and creds == self.CREDS
+
+    def test_mixed_files_are_cleared_with_the_row(self, temp_home: Path):
+        # (c) The credential stayed the new account's, the config went back to
+        # org-A's: neither account can use that slot. Cleared, the row goes.
+        s = self._org_a_in_slot_5(temp_home, "org-B")
+        with self._active(s), self._restore_write_fails(s), self._config_write_fails_after_writing(s):
+            with pytest.raises(ConfigError, match="Slot 5 could not be restored and was cleared; re-add the account"):
+                s.add_account(slot=5, assume_yes=True)
+        assert self._slot_5(s) == (None, "", "")
+
+    def test_a_clear_that_leaves_a_file_disables_instead_of_dropping(self, temp_home: Path):
+        # The clear reported success but the config is still there: the slot
+        # is not clean, so its row stays, disabled.
+        s = self._org_a_in_slot_5(temp_home, "org-B")
+        with self._active(s), self._restore_write_fails(s), self._config_write_fails_after_writing(s), \
+                patch.object(s, "_delete_config_backup"):
+            with pytest.raises(ConfigError, match="could not be restored or cleared"):
+                s.add_account(slot=5, assume_yes=True)
+        record = json.loads(s.sequence_file.read_text())["accounts"]["5"]
+        assert record["disabled"] is True
+
+    def test_mixed_files_that_cannot_be_cleared_disable_the_slot(self, temp_home: Path):
+        from claude_swap.autoswitch import AutoSwitchEngine
+        from claude_swap.settings import AutoSwitchSettings
+
+        s = self._org_a_in_slot_5(temp_home, "org-B")
+        real_strict = s._store.delete_account_credentials_strict
+        strict_calls = []
+
+        def strict(num, email):
+            # The add's own delete of org-A's files works; clearing afterwards does not.
+            strict_calls.append(num)
+            if len(strict_calls) > 1:
+                raise CredentialError("Could not clear stored credentials for slot 5")
+            return real_strict(num, email)
+
+        with self._active(s), self._restore_write_fails(s), self._config_write_fails_after_writing(s), \
+                patch.object(s._store, "delete_account_credentials_strict", side_effect=strict):
+            with pytest.raises(ConfigError) as raised:
+                s.add_account(slot=5, assume_yes=True)
+        message = str(raised.value)
+        assert "could not be restored or cleared" in message and "disabled" in message
+        assert "the new account's credential" in message and "the previous config" in message
+        assert "lost" not in message
+        record = json.loads(s.sequence_file.read_text())["accounts"]["5"]
+        assert record["disabled"] is True and record["note"] == "broken credential state, re-add"
+        engine = AutoSwitchEngine(s, AutoSwitchSettings(), lambda _event: None)
+        assert engine._freshen_target("5", "a@example.com") != "ok"
+
+    def test_failure_on_an_empty_slot_leaves_no_files(self, temp_home: Path, monkeypatch):
+        s = self._switcher(temp_home, "a@example.com", {})
+        self._chmod_fails_on_the_config(monkeypatch)
+        with self._active(s):
+            with pytest.raises(PermissionError):
+                s.add_account(slot=5)
+        assert self._slot_5(s) == (None, "", "")
+        assert not (s.configs_dir / ".claude-config-5-a@example.com.json").exists()
+
+    # -- add_account_from_token ---------------------------------------------
+
+    def _hook_token(self, s: ClaudeAccountSwitcher, before):
+        """Run ``before`` once just before the add takes the account lock:
+        after every decision it makes without it."""
+        real = s._commit_add
+        fired = []
+
+        def hooked(*a, **k):
+            if not fired:
+                fired.append(1)
+                before()
+            return real(*a, **k)
+
+        return patch.object(s, "_commit_add", side_effect=hooked)
+
+    def test_token_readd_to_own_slot_keeps_its_alias(self, temp_home: Path):
+        s = self._switcher(temp_home, "x@example.com", {"3": ("t@example.com", "old")})
+        s.add_account_from_token("tok-1", email="t@example.com", slot=3)
+        assert self._accounts(s) == {"3": ("t@example.com", "old")}
+
+    def test_token_readd_keeps_a_rename_that_landed_meanwhile(self, temp_home: Path):
+        s = self._switcher(temp_home, "x@example.com", {"3": ("t@example.com", "old")})
+        with self._hook_token(s, lambda: self._elsewhere(s, self._rename("3", "new"))):
+            s.add_account_from_token("tok-1", email="t@example.com", slot=3)
+        assert self._accounts(s) == {"3": ("t@example.com", "new")}
+
+    def test_token_move_carries_the_alias(self, temp_home: Path):
+        s = self._switcher(temp_home, "x@example.com", {"1": ("t@example.com", "old")})
+        s.add_account_from_token("tok-1", email="t@example.com", slot=5)
+        assert self._accounts(s) == {"5": ("t@example.com", "old")}
+
+    @pytest.mark.parametrize("change", ["swap", "remove"])
+    def test_token_confirmed_overwrite_aborts_when_the_slot_changed(self, temp_home: Path, change):
+        s = self._switcher(temp_home, "x@example.com", {
+            "2": ("c@example.com", "cee"), "3": ("a@example.com", "ay"),
+        })
+        before = self._accounts(s)
+        edit = self._swap("2", "3") if change == "swap" else self._remove("3")
+
+        def confirm(_prompt):
+            self._elsewhere(s, edit)
+            return "y"
+
+        with patch("builtins.input", side_effect=confirm), \
+                patch.object(s, "_delete_account_credentials_strict") as deleted, \
+                patch.object(s, "_write_account_credentials") as written:
+            with pytest.raises(ConfigError, match="Slot changed, nothing overwritten"):
+                s.add_account_from_token("tok-1", email="t@example.com", slot=3)
+        deleted.assert_not_called()
+        written.assert_not_called()
+        after = self._accounts(s)
+        if change == "swap":
+            assert after == {"2": before["3"], "3": before["2"]}
+        else:
+            assert after == {"2": before["2"]}
+
+
+class TestDisableResolvesUnderTheLock:
+    """disable/enable name an account; the slot it is in is read under the
+    lock, so a swap landing before the lock cannot redirect the change."""
+
+    def _setup(self, data):
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s.sequence_file.write_text(json.dumps(data))
+        return s
+
+    def _swap_after_resolution(self, s):
+        """Another process swaps slots 1 and 2 as soon as this thread has
+        resolved the identifier while not holding the account lock."""
+        real = s.resolve_account
+
+        def resolve(identifier):
+            result = real(identifier)
+            if not getattr(s._roster_state(), "depth", 0):
+                data = json.loads(s.sequence_file.read_text())
+                acc = data["accounts"]
+                acc["1"], acc["2"] = acc["2"], acc["1"]
+                s.sequence_file.write_text(json.dumps(data))
+            return result
+
+        return patch.object(s, "resolve_account", side_effect=resolve)
+
+    @pytest.mark.parametrize("disabled", [True, False])
+    def test_swap_between_resolution_and_lock(
+        self, temp_home: Path, sample_sequence_data: dict, disabled
+    ):
+        if not disabled:
+            sample_sequence_data["accounts"]["1"]["disabled"] = True
+            sample_sequence_data["accounts"]["2"]["disabled"] = True
+        s = self._setup(sample_sequence_data)
+        with self._swap_after_resolution(s):
+            s.set_account_disabled("account1@example.com", disabled)
+        data = json.loads(s.sequence_file.read_text())
+        by_email = {a["email"]: bool(a.get("disabled")) for a in data["accounts"].values()}
+        assert by_email["account1@example.com"] is disabled
+        assert by_email["account2@example.com"] is (not disabled)
+
+
+class TestSlotDeletesStayUnderTheLock:
+    """remove and add's overwrite delete a slot's backups in the same lock
+    hold that re-checks the slot and drops it from the roster: once the lock
+    is released another writer may put a new account on that slot number."""
+
+    def _setup(self, data):
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s.sequence_file.write_text(json.dumps(data))
+        return s
+
+    def _recording_delete(self, s, seen, *, fail=False):
+        """A credential delete noting whether this thread held the account lock."""
+        def delete(num, email):
+            seen.append((num, email, bool(getattr(s._roster_state(), "depth", 0))))
+            if fail:
+                raise KeychainError("security: delete failed")
+
+        return patch.object(s, "_delete_account_credentials_strict", side_effect=delete)
+
+    def test_remove_deletes_credentials_inside_the_lock_hold(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        s = self._setup(sample_sequence_data)
+        seen = []
+        with self._recording_delete(s, seen):
+            s.remove_account("2", assume_yes=True)
+        assert seen == [("2", "account2@example.com", True)]
+        assert sorted(json.loads(s.sequence_file.read_text())["accounts"]) == ["1"]
+
+    def test_remove_keeps_the_slot_when_its_delete_fails(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        s = self._setup(sample_sequence_data)
+        seen = []
+        with self._recording_delete(s, seen, fail=True):
+            with pytest.raises(KeychainError):
+                s.remove_account("2", assume_yes=True)
+        assert sorted(json.loads(s.sequence_file.read_text())["accounts"]) == ["1", "2"]
+
+    def test_remove_refuses_a_live_session_before_dropping_anything(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        s = self._setup(sample_sequence_data)
+        s._get_sequence_data_migrated()  # its one-time write is not the remove's
+        before = s.sequence_file.read_text()
+
+        def live(num, email, action):
+            raise SessionError("live")
+
+        with patch.object(s, "_ensure_no_live_session", side_effect=live), \
+                patch.object(s, "_delete_account_credentials_strict") as deleted:
+            with pytest.raises(SessionError):
+                s.remove_account("2", assume_yes=True)
+        deleted.assert_not_called()
+        assert s.sequence_file.read_text() == before
+
+    def test_remove_rechecks_for_a_live_session_under_the_lock(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        # No session at the prompt; one starts before the user confirms.
+        s = self._setup(sample_sequence_data)
+        s._get_sequence_data_migrated()
+        before = s.sequence_file.read_text()
+        checks = []
+
+        def live(num, email, action):
+            checks.append(num)
+            if len(checks) > 1:
+                raise SessionError("live")
+
+        with patch.object(s, "_ensure_no_live_session", side_effect=live), \
+                patch.object(s, "_delete_account_credentials_strict") as deleted:
+            with pytest.raises(SessionError):
+                s.remove_account("2", assume_yes=True)
+        deleted.assert_not_called()
+        assert s.sequence_file.read_text() == before
+
+
+    # -- remove keeps the slot when its credential cannot be deleted ---------
+
+    def _stored_slot(self, temp_home, sample_sequence_data, platform):
+        s = self._setup(sample_sequence_data)
+        s.platform = platform
+        s._write_account_credentials("2", "account2@example.com", '{"claudeAiOauth": {"accessToken": "t2"}}')
+        return s
+
+    def test_remove_keeps_the_slot_when_the_credential_file_cannot_be_deleted(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        s = self._stored_slot(temp_home, sample_sequence_data, Platform.LINUX)
+        enc = s._store._backup_enc_path("2", "account2@example.com")
+        assert enc.exists()
+        real_unlink = Path.unlink
+
+        def unlink(self_path, *a, **k):
+            if self_path == enc:
+                raise PermissionError(13, "Permission denied", str(enc))
+            return real_unlink(self_path, *a, **k)
+
+        with patch.object(Path, "unlink", unlink):
+            with pytest.raises(ConfigError, match=r"Could not delete credentials for slot 2: .*Permission denied.*; account kept"):
+                s.remove_account("2", assume_yes=True)
+        assert sorted(json.loads(s.sequence_file.read_text())["accounts"]) == ["1", "2"]
+        assert s._read_account_credentials("2", "account2@example.com")
+
+    def test_remove_keeps_the_slot_when_the_keychain_delete_fails(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch
+    ):
+        s = self._stored_slot(temp_home, sample_sequence_data, Platform.MACOS)
+        real_delete = macos_keychain.delete_password
+
+        def delete(service, account):
+            if account.startswith("account-2-"):
+                raise KeychainError("security delete-generic-password failed (rc=51): locked")
+            return real_delete(service, account)
+
+        monkeypatch.setattr(macos_keychain, "delete_password", delete)
+        with pytest.raises(ConfigError, match=r"Could not delete credentials for slot 2: .*rc=51.*; account kept"):
+            s.remove_account("2", assume_yes=True)
+        assert sorted(json.loads(s.sequence_file.read_text())["accounts"]) == ["1", "2"]
+
+    def test_a_locked_keychain_leaves_the_file_and_history_in_place(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch
+    ):
+        s = self._setup(sample_sequence_data)
+        s.platform = Platform.MACOS
+        email = "account2@example.com"
+        s._store._write_backup_enc("2", email, '{"claudeAiOauth": {"accessToken": "t2"}}')
+        prev = s._store._prev_backup_path("2", email)
+        prev.write_text("history")
+        enc = s._store._backup_enc_path("2", email)
+
+        def delete(service, account):
+            raise KeychainError("security delete-generic-password failed (rc=51): locked")
+
+        monkeypatch.setattr(macos_keychain, "delete_password", delete)
+        with pytest.raises(ConfigError, match="account kept"):
+            s.remove_account("2", assume_yes=True)
+        assert enc.exists() and prev.read_text() == "history"
+        assert s._read_account_credentials("2", email)
+        assert sorted(json.loads(s.sequence_file.read_text())["accounts"]) == ["1", "2"]
+
+    def test_remove_of_a_slot_with_no_stored_credential_succeeds(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        s = self._setup(sample_sequence_data)
+        s.remove_account("2", assume_yes=True)  # "not found" is success
+        assert sorted(json.loads(s.sequence_file.read_text())["accounts"]) == ["1"]
+
+    def test_overwrite_deletes_the_displaced_credentials_inside_the_lock_hold(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        s = self._setup(sample_sequence_data)
+        (temp_home / ".claude.json").write_text(json.dumps({"oauthAccount": {
+            "emailAddress": "new@example.com", "accountUuid": "uuid-new",
+            "organizationUuid": "", "organizationName": "",
+        }}))
+        creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
+        seen = []
+        with self._recording_delete(s, seen), \
+                patch.object(s, "_read_active_credentials", return_value=ActiveCredentials(creds, False)):
+            s.add_account(slot=2, assume_yes=True)
+        assert seen == [("2", "account2@example.com", True)]
+
+
+class TestReadersNeverPairARowWithAnotherAccountsCredential:
+    """An add writes the roster row, then the credential under the same
+    (slot, email) key. A reader in between would pair the new row with the
+    old account's credential; readers take the account lock for the read."""
+
+    def _slot_5_org_a(self, temp_home: Path):
+        (temp_home / ".claude.json").write_text(json.dumps({"oauthAccount": {
+            "emailAddress": "x@example.com", "accountUuid": "uuid-x",
+            "organizationUuid": "", "organizationName": "",
+        }}))
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s.sequence_file.write_text(json.dumps({
+            "activeAccountNumber": None, "lastUpdated": "t", "sequence": [5],
+            "accounts": {"5": {"email": "t@example.com", "uuid": "u", "organizationUuid": "org-A",
+                               "organizationName": "A", "added": "t"}},
+        }))
+        s._write_account_credentials("5", "t@example.com", json.dumps({"claudeAiOauth": {"accessToken": "cred-A"}}))
+        s._write_account_config("5", "t@example.com", json.dumps({"oauthAccount": {"emailAddress": "t@example.com"}}))
+        return s
+
+    def _read_during_the_add(self, s, reader):
+        """Run ``reader`` on another thread as the add stores the credential
+        (the roster row already names the new account); returns its result."""
+        real = s._write_account_credentials
+        box = {}
+
+        def write(num, email, creds):
+            if "thread" not in box:
+                box["thread"] = threading.Thread(target=lambda: box.setdefault("result", reader()))
+                box["thread"].start()
+                box["thread"].join(0.3)  # the reader gets its chance inside the window
+            return real(num, email, creds)
+
+        with patch.object(s, "_write_account_credentials", side_effect=write):
+            s.add_account_from_token("cred-B", email="t@example.com", slot=5, assume_yes=True)
+        box["thread"].join(5)
+        return box["result"]
+
+    @staticmethod
+    def _token(creds):
+        return json.loads(creds)["claudeAiOauth"]["accessToken"] if creds else None
+
+    CONSISTENT = {("org-A", "cred-A"), ("", "cred-B")}
+
+    def test_accounts_info_pairs_each_row_with_its_own_credential(self, temp_home: Path):
+        s = self._slot_5_org_a(temp_home)
+
+        def reader():
+            (row,) = [r for r in s._build_accounts_info() if str(r[0]) == "5"]
+            return (row[3], self._token(row[5]))
+
+        assert self._read_during_the_add(s, reader) in self.CONSISTENT
+
+    def test_export_pairs_each_row_with_its_own_credential(self, temp_home: Path):
+        from claude_swap.transfer import export_accounts
+
+        s = self._slot_5_org_a(temp_home)
+        out = temp_home / "out.cswap"
+
+        def reader():
+            export_accounts(s, str(out))
+            (entry,) = json.loads(out.read_text())["accounts"]
+            return (entry["organizationUuid"], entry["credentials"]["claudeAiOauth"]["accessToken"])
+
+        assert self._read_during_the_add(s, reader) in self.CONSISTENT
+
+    def test_export_to_a_stalled_reader_does_not_hold_the_lock(self, temp_home: Path, monkeypatch):
+        from claude_swap.locking import FileLock
+        from claude_swap.transfer import export_accounts
+
+        s = self._slot_5_org_a(temp_home)
+        writing, release = threading.Event(), threading.Event()
+
+        class StalledStdout:
+            def write(self, text):
+                writing.set()
+                release.wait(5)  # a consumer that is not reading
+                return len(text)
+
+            def flush(self):
+                pass
+
+        monkeypatch.setattr(sys, "stdout", StalledStdout())
+        worker = threading.Thread(target=export_accounts, args=(s, "-"))
+        worker.start()
+        try:
+            assert writing.wait(5)
+            probe = FileLock(s.lock_file)
+            free = probe.acquire(timeout=0)
+            if free:
+                probe.release()
+        finally:
+            release.set()
+            worker.join(5)
+        assert free
+
+    def test_export_warnings_to_a_full_stderr_do_not_hold_the_lock(self, temp_home: Path, monkeypatch):
+        from claude_swap.locking import FileLock
+        from claude_swap.transfer import export_accounts
+
+        s = self._slot_5_org_a(temp_home)
+        # Slot 6 has no stored backup: export skips it with a warning on stderr.
+        data = json.loads(s.sequence_file.read_text())
+        data["accounts"]["6"] = {"email": "u@example.com", "uuid": "u6", "organizationUuid": "",
+                                 "organizationName": "", "added": "t"}
+        data["sequence"].append(6)
+        s.sequence_file.write_text(json.dumps(data))
+        writing, release = threading.Event(), threading.Event()
+        written = []
+
+        class FullStderr:
+            def write(self, text):
+                written.append(text)
+                writing.set()
+                release.wait(5)  # a pipe nobody drains
+                return len(text)
+
+            def flush(self):
+                pass
+
+        monkeypatch.setattr(sys, "stderr", FullStderr())
+        worker = threading.Thread(target=export_accounts, args=(s, str(temp_home / "out.cswap")))
+        worker.start()
+        try:
+            assert writing.wait(5)
+            probe = FileLock(s.lock_file)
+            free = probe.acquire(timeout=0)
+            if free:
+                probe.release()
+        finally:
+            release.set()
+            worker.join(5)
+        assert free
+        assert any("Skipping Account-6" in text for text in written)
+
+    def test_export_warnings_are_printed_when_nothing_could_be_exported(self, temp_home: Path, capsys):
+        from claude_swap.transfer import TransferError, export_accounts
+
+        s = self._slot_5_org_a(temp_home)
+        s._delete_account_credentials("5", "t@example.com")
+        with pytest.raises(TransferError, match="no exportable accounts"):
+            export_accounts(s, str(temp_home / "out.cswap"))
+        assert "Skipping Account-5" in capsys.readouterr().err
+
+    def test_the_public_reader_waits_for_the_add(self, temp_home: Path):
+        s = self._slot_5_org_a(temp_home)
+
+        def reader():
+            return self._token(s.read_account_credentials("5", "t@example.com"))
+
+        # The row says t@ in no org from the moment the add writes it; the
+        # reader answers for that row, never with org-A's credential.
+        assert self._read_during_the_add(s, reader) == "cred-B"
 
 
 class TestDirectorySetup:

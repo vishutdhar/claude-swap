@@ -776,7 +776,13 @@ class AutoSwitchEngine:
         trouble — try again next tick) or ``"skip-live-session"``. Only ever
         touches the slot's *backup* store; the active credential belongs to
         Claude Code.
+
+        A slot held out of rotation returns ``"skip-disabled"``.
         """
+        if self.switcher.is_account_disabled(number):
+            # Held out of rotation, by the user or by a failed add that left
+            # the slot's files unusable: never a target, whatever it stores.
+            return "skip-disabled"
         if self.switcher.account_kind_for(number) == "api_key":
             return "ok"  # API keys don't expire/refresh
         if self.switcher.live_session_pids_for(number, email):
@@ -1364,7 +1370,7 @@ class AutoSwitchEngine:
                 ) < _SYSTEMIC_STATUSES.index(systemic):
                     systemic = status
                 continue
-            if status == "skip-live-session":
+            if status in ("skip-live-session", "skip-disabled"):
                 continue
             return self._perform(num, email, trigger, left_snapshot)
 

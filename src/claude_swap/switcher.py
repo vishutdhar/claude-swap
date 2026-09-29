@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import contextlib
 import json
 import logging
 import os
@@ -10,6 +11,7 @@ import re
 import shutil
 import threading
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -19,6 +21,7 @@ from claude_swap import macos_keychain
 from claude_swap.exceptions import (
     AccountNotFoundError,
     ConfigError,
+    CredentialError,
     CredentialReadError,
     LockError,
     SessionError,
@@ -51,7 +54,7 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
     merge_shared_credential_fields,
     shared_credential_fields,
 )
-from claude_swap.fsutil import read_text_with_retry
+from claude_swap.fsutil import read_text_with_retry, replace_with_retry
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
 from claude_swap.models import (
@@ -560,24 +563,42 @@ class ClaudeAccountSwitcher:
         """Write JSON file with validation."""
         content = json.dumps(data, indent=2)
 
-        # Write to temp file first
-        temp_path = path.with_suffix(f".{os.getpid()}.tmp")
-        temp_path.write_text(content, encoding="utf-8")
-
-        # Validate written content
+        # Write to a temp file first. Its name comes from mkstemp: a PID-based
+        # name is shared by every thread in one process (the menu bar writes
+        # from its worker and its main thread), so two writers could publish
+        # each other's half-written file.
+        fd, temp_name = tempfile.mkstemp(
+            dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+        )
+        temp_path = Path(temp_name)
+        # Any failure before the rename (a full disk on the write, the
+        # read-back, the chmod, the rename itself) removes the temp file;
+        # left behind, each failed write would leak one. After the rename the
+        # name is free for another writer's mkstemp, so it is left alone.
+        published = False
         try:
-            json.loads(temp_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            temp_path.unlink()
-            raise ConfigError("Generated invalid JSON")
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(content)
 
-        # Permissions go on the temp file so the rename below is the final,
-        # atomic commit: nothing can fail after the file is published (a
-        # chmod on the final path could raise with the write already live,
-        # making callers roll back around committed metadata).
-        if sys.platform != "win32":
-            os.chmod(temp_path, 0o600)
-        shutil.move(str(temp_path), str(path))
+            # Validate written content
+            try:
+                json.loads(temp_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                raise ConfigError("Generated invalid JSON")
+
+            # Permissions go on the temp file so the rename below is the final,
+            # atomic commit: nothing can fail after the file is published (a
+            # chmod on the final path could raise with the write already live,
+            # making callers roll back around committed metadata).
+            if sys.platform != "win32":
+                os.chmod(temp_path, 0o600)
+            # Same directory, so a rename: atomic, never a copy. Retried past
+            # the brief sharing locks Windows scanners take on a new file.
+            replace_with_retry(temp_path, path)
+            published = True
+        finally:
+            if not published:
+                temp_path.unlink(missing_ok=True)
 
     # -- credential storage (delegates to CredentialStore) ----------------
     #
@@ -884,15 +905,294 @@ class ClaudeAccountSwitcher:
         removes the slot's session profile alongside the backups so a stale
         profile can never outlive its account.
 
+        The credential delete fails closed: a missing item is success, any
+        other Keychain or file failure raises, so no caller drops a slot
+        whose credential is still stored.
+
         Raises:
             SessionError: a live session-mode instance is using this account.
+            CredentialError: the stored credential could not be deleted.
         """
         self._ensure_no_live_session(account_num, email, "the operation")
-        self._delete_account_credentials(account_num, email)
+        self._delete_account_credentials_strict(account_num, email)
         config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
         if config_file.exists():
             config_file.unlink()
         self._delete_session_profile(account_num, email)
+
+    @staticmethod
+    def _record_identity(record: dict | None) -> tuple[str, str] | None:
+        """``(email, organizationUuid)`` of a roster record, None for no record."""
+        if record is None:
+            return None
+        return (record.get("email", ""), record.get("organizationUuid", "") or "")
+
+    def _commit_add(
+        self,
+        account_num: str | None,
+        email: str,
+        org_uuid: str,
+        *,
+        is_api_key: bool,
+        displace: tuple[str, str, str] | None,
+        alias: str | None,
+        record: dict,
+        in_place: bool,
+        credentials: str,
+        config: str,
+        set_active: bool,
+    ) -> tuple[str, str | None, bool]:
+        """Store an added account in one hold of the account lock.
+
+        An add chooses its slot, asks before overwriting, and reads the login
+        before it takes the lock, and another cswap process may change the
+        roster meanwhile. Under the lock this re-reads the roster and:
+
+        - picks the slot again when ``account_num`` is None: the account's
+          own slot if it has one now, else the next free number;
+        - requires the slot to hold what was decided: the ``displace``
+          ``(num, email, org)`` the user agreed to overwrite, else nothing or
+          this same account; otherwise ConfigError "Slot changed, nothing
+          overwritten", with nothing written;
+        - refuses this ``(email, org)`` stored as the other kind (OAuth or
+          API key), and an ``alias`` another slot holds;
+        - writes the roster first, so the slot names this account before its
+          credential is stored under ``(slot, email)``; a slot it moved from
+          and a displaced one are dropped;
+        - reads the credential and config it is about to replace, then
+          deletes the displaced slot's files and stores the credential and
+          config. If any of that fails, ``_settle_failed_add`` puts the
+          files back, reads what is on disk, and makes the roster match;
+        - deletes the files of the slot it moved from last.
+
+        The record is ``record``, or with ``in_place`` the slot's own record
+        when it already holds this account. Its alias is ``alias``, else the
+        one it holds now, else the one of the slot it moved from.
+
+        Returns ``(num, moved_from, refreshed)``; ``refreshed`` means the slot
+        already held this account.
+        """
+        ours = (email, org_uuid or "")
+        with self._account_lock():
+            data = self._get_sequence_data()
+            if data is None:
+                raise ConfigError("No accounts are managed yet")
+            before = json.loads(json.dumps(data))
+            accounts = data.setdefault("accounts", {})
+            data.setdefault("sequence", [])
+            mine = [n for n, acc in accounts.items() if self._record_identity(acc) == ours]
+            num = account_num
+            if num is None:
+                num = mine[0] if mine else str(max((int(n) for n in accounts), default=0) + 1)
+            there = self._record_identity(accounts.get(num))
+            if displace is not None and there != (displace[1], displace[2] or ""):
+                raise ConfigError("Slot changed, nothing overwritten")
+            if displace is None and there not in (None, ours):
+                raise ConfigError("Slot changed, nothing overwritten")
+            self._reject_cross_kind_collision(email, is_api_key, data=data, org_uuid=org_uuid)
+            moved_from = next((n for n in mine if n != num), None)
+            if alias is not None:
+                for n, acc in accounts.items():
+                    if n not in (num, moved_from) and (acc.get("alias") or "").lower() == alias.lower():
+                        raise ValidationError(f"Alias '{alias}' is already used by account {n}")
+            for n in ([num] if displace is not None else []) + ([moved_from] if moved_from else []):
+                self._ensure_no_live_session(n, accounts[n].get("email", ""), "the operation")
+
+            # The backups this add replaces, read before any file is touched,
+            # so a failure below can put them back exactly: this account's own
+            # key (num, email), which a displaced account in another org
+            # shares, and a displaced account's key when its email differs.
+            keys = [(num, email)]
+            if displace is not None and displace[1] != email:
+                keys.append((num, displace[1]))
+            saved = {}
+            for key in keys:
+                stored, unreadable = self._read_account_credentials_ex(*key)
+                if unreadable:
+                    raise CredentialError(
+                        f"Could not read the stored credentials for slot {key[0]} "
+                        f"({key[1]}); nothing overwritten"
+                    )
+                saved[key] = (stored, self._read_account_config(*key))
+
+            refreshed = there == ours
+            current = accounts.get(num) if refreshed else None
+            keep = alias if alias is not None else (
+                current.get("alias") if current is not None
+                else (accounts[moved_from].get("alias") if moved_from else None)
+            )
+            new = dict(current) if in_place and current is not None else dict(record)
+            new.pop("alias", None)
+            if keep:
+                new["alias"] = keep
+            if moved_from:
+                accounts.pop(moved_from)
+                data["sequence"] = [s for s in data["sequence"] if s != int(moved_from)]
+            accounts[num] = new
+            if int(num) not in data["sequence"]:
+                data["sequence"].append(int(num))
+                data["sequence"].sort()
+            if set_active:
+                data["activeAccountNumber"] = int(num)
+            data["lastUpdated"] = get_timestamp()
+            self._write_roster(data)
+
+            try:
+                if displace is not None:
+                    self._delete_account_files(num, displace[1])
+                self._write_account_credentials(num, email, credentials)
+                self._write_account_config(num, email, config)
+            except BaseException as failure:
+                new_files = {key: ("", "") for key in saved}
+                new_files[(num, email)] = (credentials, config)
+                if self._settle_failed_add(num, saved, new_files, before, failure) != "committed":
+                    raise
+                if not isinstance(failure, Exception):
+                    raise  # an interrupt: the add stands, the interrupt still ends the run
+
+            if moved_from:
+                # The roster names the new slot only; a failure here leaks a
+                # stale file under the old key, never a wrong read.
+                try:
+                    self._delete_account_files(moved_from, email)
+                except Exception as e:
+                    self._logger.error(
+                        f"Stale backup left under old key {moved_from} ({email}): {e}"
+                    )
+        return num, moved_from, refreshed
+
+    def _restore_backups(self, saved: dict[tuple[str, str], tuple[str, str]]) -> None:
+        """Try to put slot keys' credential and config back as ``_commit_add`` read them.
+
+        ``saved`` maps ``(num, email)`` to the ``(credential, config)`` read
+        before the add touched anything; an empty value means the key held
+        nothing, so whatever the add wrote there is deleted, with the
+        confirmed (strict) delete. Every step is attempted and each failure
+        logged; ``_settle_failed_add`` then reads back what is on disk.
+        """
+        for (num, email), (creds, config) in saved.items():
+            try:
+                if creds:
+                    self._store._write_account_credentials(num, email, creds)
+                    # The failed add's credential must not become this key's history.
+                    self._store.delete_previous_backup(num, email)
+                else:
+                    self._store.delete_account_credentials_strict(num, email)
+            except Exception:
+                self._logger.error(
+                    f"Could not restore the credential under {num} ({email})", exc_info=True
+                )
+            try:
+                if config:
+                    self._write_account_config(num, email, config)
+                else:
+                    self._delete_config_backup(num, email)
+            except Exception:
+                self._logger.error(
+                    f"Could not restore the config under {num} ({email})", exc_info=True
+                )
+
+    def _backup_on_disk(self, num: str, email: str) -> tuple[str | None, str | None]:
+        """``(credential, config)`` stored under a slot key; None where unreadable."""
+        creds, unreadable = self._read_account_credentials_ex(num, email)
+        try:
+            config = self._read_account_config(num, email)
+        except OSError:
+            config = None
+        return (None if unreadable else creds), config
+
+    def _settle_failed_add(
+        self,
+        num: str,
+        saved: dict[tuple[str, str], tuple[str, str]],
+        new_files: dict[tuple[str, str], tuple[str, str]],
+        before: dict,
+        failure: BaseException,
+    ) -> str:
+        """After an add failed writing its files: restore, then let the disk decide.
+
+        Called under the account lock, with the roster already naming the
+        new account in slot ``num``. The files are put back from ``saved``,
+        then read back, and the roster is made to match them:
+
+        | on disk after the restore       | roster                        | reported                      |
+        |---------------------------------|-------------------------------|-------------------------------|
+        | every key as before the add     | put back as before the add    | the original error            |
+        | every key as the add wrote it   | keeps the new account         | "committed despite" warning   |
+        | anything else, cleared          | slot ``num`` dropped          | "could not be restored and    |
+        |                                 |                               | was cleared; re-add"          |
+        | anything else, clear failed     | row kept, ``disabled`` and a  | the state left on disk        |
+        |                                 | ``note``                      |                               |
+
+        Returns ``"restored"`` (the caller re-raises the failure) or
+        ``"committed"``; raises ConfigError in the other two cases.
+        """
+        self._restore_backups(saved)
+        on_disk = {key: self._backup_on_disk(*key) for key in saved}
+
+        if on_disk == saved:
+            roster = self._get_sequence_data()
+            roster.clear()
+            roster.update(before)
+            self._write_roster(roster)
+            return "restored"
+
+        if on_disk == new_files:
+            message = f"Add to slot {num} committed despite: {failure}"
+            self._logger.warning(message)
+            warning(message)
+            return "committed"
+
+        cleared = True
+        for key in saved:
+            try:
+                self._store.delete_account_credentials_strict(*key)
+                self._delete_config_backup(*key)
+            except Exception:
+                self._logger.error(f"Could not clear {key[0]} ({key[1]})", exc_info=True)
+                cleared = False
+        cleared = cleared and all(self._backup_on_disk(*key) == ("", "") for key in saved)
+        roster = self._get_sequence_data()
+        if cleared:
+            roster.clear()
+            roster.update(before)
+            roster.get("accounts", {}).pop(num, None)
+            roster["sequence"] = [n for n in roster.get("sequence", []) if n != int(num)]
+            if str(roster.get("activeAccountNumber")) == num:
+                roster["activeAccountNumber"] = None
+            roster["lastUpdated"] = get_timestamp()
+            self._write_roster(roster)
+            raise ConfigError(
+                f"Slot {num} could not be restored and was cleared; re-add the account"
+            ) from failure
+
+        record = roster["accounts"][num]
+        record["disabled"] = True
+        record["note"] = "broken credential state, re-add"
+        roster["lastUpdated"] = get_timestamp()
+        self._write_roster(roster)
+
+        def describe(value, key, index, what):
+            if value is None:
+                return f"an unreadable {what}"
+            if value == "":
+                return f"no {what}"
+            if value == new_files[key][index]:
+                return f"the new account's {what}"
+            if value == saved[key][index]:
+                return f"the previous {what}"
+            return f"an unrecognised {what}"
+
+        left = "; ".join(
+            f"{k_num} ({k_email}) holds {describe(creds, key, 0, 'credential')} "
+            f"and {describe(config, key, 1, 'config')}"
+            for key in saved
+            for k_num, k_email in [key]
+            for creds, config in [self._backup_on_disk(*key)]
+        )
+        raise ConfigError(
+            f"Slot {num} could not be restored or cleared and was disabled; {left}"
+        ) from failure
 
     def _prune_mappings(self, email: str, org_uuid: str) -> None:
         """Drop directory mappings for an identity that no longer has a slot.
@@ -971,12 +1271,23 @@ class ClaudeAccountSwitcher:
             record.get("organizationUuid", "") or "",
         )
 
-    def set_alias(self, identifier: str, alias: str) -> tuple[str, str]:
+    def set_alias(
+        self,
+        identifier: str,
+        alias: str,
+        *,
+        expected_email: str | None = None,
+        expected_org: str | None = None,
+    ) -> tuple[str, str]:
         """Set (or rename) the alias for the account matching identifier.
 
         ``identifier`` is a slot number, email, or existing alias (so a
         typo'd alias can be corrected with ``cswap alias <old> <new>`` as
         well as by number/email). Returns ``(account_num, normalized_alias)``.
+
+        ``expected_email`` and ``expected_org`` pin the account a caller
+        showed the user (the menu bar's rename prompt): see
+        ``_account_holding_identity``.
 
         Raises:
             AccountNotFoundError: identifier doesn't match any account.
@@ -989,27 +1300,42 @@ class ClaudeAccountSwitcher:
         except ValueError as e:
             raise ValidationError(str(e)) from e
 
-        self._get_sequence_data_migrated()
-        account_num = self._resolve_account_identifier(identifier)
-        if not account_num:
-            raise AccountNotFoundError(
-                f"No account found with identifier: {identifier}"
-            )
-        data = self._get_sequence_data() or {}
-        record = data.get("accounts", {}).get(account_num)
-        if not record:
-            raise AccountNotFoundError(f"Account-{account_num} does not exist")
+        # A read-modify-write of sequence.json, like a switch: hold the same
+        # account lock across resolve, re-read and write, or a switch landing
+        # in between (the auto-switch engine, the rotate daemon) is written
+        # back over, or overwrites the rename.
+        with self._account_lock():
+            self._get_sequence_data_migrated()
+            account_num = self._resolve_account_identifier(identifier)
+            if not account_num:
+                raise AccountNotFoundError(
+                    f"No account found with identifier: {identifier}"
+                )
+            data = self._get_sequence_data() or {}
+            if expected_email is not None:
+                account_num = self._account_holding_identity(
+                    data, account_num, expected_email, expected_org
+                )
+            record = data.get("accounts", {}).get(account_num)
+            if not record:
+                raise AccountNotFoundError(f"Account-{account_num} does not exist")
 
-        conflict = self._alias_in_use(normalized, exclude_num=account_num)
-        if conflict is not None:
-            raise ConfigError(f"Alias '{normalized}' is already used by account {conflict}")
+            conflict = self._alias_in_use(normalized, exclude_num=account_num)
+            if conflict is not None:
+                raise ConfigError(f"Alias '{normalized}' is already used by account {conflict}")
 
-        record["alias"] = normalized
-        data["lastUpdated"] = get_timestamp()
-        self._write_json(self.sequence_file, data)
-        return account_num, normalized
+            record["alias"] = normalized
+            data["lastUpdated"] = get_timestamp()
+            self._write_roster(data)
+            return account_num, normalized
 
-    def unset_alias(self, identifier: str) -> str:
+    def unset_alias(
+        self,
+        identifier: str,
+        *,
+        expected_email: str | None = None,
+        expected_org: str | None = None,
+    ) -> str:
         """Clear the alias for the account matching identifier.
 
         Returns the account number. Idempotent: clearing an already-unset
@@ -1020,22 +1346,56 @@ class ClaudeAccountSwitcher:
             AccountNotFoundError: identifier doesn't match any account.
         """
         self._refuse_session_shell()
-        self._get_sequence_data_migrated()
-        account_num = self._resolve_account_identifier(identifier)
-        if not account_num:
-            raise AccountNotFoundError(
-                f"No account found with identifier: {identifier}"
-            )
-        data = self._get_sequence_data() or {}
-        record = data.get("accounts", {}).get(account_num)
-        if not record:
-            raise AccountNotFoundError(f"Account-{account_num} does not exist")
+        with self._account_lock():  # same read-modify-write as set_alias
+            self._get_sequence_data_migrated()
+            account_num = self._resolve_account_identifier(identifier)
+            if not account_num:
+                raise AccountNotFoundError(
+                    f"No account found with identifier: {identifier}"
+                )
+            data = self._get_sequence_data() or {}
+            if expected_email is not None:
+                account_num = self._account_holding_identity(
+                    data, account_num, expected_email, expected_org
+                )
+            record = data.get("accounts", {}).get(account_num)
+            if not record:
+                raise AccountNotFoundError(f"Account-{account_num} does not exist")
 
-        if "alias" in record:
-            del record["alias"]
-            data["lastUpdated"] = get_timestamp()
-            self._write_json(self.sequence_file, data)
-        return account_num
+            if "alias" in record:
+                del record["alias"]
+                data["lastUpdated"] = get_timestamp()
+                self._write_roster(data)
+            return account_num
+
+    @staticmethod
+    def _account_holding_identity(
+        data: dict, account_num: str | None, email: str, org: str | None
+    ) -> str:
+        """The slot holding the account the caller showed: ``(email, org)``.
+
+        An account is its email and organization together; the same email in
+        another organization is a different account. The slot resolved from
+        the identifier if it still holds that pair; otherwise the one slot
+        that does now (a swap moved it). Called under the account lock.
+        Raises AccountNotFoundError when no slot, or more than one, holds it,
+        so nothing is changed on a guess. ``org=None`` matches on email only
+        (callers that never saw an organization).
+        """
+        def same(acc: dict) -> bool:
+            if acc.get("email") != email:
+                return False
+            return org is None or (acc.get("organizationUuid", "") or "") == (org or "")
+
+        accounts = data.get("accounts", {})
+        if account_num and same(accounts.get(account_num, {})):
+            return account_num
+        holders = [num for num, acc in accounts.items() if same(acc)]
+        if len(holders) == 1:
+            return holders[0]
+        raise AccountNotFoundError(
+            f"Account {email} is no longer in slot {account_num}; nothing was changed"
+        )
 
     def list_aliases(self) -> list[tuple[str, str, str]]:
         """Every set alias as ``(account_num, alias, email)``, slot-number order."""
@@ -1081,7 +1441,7 @@ class ClaudeAccountSwitcher:
         # refresh persist (which take the same lock) can never interleave
         # with the relocation.
         self._refuse_session_shell()
-        with FileLock(self.lock_file):
+        with self._account_lock():
             return self._swap_accounts_locked(first, second)
 
     def _read_backup_or_abort(self, account_num: str, email: str) -> str:
@@ -1206,7 +1566,7 @@ class ClaudeAccountSwitcher:
                 data["activeAccountNumber"] = int_a
             data["lastUpdated"] = get_timestamp()
             # The commit point: _write_json's rename publishes the swap.
-            self._write_json(self.sequence_file, data)
+            self._write_roster(data)
         except BaseException:
             self._rollback_swap(
                 num_a, email_a, creds_a, config_a,
@@ -1491,7 +1851,7 @@ class ClaudeAccountSwitcher:
         # the mutation (via the *_locked helpers — FileLock is non-reentrant):
         # a slot number resolved outside the lock could be renumbered by a
         # concurrent swap/move and end up moving the wrong account.
-        with FileLock(self.lock_file):
+        with self._account_lock():
             self._get_sequence_data_migrated()
 
             num_src = self._resolve_account_identifier(account)
@@ -1608,7 +1968,7 @@ class ClaudeAccountSwitcher:
                 data["activeAccountNumber"] = int_target
             data["lastUpdated"] = get_timestamp()
             # The commit point: _write_json's rename publishes the move.
-            self._write_json(self.sequence_file, data)
+            self._write_roster(data)
         except BaseException:
             # Pre-commit failure: the records still point at num_src and its
             # keys are untouched — drop any strays written under the target
@@ -1688,8 +2048,13 @@ class ClaudeAccountSwitcher:
                 print(f"  {path} {dimmed('→')} {email} {muted('(account removed)')}")
 
     def read_account_credentials(self, account_num: str, email: str) -> str:
-        """Public wrapper for session bootstrap. Empty string when missing."""
-        return self._read_account_credentials(account_num, email)
+        """Public wrapper for session bootstrap. Empty string when missing.
+
+        Read under the account lock: outside it, an add could be between
+        writing a slot's row and writing its credential.
+        """
+        with self._account_lock():
+            return self._read_account_credentials(account_num, email)
 
     def write_account_credentials(
         self, account_num: str, email: str, credentials: str
@@ -1875,25 +2240,27 @@ class ClaudeAccountSwitcher:
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
 
-        # resolve_account migrates org fields and hard-errors on ambiguity.
-        account_num, email, _ = self.resolve_account(identifier)
-
-        data = self._get_sequence_data() or {}
-        record = data.get("accounts", {}).get(account_num)
-        if not record:
-            raise AccountNotFoundError(f"Account-{account_num} does not exist")
-
         verb = "disabled" if disabled else "enabled"
-        if bool(record.get("disabled")) == disabled:
-            print(dimmed(f"Account-{account_num} ({email}) is already {verb}."))
-            return
+        with self._account_lock():  # read-modify-write of the roster
+            # Resolved under the lock: resolved before it, a swap landing in
+            # between would move the change onto another account.
+            # resolve_account migrates org fields and hard-errors on ambiguity.
+            account_num, email, _ = self.resolve_account(identifier)
+            data = self._get_sequence_data() or {}
+            record = data.get("accounts", {}).get(account_num)
+            if not record:
+                raise AccountNotFoundError(f"Account-{account_num} does not exist")
 
-        if disabled:
-            record["disabled"] = True
-        else:
-            record.pop("disabled", None)
-        data["lastUpdated"] = get_timestamp()
-        self._write_json(self.sequence_file, data)
+            if bool(record.get("disabled")) == disabled:
+                print(dimmed(f"Account-{account_num} ({email}) is already {verb}."))
+                return
+
+            if disabled:
+                record["disabled"] = True
+            else:
+                record.pop("disabled", None)
+            data["lastUpdated"] = get_timestamp()
+            self._write_roster(data)
         self._logger.info(f"{verb.capitalize()} account {account_num}: {email}")
 
         print(f"{accent(verb.capitalize())} Account-{account_num} ({email}).")
@@ -1957,7 +2324,7 @@ class ClaudeAccountSwitcher:
         the persist callback ``_fetch_account_usage`` uses. The caller must NOT
         hold ``self.lock_file`` (FileLock is non-reentrant).
         """
-        with FileLock(self.lock_file):
+        with self._account_lock():
             self._write_account_credentials(account_num, email, credentials)
 
     def account_identity(self, account_num: str) -> dict:
@@ -1989,7 +2356,7 @@ class ClaudeAccountSwitcher:
         """
         if not uuid:
             return
-        with FileLock(self.lock_file):
+        with self._account_lock():
             data = self._get_sequence_data() or {}
             acct = data.get("accounts", {}).get(str(account_num))
             if (
@@ -2006,7 +2373,7 @@ class ClaudeAccountSwitcher:
             ):
                 acct["uuid"] = uuid
                 data["lastUpdated"] = get_timestamp()
-                self._write_json(self.sequence_file, data)
+                self._write_roster(data)
 
     def consume_backup_grant(
         self, account_num: str, email: str, snapshot: str
@@ -2106,7 +2473,7 @@ class ClaudeAccountSwitcher:
         )
 
         try:
-            with FileLock(self.lock_file):
+            with self._account_lock():
                 current, unreadable = self._read_account_credentials_ex(
                     account_num, email
                 )
@@ -2305,7 +2672,7 @@ class ClaudeAccountSwitcher:
         outcome_creds = result.credentials
         try:
             try:
-                with FileLock(self.lock_file):
+                with self._account_lock():
                     store_now, store_unreadable = (
                         self._read_account_credentials_ex(account_num, email)
                     )
@@ -2852,7 +3219,7 @@ class ClaudeAccountSwitcher:
         from claude_swap.session import profile_is_quiescent
 
         session_dir = self._session_dir(account_num, email)
-        with FileLock(self.lock_file):
+        with self._account_lock():
             if not profile_is_quiescent(session_dir):
                 return False
             profile = self._session_profile_ahead(account_num, email, org_uuid)
@@ -2910,14 +3277,17 @@ class ClaudeAccountSwitcher:
 
     def _init_sequence_file(self) -> None:
         """Initialize sequence.json if it doesn't exist."""
-        if not self.sequence_file.exists():
-            init_data = {
-                "activeAccountNumber": None,
-                "lastUpdated": get_timestamp(),
-                "sequence": [],
-                "accounts": {},
-            }
-            self._write_json(self.sequence_file, init_data)
+        with self._account_lock():  # re-checked under the lock: another process may create it
+            if not self.sequence_file.exists():
+                init_data = {
+                    "activeAccountNumber": None,
+                    "lastUpdated": get_timestamp(),
+                    "sequence": [],
+                    "accounts": {},
+                }
+                # No file is the roster's current state; this is its first read.
+                self._roster_state().reads.append(init_data)
+                self._write_roster(init_data)
 
     def _get_sequence_data(self) -> dict | None:
         """Get sequence data. None ONLY when the roster does not exist yet.
@@ -2938,7 +3308,78 @@ class ClaudeAccountSwitcher:
 
         Guarding each caller was the alternative and it is 27 edits that the
         28th forgets. This is the reader; the distinction belongs here."""
-        return self._read_json(self.sequence_file, strict=True)
+        data = self._read_json(self.sequence_file, strict=True)
+        state = self._roster_state()
+        if getattr(state, "depth", 0) and data is not None:
+            state.reads.append(data)  # read under this lock hold: writable
+        return data
+
+    # -- the roster write primitive -----------------------------------------
+    #
+    # sequence.json is shared by every cswap process (the CLI, the menu bar,
+    # the auto-switch engine, the rotate daemon), so each change to it is a
+    # read-modify-write that must hold the account lock from the read to the
+    # write; otherwise one writer puts back a roster it read before another
+    # writer's change (a rename resurrecting a removed slot, a remove undoing
+    # a rename). ``_write_roster`` is the only code that writes the file, and
+    # it refuses unless this thread holds the lock and the dict was read under
+    # that same hold. ``_mutate_roster`` is the one-call form.
+
+    def _roster_state(self) -> threading.local:
+        state = self.__dict__.get("_roster_lock_state")
+        if state is None:
+            state = self.__dict__.setdefault("_roster_lock_state", threading.local())
+        return state
+
+    @contextlib.contextmanager
+    def _account_lock(self, timeout: float | None = None):
+        """The account lock (``self.lock_file``), re-entrant within one thread.
+
+        FileLock itself is not re-entrant: a nested acquisition would wait on
+        itself. Every holder of ``self.lock_file`` in this process goes
+        through here, so nested roster changes compose.
+        """
+        state = self._roster_state()
+        if getattr(state, "depth", 0):
+            state.depth += 1
+            try:
+                yield
+            finally:
+                state.depth -= 1
+            return
+        lock = FileLock(self.lock_file) if timeout is None else FileLock(self.lock_file, timeout=timeout)
+        with lock:
+            state.depth, state.reads = 1, []
+            try:
+                yield
+            finally:
+                state.depth, state.reads = 0, []
+
+    def _write_roster(self, data: dict) -> None:
+        """Write sequence.json. Only under the account lock, only a roster read under it."""
+        state = self._roster_state()
+        if not getattr(state, "depth", 0):
+            raise RuntimeError("sequence.json may only be written under the account lock")
+        if not any(data is read for read in state.reads):
+            raise RuntimeError(
+                "sequence.json write of a roster read outside this lock hold"
+            )
+        self._write_json(self.sequence_file, data)
+
+    def _mutate_roster(self, change):
+        """Read the roster under the account lock, apply ``change``, write it.
+
+        ``change(data)`` edits the freshly read dict in place and returns
+        whether anything changed; nothing is written when it returns False.
+        Raises ConfigError when no roster exists yet.
+        """
+        with self._account_lock():
+            data = self._get_sequence_data()
+            if data is None:
+                raise ConfigError("No accounts are managed yet")
+            if change(data):
+                data["lastUpdated"] = get_timestamp()
+                self._write_roster(data)
 
     def _get_next_account_number(self) -> int:
         """Get next account number."""
@@ -3308,7 +3749,9 @@ class ClaudeAccountSwitcher:
                 "'cswap --add-token sk-ant-api...' instead of --add-account."
             )
 
-    def _reject_cross_kind_collision(self, email: str, is_api_key: bool) -> None:
+    def _reject_cross_kind_collision(
+        self, email: str, is_api_key: bool, *, data: dict | None = None, org_uuid: str = ""
+    ) -> None:
         """Reject registering a token whose (email, personal-org) already exists as
         the *other* kind.
 
@@ -3317,15 +3760,18 @@ class ClaudeAccountSwitcher:
         apart at switch time. Rather than thread ``kind`` through the whole identity
         system, refuse the collision and point the user at a distinct ``--email``.
         The default ``…@token.local`` labels never collide; this only guards a forced
-        ``--email``.
+        ``--email``. ``data`` is a roster the caller read under the account
+        lock (``_commit_add`` repeats the check there).
         """
-        data = self._get_sequence_data()
+        if data is None:
+            data = self._get_sequence_data()
         if not data:
             return
-        slot = self._find_account_slot(data, email, "")
+        slot = self._find_account_slot(data, email, org_uuid)
         if slot is None:
             return
-        existing_kind = self._account_kind(slot)
+        record = data.get("accounts", {}).get(slot, {})
+        existing_kind = "api_key" if record.get("kind") == "api_key" else "oauth"
         new_kind = "api_key" if is_api_key else "oauth"
         if existing_kind != new_kind:
             existing_label = "API-key" if existing_kind == "api_key" else "OAuth"
@@ -3419,6 +3865,11 @@ class ClaudeAccountSwitcher:
         return data
 
     def _migrate_org_fields(self) -> None:
+        """Backfill organization fields, as one read-modify-write under the account lock."""
+        with self._account_lock():
+            self._migrate_org_fields_locked()
+
+    def _migrate_org_fields_locked(self) -> None:
         """Backfill organizationUuid/Name for accounts added before org support.
 
         For the currently active account, reads org info from the live config
@@ -3477,7 +3928,7 @@ class ClaudeAccountSwitcher:
 
         if updated:
             data["lastUpdated"] = get_timestamp()
-            self._write_json(self.sequence_file, data)
+            self._write_roster(data)
 
     def add_account(
         self,
@@ -3559,18 +4010,32 @@ class ClaudeAccountSwitcher:
             # on a race.
             self._reject_identity_drift_since_verify(identity)
 
-            self._write_account_credentials(account_num, current_email, current_creds)
-            self._write_account_config(account_num, current_email, current_config)
+            # The slot is found again under the lock (a swap may have moved
+            # the account since the read above), and the credential is stored
+            # in that same hold. Gone meanwhile, it is added as new.
+            oauth_data = self._read_json(config_path).get("oauthAccount", {})
+            account_num, _moved, refreshed = self._commit_add(
+                None, current_email, current_org_uuid,
+                is_api_key=False, displace=None, alias=alias,
+                record={
+                    "email": current_email,
+                    "uuid": oauth_data.get("accountUuid", "") or "",
+                    "organizationUuid": current_org_uuid,
+                    "organizationName": oauth_data.get("organizationName", "") or "",
+                    "added": get_timestamp(),
+                },
+                in_place=True, credentials=current_creds, config=current_config,
+                set_active=True,
+            )
             self._usage_store.clear_dead_token(
                 [account_num], {account_num: (current_email, current_org_uuid)}
             )
-
-            if alias is not None:
-                seq["accounts"][account_num]["alias"] = alias
-
-            seq["activeAccountNumber"] = int(account_num)
-            seq["lastUpdated"] = get_timestamp()
-            self._write_json(self.sequence_file, seq)
+            if not refreshed:
+                tag = self._get_display_tag(
+                    current_email, oauth_data.get("organizationName", "") or "", current_org_uuid
+                )
+                print(f"{accent('Added')} Account {account_num}: {current_email} {muted(f'[{tag}]')}")
+                return
 
             tag = self._get_display_tag(current_email, matched_org_name, current_org_uuid)
             self._logger.info(f"Updated credentials for account {account_num}: {current_email}")
@@ -3581,23 +4046,16 @@ class ClaudeAccountSwitcher:
             return
 
         # Determine slot number and collect confirmation decisions
-        # (no destructive operations until new account is verified readable)
+        # (no destructive operations until new account is verified readable).
+        # Everything decided here, before the account lock, is checked again
+        # under it by _commit_add.
         displace_slot = None  # slot to clean up (occupied by different account)
-        migrate_from = None   # old slot to clean up (same account, different slot)
 
         if slot is not None:
             if slot < 1:
                 raise ConfigError("Slot number must be >= 1")
             account_num = str(slot)
             data = self._get_sequence_data()
-
-            # Find if current account already exists in a different slot
-            if self._account_exists(current_email, current_org_uuid):
-                old_num = self._find_account_slot(
-                    data, current_email, current_org_uuid
-                )
-                if old_num and old_num != account_num:
-                    migrate_from = old_num
 
             # Check if target slot is occupied by a different account
             if account_num in data.get("accounts", {}):
@@ -3631,19 +4089,6 @@ class ClaudeAccountSwitcher:
                     )
         else:
             account_num = str(self._get_next_account_number())
-
-        # Capture any alias to carry forward before destructive cleanup below
-        # deletes the old record (same account moving slots, or refreshing in place).
-        existing_alias = None
-        if slot is not None:
-            prior = data.get("accounts", {}).get(account_num) or {}
-            if (
-                prior.get("email") == current_email
-                and prior.get("organizationUuid", "") == current_org_uuid
-            ):
-                existing_alias = prior.get("alias")
-            if migrate_from:
-                existing_alias = data["accounts"][migrate_from].get("alias") or existing_alias
 
         if alias is not None:
             conflict = self._alias_in_use(alias, exclude_num=account_num)
@@ -3682,55 +4127,30 @@ class ClaudeAccountSwitcher:
         self._reject_identity_drift_since_verify(identity)
 
         # Now safe to perform destructive cleanup (new account data is in memory)
+        account_num, moved_from, _refreshed = self._commit_add(
+            account_num if slot is not None else None,
+            current_email, current_org_uuid,
+            is_api_key=False, displace=displace_slot, alias=alias,
+            record={
+                "email": current_email,
+                "uuid": account_uuid,
+                "organizationUuid": organization_uuid,
+                "organizationName": organization_name,
+                "added": get_timestamp(),
+            },
+            in_place=False, credentials=current_creds, config=current_config,
+            set_active=True,
+        )
         if displace_slot:
-            d_num, d_email, d_org = displace_slot
-            self._delete_account_files(d_num, d_email)
-            data = self._get_sequence_data()
-            if int(d_num) in data["sequence"]:
-                data["sequence"].remove(int(d_num))
-            del data["accounts"][d_num]
-            self._write_json(self.sequence_file, data)
-            self._prune_mappings(d_email, d_org)
-
-        if migrate_from:
-            data = self._get_sequence_data()
-            old_email = data["accounts"][migrate_from].get("email", "")
-            self._delete_account_files(migrate_from, old_email)
-            if int(migrate_from) in data["sequence"]:
-                data["sequence"].remove(int(migrate_from))
-            del data["accounts"][migrate_from]
-            self._write_json(self.sequence_file, data)
-
-        # Store backups
-        self._write_account_credentials(account_num, current_email, current_creds)
-        self._write_account_config(account_num, current_email, current_config)
+            self._prune_mappings(displace_slot[1], displace_slot[2])
         self._usage_store.clear_dead_token(
             [account_num], {account_num: (current_email, organization_uuid)}
         )
 
-        # Update sequence.json
-        data = self._get_sequence_data()
-        data["accounts"][account_num] = {
-            "email": current_email,
-            "uuid": account_uuid,
-            "organizationUuid": organization_uuid,
-            "organizationName": organization_name,
-            "added": get_timestamp(),
-        }
-        carried_alias = alias if alias is not None else existing_alias
-        if carried_alias:
-            data["accounts"][account_num]["alias"] = carried_alias
-        if int(account_num) not in data["sequence"]:
-            data["sequence"].append(int(account_num))
-            data["sequence"].sort()
-        data["activeAccountNumber"] = int(account_num)
-        data["lastUpdated"] = get_timestamp()
-
-        self._write_json(self.sequence_file, data)
         tag = self._get_display_tag(current_email, organization_name, organization_uuid)
         self._logger.info(f"Added account {account_num}: {current_email} (org: {organization_uuid or 'personal'})")
-        if migrate_from:
-            print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
+        if moved_from:
+            print(f"{dimmed(f'Moved from slot {moved_from} → {slot}')}")
         print(f"{accent('Added')} Account {account_num}: {current_email} {muted(f'[{tag}]')}")
 
     def add_account_from_token(
@@ -3815,16 +4235,30 @@ class ClaudeAccountSwitcher:
             }
         })
 
+        record = {
+            "email": email,
+            "uuid": "",
+            "organizationUuid": "",
+            "organizationName": "",
+            "added": get_timestamp(),
+        }
+        if is_api_key:
+            record["kind"] = "api_key"
+        source_label = "API key" if is_api_key else "token"
+
         # If the account already exists (same email, personal), refresh in place.
+        # Its slot is found again under the lock and the credential stored in
+        # that same hold; gone meanwhile, it is added as new.
         if slot is None and self._account_exists(email, ""):
-            seq = self._get_sequence_data()
-            account_num = self._find_account_slot(seq, email, "")
-            if account_num is None:
+            if self._find_account_slot(self._get_sequence_data(), email, "") is None:
                 raise ConfigError(
                     f"Existing account metadata for {email} is inconsistent"
                 )
-            self._write_account_credentials(account_num, email, credentials)
-            self._write_account_config(account_num, email, config)
+            account_num, _moved, refreshed = self._commit_add(
+                None, email, "", is_api_key=is_api_key, displace=None, alias=None,
+                record=record, in_place=True, credentials=credentials, config=config,
+                set_active=False,
+            )
             # A refreshed credential invalidates any dead-token quarantine on this
             # slot (mirrors ``add_account``); otherwise the stale strike row keeps
             # the account stuck at "re-login needed" and it never fetches the new
@@ -3832,29 +4266,30 @@ class ClaudeAccountSwitcher:
             self._usage_store.clear_dead_token(
                 [account_num], {account_num: (email, "")}
             )
-            seq["lastUpdated"] = get_timestamp()
-            self._write_json(self.sequence_file, seq)
-            kind_label = "API key" if is_api_key else "token"
-            self._logger.info(f"Updated {kind_label} for account {account_num}: {email}")
-            print(
-                f"{accent(f'Updated {kind_label}')} for Account {account_num} "
-                f"({email} {muted('[personal]')})."
-            )
+            if refreshed:
+                kind_label = "API key" if is_api_key else "token"
+                self._logger.info(f"Updated {kind_label} for account {account_num}: {email}")
+                print(
+                    f"{accent(f'Updated {kind_label}')} for Account {account_num} "
+                    f"({email} {muted('[personal]')})."
+                )
+            else:
+                self._logger.info(f"Added account {account_num} from {source_label}: {email}")
+                print(
+                    f"{accent('Added')} Account {account_num}: {email} "
+                    f"{muted('[personal]')} {muted(f'(from {source_label})')}"
+                )
             return
 
+        # Decided before the account lock; _commit_add checks it again under
+        # the lock.
         displace_slot = None
-        migrate_from = None
 
         if slot is not None:
             if slot < 1:
                 raise ConfigError("Slot number must be >= 1")
             account_num = str(slot)
             data = self._get_sequence_data()
-
-            if self._account_exists(email, ""):
-                old_num = self._find_account_slot(data, email, "")
-                if old_num and old_num != account_num:
-                    migrate_from = old_num
 
             if account_num in data.get("accounts", {}):
                 existing = data["accounts"][account_num]
@@ -3886,56 +4321,23 @@ class ClaudeAccountSwitcher:
                         existing.get("organizationUuid", "") or "",
                     )
         else:
-            account_num = str(self._get_next_account_number())
+            account_num = None
 
+        account_num, moved_from, _refreshed = self._commit_add(
+            account_num, email, "", is_api_key=is_api_key, displace=displace_slot,
+            alias=None, record=record, in_place=False, credentials=credentials,
+            config=config, set_active=False,
+        )
         if displace_slot:
-            d_num, d_email, d_org = displace_slot
-            self._delete_account_files(d_num, d_email)
-            data = self._get_sequence_data()
-            if int(d_num) in data["sequence"]:
-                data["sequence"].remove(int(d_num))
-            del data["accounts"][d_num]
-            self._write_json(self.sequence_file, data)
-            self._prune_mappings(d_email, d_org)
-
-        if migrate_from:
-            data = self._get_sequence_data()
-            old_email = data["accounts"][migrate_from].get("email", "")
-            self._delete_account_files(migrate_from, old_email)
-            if int(migrate_from) in data["sequence"]:
-                data["sequence"].remove(int(migrate_from))
-            del data["accounts"][migrate_from]
-            self._write_json(self.sequence_file, data)
-
-        self._write_account_credentials(account_num, email, credentials)
-        self._write_account_config(account_num, email, config)
+            self._prune_mappings(displace_slot[1], displace_slot[2])
         # Reusing/overwriting a slot with a fresh credential lifts any dead-token
         # quarantine carried by that slot's prior lineage (mirrors ``add_account``).
         self._usage_store.clear_dead_token(
             [account_num], {account_num: (email, "")}
         )
-
-        data = self._get_sequence_data()
-        record = {
-            "email": email,
-            "uuid": "",
-            "organizationUuid": "",
-            "organizationName": "",
-            "added": get_timestamp(),
-        }
-        if is_api_key:
-            record["kind"] = "api_key"
-        data["accounts"][account_num] = record
-        if int(account_num) not in data["sequence"]:
-            data["sequence"].append(int(account_num))
-            data["sequence"].sort()
-        data["lastUpdated"] = get_timestamp()
-
-        self._write_json(self.sequence_file, data)
-        source_label = "API key" if is_api_key else "token"
         self._logger.info(f"Added account {account_num} from {source_label}: {email}")
-        if migrate_from:
-            print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
+        if moved_from:
+            print(f"{dimmed(f'Moved from slot {moved_from} → {slot}')}")
         print(
             f"{accent('Added')} Account {account_num}: {email} "
             f"{muted('[personal]')} {muted(f'(from {source_label})')}"
@@ -4015,15 +4417,37 @@ class ClaudeAccountSwitcher:
                 print(dimmed("Cancelled"))
                 return
 
-        # Remove backup files
-        self._delete_account_files(account_num, email)
+        # One hold of the account lock from here to the roster write: the
+        # roster read above predates the confirmation prompt, and a switch,
+        # rename or swap may have landed while it was open. Writing that read
+        # back would undo them; removing a slot that now holds another
+        # account would delete the wrong login.
+        with self._account_lock():
+            fresh = self._get_sequence_data() or {}
+            current = fresh.get("accounts", {}).get(account_num)
+            if current is None or (current.get("email"), current.get("organizationUuid", "") or "") != (
+                email, account_info.get("organizationUuid", "") or ""
+            ):
+                raise ConfigError(
+                    f"Account-{account_num} changed while waiting for confirmation; "
+                    "nothing was removed"
+                )
 
-        # Update sequence.json
-        del data["accounts"][account_num]
-        data["sequence"] = [n for n in data["sequence"] if n != int(account_num)]
-        data["lastUpdated"] = get_timestamp()
+            # Remove backup files; if the credential stays stored, so does the slot.
+            try:
+                self._delete_account_files(account_num, email)
+            except CredentialError as e:
+                reason = e.__cause__ or e
+                raise ConfigError(
+                    f"Could not delete credentials for slot {account_num}: {reason}; "
+                    "account kept"
+                ) from e
 
-        self._write_json(self.sequence_file, data)
+            # Update sequence.json
+            del fresh["accounts"][account_num]
+            fresh["sequence"] = [n for n in fresh["sequence"] if n != int(account_num)]
+            fresh["lastUpdated"] = get_timestamp()
+            self._write_roster(fresh)
         self._logger.info(f"Removed account {account_num}: {email}")
         print(f"{accent('Removed')} Account-{account_num} ({email})")
 
@@ -4036,7 +4460,18 @@ class ClaudeAccountSwitcher:
         slot is detected and credentials are read in exactly one place. The
         active account's credentials come from Claude Code's live store; every
         other slot reads its backup copy.
+
+        Rows and credentials are read in one short hold of the account lock
+        (released before any network): an add writes a slot's row and then
+        its credential in one hold, and read outside it a row could pair
+        with the previous account's credential. Every reader that pairs
+        roster rows with credentials (usage fetch, the auto engine, list,
+        the TUI and menu bar snapshots) comes through here.
         """
+        with self._account_lock():
+            return self._build_accounts_info_locked()
+
+    def _build_accounts_info_locked(self) -> list[tuple[int, str, str, str, bool, str, str]]:
         data = self._get_sequence_data_migrated() or {}
         current_identity = self._get_current_account()
 
@@ -4276,7 +4711,7 @@ class ClaudeAccountSwitcher:
             # below (the one step that can touch ~/.claude.json).
             with (
                 FileLock(self.credentials_dir / f".consume-{account_num}.lock"),
-                FileLock(self.lock_file),
+                self._account_lock(),
                 claude_credentials_lock(),
             ):
                 live = self._read_credentials()
@@ -4720,7 +5155,7 @@ class ClaudeAccountSwitcher:
                     return
                 self._provenance_warned.discard((account_num, email, "resync"))
             with (
-                FileLock(self.lock_file),
+                self._account_lock(),
                 claude_credentials_lock(),
             ):
                 # Identity re-check under the lock: a switch/login landing in
@@ -6779,7 +7214,7 @@ class ClaudeAccountSwitcher:
         # ~/.claude.json.lock likewise keeps the oauthAccount splice from
         # interleaving with Claude Code's own config writes. Everything under
         # here is local I/O — no network while locks are held.
-        with FileLock(self.lock_file), claude_credentials_lock(), claude_config_lock():
+        with self._account_lock(), claude_credentials_lock(), claude_config_lock():
             data = self._get_sequence_data()
             active_account = data.get("activeAccountNumber")
             current_account = str(active_account) if active_account is not None else None
@@ -6944,7 +7379,7 @@ class ClaudeAccountSwitcher:
 
                     data["activeAccountNumber"] = int(target_account)
                     data["lastUpdated"] = get_timestamp()
-                    self._write_json(self.sequence_file, data)
+                    self._write_roster(data)
                 except Exception:
                     if config_written and rollback_config_text is not None:
                         try:
@@ -7210,7 +7645,7 @@ class ClaudeAccountSwitcher:
                 # Step 5: Update sequence state
                 data["activeAccountNumber"] = int(target_account)
                 data["lastUpdated"] = get_timestamp()
-                self._write_json(self.sequence_file, data)
+                self._write_roster(data)
                 transaction.record_step("sequence_updated")
 
                 self._logger.info(

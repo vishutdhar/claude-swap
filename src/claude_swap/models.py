@@ -194,11 +194,12 @@ class SwitchTransaction:
                     if sys.platform != "win32":
                         os.chmod(self.config_path, 0o600)
                 elif step == "sequence_updated":
-                    data = switcher._get_sequence_data()
-                    if data:
+                    def restore_active(data):
                         data["activeAccountNumber"] = int(self.original_account_num)
-                        data["lastUpdated"] = get_timestamp()
-                        switcher._write_json(switcher.sequence_file, data)
+                        return True
+
+                    if switcher._get_sequence_data():
+                        switcher._mutate_roster(restore_active)
                 switcher._logger.info(f"Rolled back step: {step}")
             except Exception as e:
                 switcher._logger.error(f"Failed to rollback step {step}: {e}")
