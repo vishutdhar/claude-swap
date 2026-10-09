@@ -1929,13 +1929,14 @@ class TestListFresh:
         return s
 
     def _seed(self, s):
-        """Both rows measured AGE_S ago, with poll plans far in the future."""
+        """Both rows measured AGE_S ago, with poll plans far in the future,
+        written the way this version's collector writes them (plan and floor
+        field together; no floor)."""
         store = s._usage_store
         store.record(
-            {n: FetchRecord(usage=self.OLD[n]) for n in self.IDENT}, self.IDENT
-        )
-        store.set_poll_plan(
-            {n: (time.time() + 600.0, 600.0) for n in self.IDENT}, self.IDENT
+            {n: FetchRecord(usage=self.OLD[n]) for n in self.IDENT},
+            self.IDENT,
+            plans={n: (time.time() + 600.0, 600.0) for n in self.IDENT},
         )
         table = json.loads(store.path.read_text())
         for row in table["accounts"].values():
@@ -2108,6 +2109,40 @@ class TestListFresh:
         assert store.entries(self.IDENT)["2"].fetched_at == after.fetched_at
         _, plain = self._list(s)
         assert plain == []
+
+    def test_rows_from_before_the_upgrade_follow_plain_rules_until_polled(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        from claude_swap.usage_store import SERVE_TTL_S
+
+        s = self._switcher(sample_sequence_data)
+        self._seed(s)
+        store = s._usage_store
+        table = json.loads(store.path.read_text())
+        for row in table["accounts"].values():
+            del row["post429FloorUntil"]  # the previous version's row shape
+        store.path.write_text(json.dumps(table))
+
+        _, fetched = self._list(s, fresh=True)
+        assert fetched == []  # unknown floors: plain rules, inside the TTL
+
+        # Stale with due plans, so the plain rules poll both, and that
+        # successful poll writes the field (null: no floor applied).
+        table = json.loads(store.path.read_text())
+        for row in table["accounts"].values():
+            row["fetchedAt"] -= SERVE_TTL_S
+            row["nextPollAt"] = time.time() - 1.0
+        store.path.write_text(json.dumps(table))
+        _, fetched = self._list(s, fresh=True)
+        assert fetched == ["1", "2"]
+        rows = json.loads(store.path.read_text())["accounts"]
+        assert all(
+            "post429FloorUntil" in r and r["post429FloorUntil"] is None
+            for r in rows.values()
+        )
+
+        _, fetched = self._list(s, fresh=True)
+        assert fetched == ["1", "2"]  # settled: --fresh beats the TTL again
 
     def test_fresh_leaves_a_quarantined_account_unfetched(
         self, temp_home, mock_claude_config, sample_sequence_data

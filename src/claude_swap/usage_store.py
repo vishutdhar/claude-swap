@@ -1036,9 +1036,9 @@ class UsageStore:
         the caller asked to re-measure now, so neither the serve TTL nor the
         poll plan holds a slot back. The guards still do: quarantine, backoff
         and a live claim refuse it as always. A token that 429'd recently
-        (``UsageEntry.recent_429``), or whose post-429 floor plan is still
-        pending (``post429FloorUntil``, see :meth:`record`), keeps the mode
-        rules, so a forced re-measure never spends what that floor is saving.
+        (``UsageEntry.recent_429``), or whose post-429 floor plan may still
+        be pending (``_post_429_floor_pending``), keeps the mode rules, so a
+        forced re-measure never spends what that floor is saving.
         """
         nums = list(nums)
         if not nums:
@@ -1089,8 +1089,10 @@ class UsageStore:
         ``post_429_floors`` names the slots whose supplied plan is the
         planner's post-429 floor. Its end (the plan's ``nextPollAt``) is kept
         as ``post429FloorUntil``, because this same success clears the 429's
-        own fields and a ``fresh`` reservation must still honour the floor. A
-        plan installed without the floor ends it.
+        own fields and a ``fresh`` reservation must still honour the floor.
+        Every success that installs a plan writes the field, null when the
+        plan has no floor; a success without a plan leaves the stored plan,
+        and so the field (or its absence), as it was.
         """
         post_429_floors = set(post_429_floors)
         if not outcomes:
@@ -1222,6 +1224,26 @@ def _num_or_none(value: object) -> float | None:
     return float(value) if isinstance(value, (int, float)) else None
 
 
+def _post_429_floor_pending(row: dict, now: float) -> bool:
+    """Whether a row's stored plan may still be a pending post-429 floor.
+
+    :meth:`UsageStore.record` writes ``post429FloorUntil`` with every plan it
+    installs: the floor's end, or null for a plan without one. A row without
+    the field was planned by a version that never recorded floors, so its
+    pending plan may be protective and nothing says otherwise: that counts as
+    pending until a successful poll writes the field. A value that is neither
+    null nor a number is just as unknown.
+    """
+    if "post429FloorUntil" not in row:
+        return True
+    floor_until = row["post429FloorUntil"]
+    if floor_until is None:
+        return False
+    if not isinstance(floor_until, (int, float)):
+        return True
+    return now < floor_until
+
+
 def _row_eligible(
     row: dict,
     now: float,
@@ -1247,7 +1269,6 @@ def _row_eligible(
     # on its own because recency alone lapses: the success that installs the
     # floor clears the 429's fields, and after an hour-scale block the 429's
     # stamp is already older than its recency window.
-    floor_until = _num_or_none(row.get("post429FloorUntil"))
     if fresh and not (
         _recent_429(
             _num_or_none(row.get("last429At")),
@@ -1255,7 +1276,7 @@ def _row_eligible(
             backoff_until,
             now,
         )
-        or (floor_until is not None and now < floor_until)
+        or _post_429_floor_pending(row, now)
     ):
         return True
     fetched_at = _num_or_none(row.get("fetchedAt"))

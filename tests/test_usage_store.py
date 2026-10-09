@@ -1380,27 +1380,48 @@ class TestReserveFresh:
             ["1"], IDENT, respect_plans=True, repair_overslept=True, fresh=fresh
         )
 
+    @staticmethod
+    def _poll(store, clock, interval=600.0, floor=False):
+        """A successful poll as the collector records it: always with a plan,
+        and with the floor field (the plan's end when the planner applied
+        the post-429 floor, null otherwise). Returns the plan's end."""
+        end = clock.now + interval
+        store.record(
+            {"1": FetchRecord(usage=USAGE)},
+            IDENT,
+            plans={"1": (end, interval)},
+            post_429_floors={"1"} if floor else (),
+        )
+        return end
+
+    @staticmethod
+    def _as_written_before_floors(store):
+        """Strip the floor field: the row exactly as the previous version,
+        which planned identically but never recorded floors, left it."""
+        table = json.loads(store.path.read_text())
+        del table["accounts"]["1"]["post429FloorUntil"]
+        store.path.write_text(json.dumps(table))
+
+    @staticmethod
+    def _raw_row(store):
+        return json.loads(store.path.read_text())["accounts"]["1"]
+
     def test_fresh_wins_inside_the_serve_ttl(self, store, clock):
-        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        self._poll(store, clock)
         clock.advance(SERVE_TTL_S / 2)
         assert self._reserve(store, fresh=False) == {}
         assert set(self._reserve(store, fresh=True)) == {"1"}
 
     def test_fresh_wins_ahead_of_a_future_poll_plan(self, store, clock):
-        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        self._poll(store, clock, interval=poll_policy.CANDIDATE_MAX_INTERVAL_S)
         clock.advance(SERVE_TTL_S + 1)  # stale, but the plan is not due
-        store.set_poll_plan(
-            {"1": (clock.now + poll_policy.CANDIDATE_MAX_INTERVAL_S,
-                   poll_policy.CANDIDATE_MAX_INTERVAL_S)},
-            IDENT,
-        )
         assert self._reserve(store, fresh=False) == {}
         assert set(self._reserve(store, fresh=True)) == {"1"}
 
     def test_fresh_stamps_a_claim_like_any_reservation(self, store, clock):
         # The lease is what keeps a concurrent collector (the daemon, a second
         # --fresh) off the slot while this fetch is in flight.
-        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        self._poll(store, clock)
         assert set(self._reserve(store, fresh=True)) == {"1"}
         assert self._reserve(store, fresh=True) == {}
         assert store.reserve(["1"], IDENT, respect_plans=False) == {}
@@ -1444,11 +1465,8 @@ class TestReserveFresh:
             {"1": FetchRecord(error="http-429", retry_after_s=0.0)}, IDENT
         )
         clock.advance(store.entries(IDENT)["1"].backoff_until - clock.now)
-        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
-        store.set_poll_plan(
-            {"1": (clock.now + poll_policy.POST_429_MIN_INTERVAL_S,
-                   poll_policy.POST_429_MIN_INTERVAL_S)},
-            IDENT,
+        self._poll(
+            store, clock, interval=poll_policy.POST_429_MIN_INTERVAL_S, floor=True
         )
 
     def test_fresh_keeps_the_post_429_cadence(self, store, clock):
@@ -1461,11 +1479,29 @@ class TestReserveFresh:
         clock.advance(poll_policy.POST_429_MIN_INTERVAL_S)  # plan due
         assert set(self._reserve(store, fresh=True)) == {"1"}
 
+    def test_recency_alone_holds_fresh_when_no_floor_is_pending(
+        self, store, clock
+    ):
+        # The last poll was planned without a floor (field null), then a 429
+        # landed on a later fetch. Once its backoff lifts only recency stands
+        # between --fresh and a budget that just saturated.
+        plan_end = self._poll(store, clock)
+        clock.advance(10)
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=0.0)}, IDENT
+        )
+        clock.advance(store.entries(IDENT)["1"].backoff_until - clock.now)
+        assert self._raw_row(store)["post429FloorUntil"] is None  # premise
+        assert store.entries(IDENT)["1"].recent_429(clock.now)  # premise
+        assert self._reserve(store, fresh=False) == {}  # plan still pending
+        assert self._reserve(store, fresh=True) == {}
+        clock.advance(plan_end - clock.now)  # the plan comes due
+        assert set(self._reserve(store, fresh=True)) == {"1"}
+
     def test_fresh_resumes_once_the_429_is_no_longer_recent(self, store, clock):
         self._recovered_from_429(store, clock)
         clock.advance(usage_store.RECENT_429_WINDOW_S)
-        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
-        store.set_poll_plan({"1": (clock.now + 600.0, 600.0)}, IDENT)
+        self._poll(store, clock)
         assert not store.entries(IDENT)["1"].recent_429(clock.now)  # premise
         assert self._reserve(store, fresh=False) == {}
         assert set(self._reserve(store, fresh=True)) == {"1"}
@@ -1478,8 +1514,7 @@ class TestReserveFresh:
             {"1": FetchRecord(error="http-429", retry_after_s=0.0)}, IDENT
         )
         clock.advance(400)
-        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
-        store.set_poll_plan({"1": (clock.now + 1e6, 1e6)}, IDENT)
+        self._poll(store, clock, interval=1e6)
         clock.advance(usage_store.RECENT_429_WINDOW_S + 5000)
         store.record({"1": FetchRecord(error="timeout")}, IDENT)
         entry = store.entries(IDENT)["1"]
@@ -1501,12 +1536,8 @@ class TestReserveFresh:
             {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, IDENT
         )
         clock.advance(store.entries(IDENT)["1"].backoff_until - clock.now)
-        floor_end = clock.now + poll_policy.POST_429_MIN_INTERVAL_S
-        store.record(
-            {"1": FetchRecord(usage=USAGE)},
-            IDENT,
-            plans={"1": (floor_end, poll_policy.POST_429_MIN_INTERVAL_S)},
-            post_429_floors={"1"},
+        floor_end = self._poll(
+            store, clock, interval=poll_policy.POST_429_MIN_INTERVAL_S, floor=True
         )
         # Premise: recency alone no longer protects this row.
         assert not store.entries(IDENT)["1"].recent_429(clock.now)
@@ -1529,11 +1560,7 @@ class TestReserveFresh:
         # is free again even though the old floor's end is still ahead.
         floor_end = self._recovered_from_an_hour_block(store, clock)
         clock.advance(SERVE_TTL_S + 1)
-        store.record(
-            {"1": FetchRecord(usage=USAGE)},
-            IDENT,
-            plans={"1": (clock.now + 600.0, 600.0)},
-        )
+        self._poll(store, clock)
         clock.advance(1)
         assert clock.now < floor_end  # premise: the old floor would still hold
         assert self._reserve(store, fresh=False) == {}
@@ -1544,6 +1571,56 @@ class TestReserveFresh:
         self._recovered_from_an_hour_block(store, clock)
         clock.advance(1)
         store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        clock.advance(1)
+        assert self._reserve(store, fresh=True) == {}
+
+    def test_a_row_planned_before_floors_were_recorded_keeps_the_plain_rules(
+        self, store, clock
+    ):
+        # The previous version recovered from an hour block and installed the
+        # floor plan, but recorded no floor field. Whether the pending plan
+        # is protective is unknown, so --fresh must treat it as plain list.
+        floor_end = self._recovered_from_an_hour_block(store, clock)
+        self._as_written_before_floors(store)
+        assert "post429FloorUntil" not in self._raw_row(store)  # premise
+        clock.advance(1)
+        assert self._reserve(store, fresh=True) == {}
+        clock.advance(SERVE_TTL_S)  # stale, the old plan still pending
+        assert self._reserve(store, fresh=False) == {}
+        assert self._reserve(store, fresh=True) == {}
+        clock.advance(floor_end - clock.now)  # plain rules: the plan is due
+        assert set(self._reserve(store, fresh=True)) == {"1"}
+
+    def test_one_poll_by_this_version_settles_an_old_row(self, store, clock):
+        # The first success under this version writes the field (null: no
+        # floor), and from then on --fresh re-measures inside the serve TTL.
+        floor_end = self._recovered_from_an_hour_block(store, clock)
+        self._as_written_before_floors(store)
+        clock.advance(floor_end - clock.now)
+        self._poll(store, clock)
+        assert self._raw_row(store)["post429FloorUntil"] is None  # premise
+        clock.advance(1)
+        assert self._reserve(store, fresh=False) == {}
+        assert set(self._reserve(store, fresh=True)) == {"1"}
+
+    def test_a_plan_free_success_leaves_an_old_row_unknown(self, store, clock):
+        # A success that installs no plan says nothing about the stored plan,
+        # so it must not mark an old row's plan as floor-free.
+        self._recovered_from_an_hour_block(store, clock)
+        self._as_written_before_floors(store)
+        clock.advance(1)
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        assert "post429FloorUntil" not in self._raw_row(store)
+        clock.advance(1)
+        assert self._reserve(store, fresh=True) == {}
+
+    def test_an_unreadable_floor_field_is_as_unknown_as_a_missing_one(
+        self, store, clock
+    ):
+        self._poll(store, clock)
+        table = json.loads(store.path.read_text())
+        table["accounts"]["1"]["post429FloorUntil"] = "garbled"
+        store.path.write_text(json.dumps(table))
         clock.advance(1)
         assert self._reserve(store, fresh=True) == {}
 
