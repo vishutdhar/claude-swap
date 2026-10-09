@@ -1426,13 +1426,29 @@ class TestReserveFresh:
         assert self._reserve(store, fresh=True) == {}
         assert store.reserve(["1"], IDENT, respect_plans=False) == {}
 
+    # The guard tests below start from a row this version has polled (floor
+    # field present and null) and keep it free of any recent 429, so the
+    # fresh bypass WOULD fire if it were reached. A row recorded into an
+    # empty store has no floor field, falls to the plain rules, and cannot
+    # tell whether a guard sits above or below the bypass.
+
+    def _assert_bypass_reachable(self, store, clock):
+        row = self._raw_row(store)
+        assert "post429FloorUntil" in row and row["post429FloorUntil"] is None
+        assert not store.entries(IDENT)["1"].recent_429(clock.now)
+
     @pytest.mark.parametrize("error", sorted(usage_store.PERMANENT_AUTH_ERRORS))
     def test_fresh_never_wins_a_dead_token(self, store, clock, error):
+        self._poll(store, clock)
         store.record({"1": FetchRecord(error=error)}, IDENT)
         clock.advance(TRUST_MAX_AGE_S)  # backoff long gone; quarantine stays
+        self._assert_bypass_reachable(store, clock)
         assert self._reserve(store, fresh=True) == {}
 
     def test_fresh_waits_out_a_429_backoff(self, store, clock):
+        # A live 429 is also recent, so here the bypass is unreachable either
+        # way; the backoff guard's place is pinned by the timeout test below.
+        self._poll(store, clock)
         store.record(
             {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, IDENT
         )
@@ -1440,6 +1456,7 @@ class TestReserveFresh:
         assert self._reserve(store, fresh=True) == {}
 
     def test_fresh_waits_out_a_saturated_edge_429(self, store, clock):
+        self._poll(store, clock)
         store.record(
             {"1": FetchRecord(error="http-429", retry_after_s=0.0)}, IDENT
         )
@@ -1447,13 +1464,19 @@ class TestReserveFresh:
         assert self._reserve(store, fresh=True) == {}
 
     def test_fresh_waits_out_any_failure_backoff(self, store, clock):
+        self._poll(store, clock)
         store.record({"1": FetchRecord(error="timeout")}, IDENT)
         clock.advance(BACKOFF_BASE_S - 1)
+        self._assert_bypass_reachable(store, clock)
         assert self._reserve(store, fresh=True) == {}
+        clock.advance(2)  # the backoff lifts; still inside the serve TTL
+        assert set(self._reserve(store, fresh=True)) == {"1"}
 
     def test_fresh_skips_a_live_claim_until_it_ages_out(self, store, clock):
-        assert set(store.reserve(["1"], IDENT, respect_plans=True)) == {"1"}
+        self._poll(store, clock)
+        assert set(self._reserve(store, fresh=True)) == {"1"}  # another --fresh
         clock.advance(CLAIM_TTL_S - 1)
+        self._assert_bypass_reachable(store, clock)
         assert self._reserve(store, fresh=True) == {}
         clock.advance(2)  # a crashed claimer's lease has aged out
         assert set(self._reserve(store, fresh=True)) == {"1"}

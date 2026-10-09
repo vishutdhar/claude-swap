@@ -2164,6 +2164,39 @@ class TestListFresh:
         assert [str(c.args[0][0]) for c in fetch.call_args_list] == ["1"]
         assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
 
+    def test_a_dead_verdict_landing_after_the_snapshot_still_refuses_fresh(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        """The race the locked re-check exists for: the collector's snapshot
+        sees account 2 healthy, then another process records invalid_grant
+        before this collector's reservation. The reservation must refuse it.
+
+        The other process's clock is an hour back, so its failure backoff has
+        already lifted and only the quarantine guard stands between the
+        fresh bypass and a dead grant."""
+        s = self._switcher(sample_sequence_data)
+        self._seed(s)  # rows written by this version: the bypass is reachable
+        store = s._usage_store
+        other = UsageStore(store.path.parent, clock=lambda: time.time() - 3600.0)
+        real_reserve = store.reserve
+        snapshots = []
+
+        def reserve_after_the_verdict(*args, **kwargs):
+            snapshots.append(store.entries(self.IDENT)["2"].auth_dead_strikes)
+            other.record(
+                {"2": FetchRecord(error="invalid_grant")}, {"2": self.IDENT["2"]}
+            )
+            return real_reserve(*args, **kwargs)
+
+        with patch.object(store, "reserve", side_effect=reserve_after_the_verdict):
+            _, fetched = self._list(s, fresh=True)
+        assert snapshots == [0]  # premise: healthy when the collector looked
+        row2 = json.loads(store.path.read_text())["accounts"]["2"]
+        assert row2["authDeadStrikes"] == 1
+        assert row2["backoffUntil"] < time.time()  # only quarantine is left
+        assert fetched == ["1"]
+        assert store.entries(self.IDENT)["2"].last_good == self.OLD["2"]
+
     def test_fresh_remeasures_a_disabled_account_because_list_shows_it(
         self, temp_home, mock_claude_config, sample_sequence_data
     ):
