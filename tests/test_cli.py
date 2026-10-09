@@ -1021,6 +1021,66 @@ class TestJsonOutputCli:
         assert captured.err == ""  # nothing on stderr in JSON mode
 
 
+class TestListFreshCli:
+    """``--fresh`` reaches ``list_accounts`` only when given and only with
+    ``list``; the plain list call keeps its exact arguments (pinned by
+    ``test_list_subcommand_with_json`` and ``test_list_json_serialized_to_stdout``)."""
+
+    def _list_accounts_after(self, argv):
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", argv), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            switcher_cls.return_value.list_accounts.return_value = {
+                "schemaVersion": 1, "activeAccountNumber": None, "accounts": [],
+            }
+            cli.main()
+        return switcher_cls.return_value.list_accounts
+
+    def test_list_json_fresh_is_forwarded(self, capsys):
+        list_accounts = self._list_accounts_after(
+            ["claude-swap", "list", "--json", "--fresh"]
+        )
+        list_accounts.assert_called_once_with(
+            show_token_status=False, json_output=True, fresh=True,
+        )
+        assert json.loads(capsys.readouterr().out)["accounts"] == []
+
+    def test_list_fresh_without_json_is_forwarded(self):
+        list_accounts = self._list_accounts_after(["claude-swap", "list", "--fresh"])
+        list_accounts.assert_called_once_with(
+            show_token_status=False, json_output=False, fresh=True,
+        )
+
+    def test_legacy_list_flag_takes_fresh_too(self):
+        list_accounts = self._list_accounts_after(
+            ["claude-swap", "--list", "--fresh", "--json"]
+        )
+        list_accounts.assert_called_once_with(
+            show_token_status=False, json_output=True, fresh=True,
+        )
+
+    @pytest.mark.parametrize("verb", [["status"], ["switch"], ["status", "--json"]])
+    def test_fresh_requires_list(self, capsys, verb):
+        with patch.object(sys, "argv", ["claude-swap", *verb, "--fresh"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 2
+        assert "--fresh can only be used with 'list'" in capsys.readouterr().err
+
+    def test_list_help_mentions_fresh(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "claude_swap", "list", "--help"],
+            capture_output=True,
+            text=True,
+            env=_subprocess_env(),
+        )
+        assert result.returncode == 0
+        lines = [ln for ln in result.stdout.splitlines() if "--fresh" in ln]
+        assert len(lines) == 1, result.stdout
+        assert "list" in lines[0]
+
+
 class TestAutoCommand:
     """`cswap auto` pre-dispatch: parsing, settings merge, exit codes, JSONL."""
 

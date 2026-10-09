@@ -82,6 +82,33 @@ def _live_claim(
         and (now - last_attempt_at) < LEGACY_CLAIM_TTL_S
     )
 
+
+def _recent_429(
+    last_429_at: float | None,
+    last_error: object,
+    backoff_until: float | None,
+    now: float,
+) -> bool:
+    """Whether a token's 429 is recent enough to keep the post-429 cadence.
+
+    The single source of truth for 429 recency. ``UsageEntry.recent_429``
+    (the poll planner's input) and ``_row_eligible``'s ``fresh`` mode must
+    agree, or a forced re-measure could spend the budget the planner's
+    post-429 floor is holding back. See ``UsageEntry.recent_429`` for why the
+    anchor is the 429 backoff's end rather than the stamp.
+    """
+    if last_429_at is None:
+        return False
+    anchor = last_429_at
+    if (
+        last_error == "http-429"
+        and backoff_until is not None
+        and backoff_until > anchor
+    ):
+        anchor = backoff_until
+    return now < anchor + RECENT_429_WINDOW_S
+
+
 # Deliberate staleness (failure backoff, scheduler-chosen cadence) extends
 # decision trust past STALE_OK_S, but never past this ceiling: a forever-failing
 # account must eventually read as unknown so the unknown-path machinery
@@ -324,22 +351,15 @@ class UsageEntry:
         still expires normally. Bounded by ``RECENT_429_WINDOW_S`` past the
         anchor so it clears once the saturated window has aged out.
         """
-        if self.last_429_at is None:
-            return False
-        anchor = self.last_429_at
         # Use the backoff anchor only while the LIVE backoff is a 429 backoff.
         # last429At is never cleared, but backoffUntil/lastError are rewritten by
         # any later failure — so without the lastError guard an unrelated timeout
         # on a token that 429'd long ago would install a fresh backoffUntil and
         # spuriously re-arm the post-429 cadence. Success clears lastError and
         # backoffUntil; only a 429 sets last429At and backoffUntil together.
-        if (
-            self.last_error == "http-429"
-            and self.backoff_until is not None
-            and self.backoff_until > anchor
-        ):
-            anchor = self.backoff_until
-        return now < anchor + RECENT_429_WINDOW_S
+        return _recent_429(
+            self.last_429_at, self.last_error, self.backoff_until, now
+        )
 
     def claimed(self, now: float) -> bool:
         """Whether another collector's bounded fetch lease is still live."""
@@ -988,6 +1008,7 @@ class UsageStore:
         *,
         respect_plans: bool,
         repair_overslept: bool = False,
+        fresh: bool = False,
     ) -> dict[str, str]:
         """Atomically win the right to fetch: re-check eligibility and stamp
         a bounded lease in one locked pass, returning slot → fencing id.
@@ -1010,6 +1031,13 @@ class UsageStore:
           ``repair_overslept``, this becomes the non-escalating scheduler mode:
           due plans and stale impossible plans win, but valid future plans do
           not.
+
+        ``fresh=True`` (``cswap list --fresh``) skips the mode rules above:
+        the caller asked to re-measure now, so neither the serve TTL nor the
+        poll plan holds a slot back. The guards still do: quarantine, backoff
+        and a live claim refuse it as always. A token that 429'd recently
+        (``UsageEntry.recent_429``) keeps the mode rules, so a forced
+        re-measure never spends what the post-429 cadence floor is saving.
         """
         nums = list(nums)
         if not nums:
@@ -1026,7 +1054,7 @@ class UsageStore:
                 else:
                     assert isinstance(row, dict)
                     if not _row_eligible(
-                        row, now, respect_plans, repair_overslept
+                        row, now, respect_plans, repair_overslept, fresh
                     ):
                         continue
                 claim_id = uuid.uuid4().hex
@@ -1183,10 +1211,14 @@ def _num_or_none(value: object) -> float | None:
 
 
 def _row_eligible(
-    row: dict, now: float, respect_plans: bool, repair_overslept: bool = False
+    row: dict,
+    now: float,
+    respect_plans: bool,
+    repair_overslept: bool = False,
+    fresh: bool = False,
 ) -> bool:
     """Fetch eligibility of a stored row, evaluated under the write lock
-    (see :meth:`UsageStore.reserve` for the two caller modes)."""
+    (see :meth:`UsageStore.reserve` for the caller modes)."""
     if int(row.get("authDeadStrikes") or 0) >= AUTH_DEAD_STRIKES:
         return False
     backoff_until = _num_or_none(row.get("backoffUntil"))
@@ -1198,6 +1230,15 @@ def _row_eligible(
         now,
     ):
         return False
+    # After every guard, never before: a forced re-measure still respects
+    # quarantine, backoff and another collector's lease.
+    if fresh and not _recent_429(
+        _num_or_none(row.get("last429At")),
+        row.get("lastError"),
+        backoff_until,
+        now,
+    ):
+        return True
     fetched_at = _num_or_none(row.get("fetchedAt"))
     stale = fetched_at is None or (now - fetched_at) > SERVE_TTL_S
     next_poll_at = _num_or_none(row.get("nextPollAt"))

@@ -4898,6 +4898,7 @@ class ClaudeAccountSwitcher:
         fetch: set[str] | None = None,
         *,
         scheduled: bool = False,
+        fresh: bool = False,
     ) -> dict[str, UsageEntry]:
         """Store-backed usage collection: one :class:`UsageEntry` per account.
 
@@ -4914,6 +4915,11 @@ class ClaudeAccountSwitcher:
         the same plan. A failed fetch only updates the entry's error/backoff
         fields, so the last-good measurement keeps being served
         (stale-on-error).
+
+        ``fresh=True`` (``cswap list --fresh``) re-measures every candidate
+        now, past the serve TTL and the poll plans; ``UsageStore.reserve``
+        still refuses quarantined, backed-off, claimed and recently-429'd
+        slots, which are served as they are.
         """
         store = self._usage_store
         identities = {
@@ -4967,6 +4973,7 @@ class ClaudeAccountSwitcher:
                 identities,
                 respect_plans=True,
                 repair_overslept=True,
+                fresh=fresh,
             )
         else:
             claims = store.reserve(
@@ -4974,6 +4981,7 @@ class ClaudeAccountSwitcher:
                 identities,
                 respect_plans=False,
                 repair_overslept=scheduled,
+                fresh=fresh,
             )
         # An expired ACTIVE credential that cannot reach the fetch path (and
         # its locked refresh) this tick — failure backoff, a concurrent
@@ -5457,6 +5465,7 @@ class ClaudeAccountSwitcher:
         show_token_status: bool = False,
         json_output: bool = False,
         fetch: set[str] | None = None,
+        fresh: bool = False,
     ) -> dict | None:
         """List all managed accounts.
 
@@ -5466,6 +5475,10 @@ class ClaudeAccountSwitcher:
         ``fetch`` restricts which accounts *may* be fetched this pass (the TUI
         watch view's adaptive set); ``None`` — the CLI default — leaves every
         stale account eligible.
+
+        ``fresh`` (``cswap list --fresh``) re-measures every account now
+        instead of serving measurements inside the serve TTL; see
+        ``_collect_usage_entries`` for the slots it still leaves alone.
         """
         if not self.sequence_file.exists():
             # JSON mode must never prompt — emit an empty list instead of the
@@ -5481,7 +5494,9 @@ class ClaudeAccountSwitcher:
             return None
 
         accounts_info = self._build_accounts_info()
-        entries = self._collect_usage_entries(accounts_info, fetch=fetch)
+        entries = self._collect_usage_entries(
+            accounts_info, fetch=fetch, fresh=fresh
+        )
 
         if json_output:
             return self._build_list_payload(accounts_info, entries)

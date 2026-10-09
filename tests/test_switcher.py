@@ -1900,6 +1900,208 @@ class TestListAccountsUsage:
         assert mock_fetch.call_args.args[0] == "2"
 
 
+class TestListFresh:
+    """``cswap list --fresh``: every eligible account is re-measured now,
+    through the same reserve -> fetch -> record path a due refresh takes, while
+    plain ``list`` keeps serving rows inside the serve TTL untouched."""
+
+    IDENT = {
+        "1": ("test@example.com", ""),
+        "2": ("account2@example.com", ""),
+    }
+    OLD = {
+        "1": {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 20.0}},
+        "2": {"five_hour": {"pct": 30.0}, "seven_day": {"pct": 40.0}},
+    }
+    NEW = {
+        "1": {"five_hour": {"pct": 11.0}, "seven_day": {"pct": 21.0}},
+        "2": {"five_hour": {"pct": 31.0}, "seven_day": {"pct": 41.0}},
+    }
+    AGE_S = 60.0  # inside SERVE_TTL_S: plain list must serve, not fetch
+
+    def _switcher(self, sample_sequence_data, disabled=()):
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        for num in disabled:
+            sample_sequence_data["accounts"][num]["disabled"] = True
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        return s
+
+    def _seed(self, s):
+        """Both rows measured AGE_S ago, with poll plans far in the future."""
+        store = s._usage_store
+        store.record(
+            {n: FetchRecord(usage=self.OLD[n]) for n in self.IDENT}, self.IDENT
+        )
+        store.set_poll_plan(
+            {n: (time.time() + 600.0, 600.0) for n in self.IDENT}, self.IDENT
+        )
+        table = json.loads(store.path.read_text())
+        for row in table["accounts"].values():
+            row["fetchedAt"] -= self.AGE_S
+        store.path.write_text(json.dumps(table))
+        return {n: e.fetched_at for n, e in store.entries(self.IDENT).items()}
+
+    def _creds(self):
+        live = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        backup = json.dumps({"claudeAiOauth": {"accessToken": "sk-backup"}})
+        return (
+            patch.object(
+                ClaudeAccountSwitcher,
+                "_read_active_credentials",
+                return_value=ActiveCredentials(live, False),
+            ),
+            patch.object(
+                ClaudeAccountSwitcher, "_read_account_credentials", return_value=backup
+            ),
+        )
+
+    def _list(self, s, **kwargs):
+        live, backup = self._creds()
+        with live, backup, patch.object(
+            s,
+            "_fetch_account_usage",
+            side_effect=lambda info: FetchRecord(usage=self.NEW[str(info[0])]),
+        ) as fetch:
+            payload = s.list_accounts(json_output=True, **kwargs)
+        fetched = sorted(str(c.args[0][0]) for c in fetch.call_args_list)
+        return payload, fetched
+
+    @staticmethod
+    def _ages(payload):
+        return {str(r["number"]): r["usageAgeSeconds"] for r in payload["accounts"]}
+
+    def test_plain_list_serves_rows_inside_the_ttl_without_fetching(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        s = self._switcher(sample_sequence_data)
+        before = self._seed(s)
+        payload, fetched = self._list(s)
+        assert fetched == []
+        assert all(age >= self.AGE_S for age in self._ages(payload).values())
+        after = s._usage_store.entries(self.IDENT)
+        assert {n: e.fetched_at for n, e in after.items()} == before
+        assert {n: e.last_good for n, e in after.items()} == self.OLD
+
+    def test_fresh_remeasures_every_account_once_and_records_it(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        s = self._switcher(sample_sequence_data)
+        before = self._seed(s)
+        payload, fetched = self._list(s, fresh=True)
+        assert fetched == ["1", "2"]  # one fetch per account, active included
+        assert all(age < 5.0 for age in self._ages(payload).values())
+        after = s._usage_store.entries(self.IDENT)
+        for n in self.IDENT:
+            assert after[n].fetched_at > before[n]
+            assert after[n].last_good == self.NEW[n]
+            assert after[n].claim_until == 0.0  # lease released by record()
+            assert after[n].next_poll_at > time.time()  # replanned in-transaction
+
+    def test_plain_list_right_after_fresh_serves_the_new_measurement(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        s = self._switcher(sample_sequence_data)
+        self._seed(s)
+        self._list(s, fresh=True)
+        stamps = {n: e.fetched_at for n, e in s._usage_store.entries(self.IDENT).items()}
+        payload, fetched = self._list(s)
+        assert fetched == []
+        assert all(age < 5.0 for age in self._ages(payload).values())
+        assert {
+            n: e.fetched_at for n, e in s._usage_store.entries(self.IDENT).items()
+        } == stamps
+
+    def test_fresh_serves_backoff_and_claimed_rows_as_they_are(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        s = self._switcher(sample_sequence_data)
+        self._seed(s)
+        store = s._usage_store
+        # Account 2 is inside a 429 block; nothing about it may be fetched.
+        store.record(
+            {"2": FetchRecord(error="http-429", retry_after_s=3600.0)},
+            {"2": self.IDENT["2"]},
+        )
+        payload, fetched = self._list(s, fresh=True)
+        assert fetched == ["1"]
+        row2 = next(r for r in payload["accounts"] if r["number"] == 2)
+        assert store.entries(self.IDENT)["2"].last_good == self.OLD["2"]
+        assert row2["usageAgeSeconds"] >= self.AGE_S  # stale-on-error kept
+
+        # Another process holds a live claim on account 1: served as is.
+        store.reserve(["1"], {"1": self.IDENT["1"]}, respect_plans=False, fresh=True)
+        held = store.entries(self.IDENT)["1"].fetched_at
+        payload, fetched = self._list(s, fresh=True)
+        assert fetched == []
+        assert store.entries(self.IDENT)["1"].fetched_at == held
+
+    def test_a_failure_during_fresh_keeps_last_good_like_the_normal_path(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        s = self._switcher(sample_sequence_data)
+        before = self._seed(s)
+        outcomes = {
+            "1": FetchRecord(usage=self.NEW["1"]),
+            "2": FetchRecord(error="http-429", retry_after_s=0.0),
+        }
+        live, backup = self._creds()
+        with live, backup, patch.object(
+            s, "_fetch_account_usage",
+            side_effect=lambda info: outcomes[str(info[0])],
+        ):
+            payload = s.list_accounts(json_output=True, fresh=True)
+        after = s._usage_store.entries(self.IDENT)
+        # Stale-on-error: the 429 moved only the failure fields.
+        assert after["2"].last_good == self.OLD["2"]
+        assert after["2"].fetched_at == before["2"]
+        assert after["2"].last_error == "http-429"
+        assert after["2"].in_backoff(time.time())
+        assert after["1"].last_good == self.NEW["1"]
+        # And the row reads exactly as a plain list right after reports it.
+        plain, fetched = self._list(s)
+        assert fetched == []  # account 2 is in backoff, account 1 is fresh
+        rows = {r["number"]: r for r in payload["accounts"]}
+        plain_rows = {r["number"]: r for r in plain["accounts"]}
+        assert rows[2]["usageStatus"] == plain_rows[2]["usageStatus"] == "ok"
+        assert rows[2]["usage"] == plain_rows[2]["usage"]
+        assert rows[2]["usageAgeSeconds"] >= self.AGE_S
+
+    def test_fresh_leaves_a_quarantined_account_unfetched(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+
+        s = self._switcher(sample_sequence_data)
+        self._seed(s)
+        s._usage_store.record(
+            {"2": FetchRecord(error="invalid_grant")}, {"2": self.IDENT["2"]}
+        )
+        live, backup = self._creds()
+        with live, backup, patch.object(
+            s,
+            "_fetch_account_usage",
+            side_effect=lambda info: FetchRecord(usage=self.NEW[str(info[0])]),
+        ) as fetch:
+            entries = s._collect_usage_entries(s._build_accounts_info(), fresh=True)
+        assert [str(c.args[0][0]) for c in fetch.call_args_list] == ["1"]
+        assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
+
+    def test_fresh_remeasures_a_disabled_account_because_list_shows_it(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        # `list` does not skip disabled slots (they are listed and fetched when
+        # stale), so --fresh measures them too rather than inventing a skip.
+        s = self._switcher(sample_sequence_data, disabled=("2",))
+        self._seed(s)
+        payload, fetched = self._list(s, fresh=True)
+        assert fetched == ["1", "2"]
+        row2 = next(r for r in payload["accounts"] if r["number"] == 2)
+        assert row2.get("disabled") is True
+        assert row2["usageAgeSeconds"] < 5.0
+
+
 class TestUsageFetchStamps:
     def test_stamps_reflect_store_without_fetching(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict

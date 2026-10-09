@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from claude_swap import oauth, usage_store
+from claude_swap import oauth, poll_policy, usage_store
 from claude_swap.usage_store import (
     BACKOFF_BASE_S,
     BACKOFF_CAP_S,
@@ -1365,6 +1365,141 @@ class TestReserve:
         store.record({"2": FetchRecord(usage=USAGE)}, IDENT)
         other = {"2": ("new@x.com", "org-9")}
         assert set(store.reserve(["2"], other, respect_plans=True)) == {"2"}
+
+
+class TestReserveFresh:
+    """``cswap list --fresh``: re-measure now, past the serve TTL and the poll
+    plan, but never past the guards that protect the account or the request
+    budget. A quarantined token, a failure backoff, and another collector's
+    live claim still refuse the slot; a token that 429'd recently follows the
+    normal rule, so the post-429 cadence floor is not re-spent."""
+
+    def _reserve(self, store, *, fresh: bool):
+        # The exact call the list path makes (respect_plans + overslept repair).
+        return store.reserve(
+            ["1"], IDENT, respect_plans=True, repair_overslept=True, fresh=fresh
+        )
+
+    def test_fresh_wins_inside_the_serve_ttl(self, store, clock):
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        clock.advance(SERVE_TTL_S / 2)
+        assert self._reserve(store, fresh=False) == {}
+        assert set(self._reserve(store, fresh=True)) == {"1"}
+
+    def test_fresh_wins_ahead_of_a_future_poll_plan(self, store, clock):
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        clock.advance(SERVE_TTL_S + 1)  # stale, but the plan is not due
+        store.set_poll_plan(
+            {"1": (clock.now + poll_policy.CANDIDATE_MAX_INTERVAL_S,
+                   poll_policy.CANDIDATE_MAX_INTERVAL_S)},
+            IDENT,
+        )
+        assert self._reserve(store, fresh=False) == {}
+        assert set(self._reserve(store, fresh=True)) == {"1"}
+
+    def test_fresh_stamps_a_claim_like_any_reservation(self, store, clock):
+        # The lease is what keeps a concurrent collector (the daemon, a second
+        # --fresh) off the slot while this fetch is in flight.
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        assert set(self._reserve(store, fresh=True)) == {"1"}
+        assert self._reserve(store, fresh=True) == {}
+        assert store.reserve(["1"], IDENT, respect_plans=False) == {}
+
+    @pytest.mark.parametrize("error", sorted(usage_store.PERMANENT_AUTH_ERRORS))
+    def test_fresh_never_wins_a_dead_token(self, store, clock, error):
+        store.record({"1": FetchRecord(error=error)}, IDENT)
+        clock.advance(TRUST_MAX_AGE_S)  # backoff long gone; quarantine stays
+        assert self._reserve(store, fresh=True) == {}
+
+    def test_fresh_waits_out_a_429_backoff(self, store, clock):
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, IDENT
+        )
+        clock.advance(3600.0)  # the server's deadline; the margin still holds
+        assert self._reserve(store, fresh=True) == {}
+
+    def test_fresh_waits_out_a_saturated_edge_429(self, store, clock):
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=0.0)}, IDENT
+        )
+        clock.advance(usage_store.EDGE_BACKOFF_S - 1)
+        assert self._reserve(store, fresh=True) == {}
+
+    def test_fresh_waits_out_any_failure_backoff(self, store, clock):
+        store.record({"1": FetchRecord(error="timeout")}, IDENT)
+        clock.advance(BACKOFF_BASE_S - 1)
+        assert self._reserve(store, fresh=True) == {}
+
+    def test_fresh_skips_a_live_claim_until_it_ages_out(self, store, clock):
+        assert set(store.reserve(["1"], IDENT, respect_plans=True)) == {"1"}
+        clock.advance(CLAIM_TTL_S - 1)
+        assert self._reserve(store, fresh=True) == {}
+        clock.advance(2)  # a crashed claimer's lease has aged out
+        assert set(self._reserve(store, fresh=True)) == {"1"}
+
+    def _recovered_from_429(self, store, clock):
+        """A Retry-After: 0 block that lifted, then its first success, planned
+        on the post-429 floor (what the collector writes in that case)."""
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=0.0)}, IDENT
+        )
+        clock.advance(store.entries(IDENT)["1"].backoff_until - clock.now)
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        store.set_poll_plan(
+            {"1": (clock.now + poll_policy.POST_429_MIN_INTERVAL_S,
+                   poll_policy.POST_429_MIN_INTERVAL_S)},
+            IDENT,
+        )
+
+    def test_fresh_keeps_the_post_429_cadence(self, store, clock):
+        self._recovered_from_429(store, clock)
+        assert store.entries(IDENT)["1"].recent_429(clock.now)  # premise
+        clock.advance(1)  # inside the serve TTL
+        assert self._reserve(store, fresh=True) == {}
+        clock.advance(SERVE_TTL_S)  # stale, the post-429 plan not yet due
+        assert self._reserve(store, fresh=True) == {}
+        clock.advance(poll_policy.POST_429_MIN_INTERVAL_S)  # plan due
+        assert set(self._reserve(store, fresh=True)) == {"1"}
+
+    def test_fresh_resumes_once_the_429_is_no_longer_recent(self, store, clock):
+        self._recovered_from_429(store, clock)
+        clock.advance(usage_store.RECENT_429_WINDOW_S)
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        store.set_poll_plan({"1": (clock.now + 600.0, 600.0)}, IDENT)
+        assert not store.entries(IDENT)["1"].recent_429(clock.now)  # premise
+        assert self._reserve(store, fresh=False) == {}
+        assert set(self._reserve(store, fresh=True)) == {"1"}
+
+    def test_fresh_reads_recency_like_the_planner(self, store, clock):
+        # The locked predicate and UsageEntry.recent_429 are one rule: an old
+        # 429 whose only live backoff is an unrelated timeout's is NOT recent,
+        # so the timeout's lifted backoff must not hold --fresh to the plan.
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=0.0)}, IDENT
+        )
+        clock.advance(400)
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        store.set_poll_plan({"1": (clock.now + 1e6, 1e6)}, IDENT)
+        clock.advance(usage_store.RECENT_429_WINDOW_S + 5000)
+        store.record({"1": FetchRecord(error="timeout")}, IDENT)
+        entry = store.entries(IDENT)["1"]
+        clock.advance(entry.backoff_until - clock.now)  # the timeout just lifted
+        entry = store.entries(IDENT)["1"]
+        # Premises: the timeout's backoff is the live one, the planner reads
+        # no recent 429, and the plain rule refuses (the plan is not due).
+        assert entry.last_error == "timeout" and entry.backoff_until == clock.now
+        assert not entry.recent_429(clock.now)
+        assert self._reserve(store, fresh=False) == {}
+        assert set(self._reserve(store, fresh=True)) == {"1"}
+
+    def test_fresh_defaults_off(self, store, clock):
+        # Every existing caller omits the keyword: the default must be the
+        # plain serve rule, never the bypass.
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        assert store.reserve(["1"], IDENT, respect_plans=True) == {}
+        assert store.reserve(
+            ["1"], IDENT, respect_plans=True, repair_overslept=True
+        ) == {}
 
 
 class TestLast429Marker:
