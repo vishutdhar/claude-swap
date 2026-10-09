@@ -2068,6 +2068,47 @@ class TestListFresh:
         assert rows[2]["usage"] == plain_rows[2]["usage"]
         assert rows[2]["usageAgeSeconds"] >= self.AGE_S
 
+    def test_fresh_honours_the_floor_a_real_recovery_poll_installs(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        """The review's scenario end to end: a Retry-After: 3600 block has
+        just lifted, a plain list polls the account successfully (the real
+        planner installs the post-429 floor and the success clears the 429's
+        own fields), and a --fresh one moment later must serve it, exactly as
+        a plain list would."""
+        from claude_swap import poll_policy
+
+        s = self._switcher(sample_sequence_data)
+        self._seed(s)
+        store = s._usage_store
+        now = time.time()
+        table = json.loads(store.path.read_text())
+        row = table["accounts"]["2"]
+        row.update(
+            fetchedAt=now - 5000.0,
+            lastAttemptAt=now - 4501.0,
+            lastError="http-429",
+            consecutiveFailures=1,
+            last429At=now - 4501.0,
+            backoffUntil=now - 1.0,  # 4500 s park (3600 + margin) just lifted
+            nextPollAt=now - 4600.0,
+            pollIntervalS=300.0,
+        )
+        store.path.write_text(json.dumps(table))
+
+        _, fetched = self._list(s)
+        assert fetched == ["2"]  # premise: the plain poll took the recovery
+        after = store.entries(self.IDENT)["2"]
+        assert after.last_error is None and after.backoff_until is None
+        assert after.poll_interval_s >= poll_policy.POST_429_MIN_INTERVAL_S
+        assert not after.recent_429(time.time())  # recency alone is gone
+
+        payload, fetched = self._list(s, fresh=True)
+        assert fetched == ["1"]  # account 2 is served on its floor
+        assert store.entries(self.IDENT)["2"].fetched_at == after.fetched_at
+        _, plain = self._list(s)
+        assert plain == []
+
     def test_fresh_leaves_a_quarantined_account_unfetched(
         self, temp_home, mock_claude_config, sample_sequence_data
     ):

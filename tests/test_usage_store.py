@@ -1492,6 +1492,61 @@ class TestReserveFresh:
         assert self._reserve(store, fresh=False) == {}
         assert set(self._reserve(store, fresh=True)) == {"1"}
 
+    def _recovered_from_an_hour_block(self, store, clock):
+        """A Retry-After: 3600 block, then its first success, planned on the
+        post-429 floor. The block outlasts the 429's own recency window and
+        the success clears lastError/backoffUntil, so only the floor plan is
+        left protecting the budget. Returns the floor's end."""
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, IDENT
+        )
+        clock.advance(store.entries(IDENT)["1"].backoff_until - clock.now)
+        floor_end = clock.now + poll_policy.POST_429_MIN_INTERVAL_S
+        store.record(
+            {"1": FetchRecord(usage=USAGE)},
+            IDENT,
+            plans={"1": (floor_end, poll_policy.POST_429_MIN_INTERVAL_S)},
+            post_429_floors={"1"},
+        )
+        # Premise: recency alone no longer protects this row.
+        assert not store.entries(IDENT)["1"].recent_429(clock.now)
+        return floor_end
+
+    def test_fresh_honours_the_post_429_floor_after_an_hour_block(
+        self, store, clock
+    ):
+        floor_end = self._recovered_from_an_hour_block(store, clock)
+        clock.advance(1)
+        assert self._reserve(store, fresh=True) == {}
+        clock.advance(SERVE_TTL_S)  # stale, the floor still pending
+        assert self._reserve(store, fresh=True) == {}
+        clock.advance(floor_end - clock.now)  # the floor ends
+        assert set(self._reserve(store, fresh=True)) == {"1"}
+
+    def test_a_non_floor_plan_ends_the_floor_early(self, store, clock):
+        # A success planned without the floor (an escalation fetch once the
+        # 429 is no longer recent) replaces the protective plan, so --fresh
+        # is free again even though the old floor's end is still ahead.
+        floor_end = self._recovered_from_an_hour_block(store, clock)
+        clock.advance(SERVE_TTL_S + 1)
+        store.record(
+            {"1": FetchRecord(usage=USAGE)},
+            IDENT,
+            plans={"1": (clock.now + 600.0, 600.0)},
+        )
+        clock.advance(1)
+        assert clock.now < floor_end  # premise: the old floor would still hold
+        assert self._reserve(store, fresh=False) == {}
+        assert set(self._reserve(store, fresh=True)) == {"1"}
+
+    def test_a_plan_free_success_keeps_the_floor(self, store, clock):
+        # A success that installs no plan leaves the floor plan in force.
+        self._recovered_from_an_hour_block(store, clock)
+        clock.advance(1)
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        clock.advance(1)
+        assert self._reserve(store, fresh=True) == {}
+
     def test_fresh_defaults_off(self, store, clock):
         # Every existing caller omits the keyword: the default must be the
         # plain serve rule, never the bypass.

@@ -5005,8 +5005,10 @@ class ClaudeAccountSwitcher:
             records = self._run_usage_fetches(
                 [info_by_num[num] for num in claims]
             )
-            plans = self._plans_after_fetch(records, pre, info_by_num)
-            accepted = store.record(records, identities, claims, plans)
+            plans, floors = self._plans_after_fetch(records, pre, info_by_num)
+            accepted = store.record(
+                records, identities, claims, plans, post_429_floors=floors
+            )
             accepted_records = {
                 num: record for num, record in records.items() if num in accepted
             }
@@ -5139,20 +5141,25 @@ class ClaudeAccountSwitcher:
         records: dict[str, FetchRecord],
         pre: dict[str, UsageEntry],
         info_by_num: dict[str, tuple],
-    ) -> dict[str, tuple[float | None, float | None]]:
+    ) -> tuple[dict[str, tuple[float | None, float | None]], set[str]]:
         """Build successful-fetch cadence updates for atomic outcome commit.
 
         Failures are paced by the store's backoff and keep their past-due plan
-        for when the backoff lifts.
+        for when the backoff lifts. Also returns the slots planned on the
+        post-429 floor, which the store records so ``list --fresh`` honours
+        that plan after the success has cleared the 429's own fields.
         """
         now = self._usage_store.clock()
         threshold, models = self._poll_policy_inputs()
         plans: dict[str, tuple[float | None, float | None]] = {}
+        floors: set[str] = set()
         for num, rec in records.items():
             if rec.sentinel is not None or rec.error is not None:
                 continue
             before = pre.get(num)
             recent_429 = before is not None and before.recent_429(now)
+            if recent_429:
+                floors.add(num)
             plans[num] = poll_policy.plan_after_fetch(
                 prev_interval_s=before.poll_interval_s if before else None,
                 prev_usage=before.last_good if before else None,
@@ -5163,7 +5170,7 @@ class ClaudeAccountSwitcher:
                 recent_429=recent_429,
                 now=now,
             )
-        return plans
+        return plans, floors
 
     def _replan_new_active(self, number: str, email: str, org_uuid: str) -> None:
         """Pull the just-activated account's poll plan to the active floor.

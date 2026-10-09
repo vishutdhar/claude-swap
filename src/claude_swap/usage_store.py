@@ -1036,8 +1036,9 @@ class UsageStore:
         the caller asked to re-measure now, so neither the serve TTL nor the
         poll plan holds a slot back. The guards still do: quarantine, backoff
         and a live claim refuse it as always. A token that 429'd recently
-        (``UsageEntry.recent_429``) keeps the mode rules, so a forced
-        re-measure never spends what the post-429 cadence floor is saving.
+        (``UsageEntry.recent_429``), or whose post-429 floor plan is still
+        pending (``post429FloorUntil``, see :meth:`record`), keeps the mode
+        rules, so a forced re-measure never spends what that floor is saving.
         """
         nums = list(nums)
         if not nums:
@@ -1072,6 +1073,7 @@ class UsageStore:
         identities: dict[str, Identity],
         claims: dict[str, str] | None = None,
         plans: dict[str, tuple[float | None, float | None]] | None = None,
+        post_429_floors: Iterable[str] = (),
     ) -> set[str]:
         """Merge outcomes fenced by the leases that produced them.
 
@@ -1083,7 +1085,14 @@ class UsageStore:
         only the claim and are otherwise never persisted. Unfenced callers
         (no ``claims``) defer to a live lease but never to an expired one.
         Returns the accepted slots.
+
+        ``post_429_floors`` names the slots whose supplied plan is the
+        planner's post-429 floor. Its end (the plan's ``nextPollAt``) is kept
+        as ``post429FloorUntil``, because this same success clears the 429's
+        own fields and a ``fresh`` reservation must still honour the floor. A
+        plan installed without the floor ends it.
         """
+        post_429_floors = set(post_429_floors)
         if not outcomes:
             return set()
         now = self.clock()
@@ -1105,6 +1114,9 @@ class UsageStore:
                 plan = plans.get(num) if plans is not None else None
                 if plan is not None:
                     row["nextPollAt"], row["pollIntervalS"] = plan
+                    row["post429FloorUntil"] = (
+                        plan[0] if num in post_429_floors else None
+                    )
                 row["consecutiveFailures"] = 0
                 row["lastError"] = None
                 row["backoffUntil"] = None
@@ -1231,12 +1243,19 @@ def _row_eligible(
     ):
         return False
     # After every guard, never before: a forced re-measure still respects
-    # quarantine, backoff and another collector's lease.
-    if fresh and not _recent_429(
-        _num_or_none(row.get("last429At")),
-        row.get("lastError"),
-        backoff_until,
-        now,
+    # quarantine, backoff and another collector's lease. The floor is checked
+    # on its own because recency alone lapses: the success that installs the
+    # floor clears the 429's fields, and after an hour-scale block the 429's
+    # stamp is already older than its recency window.
+    floor_until = _num_or_none(row.get("post429FloorUntil"))
+    if fresh and not (
+        _recent_429(
+            _num_or_none(row.get("last429At")),
+            row.get("lastError"),
+            backoff_until,
+            now,
+        )
+        or (floor_until is not None and now < floor_until)
     ):
         return True
     fetched_at = _num_or_none(row.get("fetchedAt"))
