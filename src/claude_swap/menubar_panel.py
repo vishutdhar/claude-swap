@@ -31,25 +31,29 @@ from claude_swap.tui.theme import CRIT_PCT, WARN_PCT
 # ---- layout constants (points) --------------------------------------------------
 
 PANEL_WIDTH = 340.0
-LEFT_INSET = 14.0  # native menu text inset
+LEFT_INSET = 14.0  # native menu text inset; the slot number starts here
 RIGHT_INSET = 12.0
-DOT_COLUMN = 12.0  # the active dot, then the slot number / row labels
-DOT_DIAMETER = 6.0
-BAR_HEIGHT = 6.0
-TICK_WIDTH = 1.5
+NUM_COLUMN = 12.0  # the slot number's gutter; the name and row labels start after it
+NUM_GAP = 4.0  # least space between a number wider than the gutter and the name
+BAR_HEIGHT = 5.0
+TICK_WIDTH = 1.0
 TICK_OVERHANG = 2.0  # the tick stands proud of the bar so it reads over the fill
-LABEL_GAP = 8.0  # label column -> bar
-PCT_GAP = 8.0  # bar (or note) -> percent
-NOTE_GAP = 4.0  # note -> percent
-RESET_GAP = 10.0  # percent -> reset countdown
-NUM_GAP = 6.0  # slot number -> name
-META_GAP = 10.0  # name -> the right-hand state/age text
-TOP_PAD = 4.0
-HEADER_GAP = 2.0
-BOTTOM_PAD = 6.0
+LABEL_GAP = 10.0  # label column -> bar
+PCT_GAP = 10.0  # bar -> percent
+RESET_GAP = 12.0  # percent -> reset countdown
+EMAIL_GAP = 8.0  # name -> email
+EMAIL_MIN_W = 24.0  # an email squeezed below this is left out, not drawn as "…"
+META_GAP = 10.0  # email -> the right-hand state/age text
+AGE_GAP = 8.0  # between the right-hand pieces: state words, then the age
+TOP_PAD = 7.0
+HEADER_GAP = 4.0
+BOTTOM_PAD = 9.0
+CARD_INSET = 5.0  # the active account's tinted card, inset from the menu edges
+CARD_RADIUS = 6.0
+HAIRLINE = 0.5  # the rule under each inactive account
 
 UNAVAILABLE = "usage unavailable"  # the text row's wording
-OVER_MARKER = "(!)"  # the text row's at/over-limit marker
+STATE_SEP = " · "  # joins the state words ("active · disabled")
 
 STATES = ("ok", "warn", "hot", "over", "unknown")
 
@@ -66,6 +70,8 @@ class WindowRow:
     no pace data, or a window that has rolled over since it was measured).
     ``ahead`` is the text row's "(ahead)" signal for the same window. An
     ``unknown`` row has no bar; its ``note`` carries the text to show instead.
+    Every other row's ``note`` is empty: an over-limit window shows as a red
+    percent, and its spoken label says "over limit".
     """
 
     label: str
@@ -80,17 +86,32 @@ class WindowRow:
 
 @dataclass(frozen=True)
 class AccountPanel:
-    """One account's block: header fields plus its window rows."""
+    """One account's block: header fields plus its window rows.
+
+    The header shows ``name_text`` and, after it, the email (unless
+    ``show_email`` is off); on the right, ``state_text`` and ``age_text``.
+    """
 
     num: str
     title: str  # the text row's identity: "alias  (email)" or the email
+    name_text: str  # the alias, else the email's local part
     email: str
     is_active: bool
     disabled: bool
-    meta_text: str  # "active · 2m ago", "disabled", ... ("" when nothing to say)
+    state_text: str  # "active", "disabled", "active · disabled", or ""
+    age_text: str | None  # "2m ago", or None when the reading's age is unknown
     rows: tuple[WindowRow, ...]
     text_label: str  # the plain text row, for accessibility and type-select
     alias: str | None = None  # kept so the accessibility label can name the email
+    show_email: bool = True  # off where Show names only hides it in the text row
+
+    @property
+    def exhausted(self) -> bool:
+        """Not the account in use, and at least one window at its limit.
+
+        Switching to it would hit that limit at once; the view mutes it.
+        """
+        return not self.is_active and any(row.state == "over" for row in self.rows)
 
 
 def usage_state(pct: float | None) -> str:
@@ -128,7 +149,7 @@ def _row(label: str, window: dict, pct: float, now: float, pace_result=None) -> 
         reset_text=_live_countdown(window, now) or "",
         state=state,
         pace_fraction=pace_fraction,
-        note=OVER_MARKER if state == "over" else "",
+        note="",
         ahead=bool(pace_result is not None and pace_result.ahead and state != "over"),
     )
 
@@ -196,31 +217,34 @@ def build_account_panel(entry: tuple, now: float, names_only: bool = False) -> A
     ``entry`` is ``(num, email, is_active, display_usage, last_good, alias,
     disabled, fetched_at)`` as ``menubar._adapt_snapshot`` builds it; the
     panel reads the same display usage the text row reads. ``names_only``
-    is Settings → Show names only, applied exactly as the text row applies it.
+    is Settings → Show names only, applied exactly as the text row applies it:
+    an aliased account's email is hidden, an account without an alias keeps it.
     """
     # Fields past the eighth are for other readers; a wider row still builds.
     num, email, is_active, display, _last_good, alias, disabled, fetched_at, *_extra = entry
-    meta = []
+    states = []
     if is_active:
-        meta.append("active")
+        states.append("active")
     if disabled:
-        meta.append("disabled")
-    age = age_text(fetched_at, now)
-    if age:
-        meta.append(age)
+        states.append("disabled")
     return AccountPanel(
         num=num,
         title=account_identity(email, alias, names_only=names_only),
+        # account_identity's rule: an empty alias is no alias. Kept whole; the
+        # view truncates by width.
+        name_text=alias or email.split("@", 1)[0],
         email=email,
         is_active=bool(is_active),
         disabled=bool(disabled),
-        meta_text=" · ".join(meta),
+        state_text=STATE_SEP.join(states),
+        age_text=age_text(fetched_at, now),
         rows=tuple(window_rows(display, now, fetched_at)),
         text_label=format_account_label(
             num, email, display, now, alias=alias, disabled=disabled,
             fetched_at=fetched_at, names_only=names_only,
         ),
         alias=alias,
+        show_email=not (names_only and alias),  # account_identity's names-only rule
     )
 
 
@@ -230,11 +254,10 @@ def build_account_panel(entry: tuple, now: float, names_only: bool = False) -> A
 class Columns:
     """Horizontal positions shared by every bar row in the menu."""
 
-    label_x: float
+    label_x: float  # row labels, and the header's name
     label_w: float
     bar_x: float
     bar_w: float
-    note_right: float | None  # right edge of the "(!)" note, when reserved
     pct_right: float  # percent text is right-aligned to this
     reset_right: float  # reset countdown is right-aligned to this
 
@@ -248,31 +271,26 @@ def row_columns(
     label_w: float,
     pct_w: float,
     reset_w: float,
-    note_w: float = 0.0,
     width: float = PANEL_WIDTH,
+    num_w: float = 0.0,
 ) -> Columns:
-    """Column layout: label, bar, optional note, percent, reset countdown.
+    """Column layout: slot number gutter, label, bar, percent, reset countdown.
 
     Widths are measured by the caller from the real fonts (the widest label in
-    the menu, "100%" in monospaced digits, and so on), so every row in every
-    account lines up. A note column is reserved only when some row needs it.
+    the menu, "100%" in monospaced digits, the widest slot number, and so on),
+    so every row in every account lines up. The gutter is NUM_COLUMN wide
+    unless the widest number needs more.
     """
-    label_x = LEFT_INSET + DOT_COLUMN
+    label_x = LEFT_INSET + max(NUM_COLUMN, num_w + NUM_GAP)
     reset_right = width - RIGHT_INSET
     pct_right = reset_right - reset_w - RESET_GAP
-    if note_w > 0:
-        note_right = pct_right - pct_w - NOTE_GAP
-        bar_right = note_right - note_w - PCT_GAP
-    else:
-        note_right = None
-        bar_right = pct_right - pct_w - PCT_GAP
+    bar_right = pct_right - pct_w - PCT_GAP
     bar_x = label_x + label_w + LABEL_GAP
     return Columns(
         label_x=label_x,
         label_w=label_w,
         bar_x=bar_x,
         bar_w=max(0.0, bar_right - bar_x),
-        note_right=note_right,
         pct_right=pct_right,
         reset_right=reset_right,
     )
@@ -308,15 +326,48 @@ def tick_rect(cols: Columns, pace_fraction: float, bar_y: float) -> tuple[float,
     )
 
 
-def header_name_span(cols: Columns, num_w: float, meta_w: float) -> tuple[float, float]:
-    """(x, width) for the header's name: after the number, before the meta text.
+def header_spans(cols: Columns, name_w: float, meta_w: float) -> tuple[float, float, float, float]:
+    """(name_x, name_w, email_x, email_w) for the header line.
 
-    The number is drawn on its own and always fits; the name gets whatever is
-    left and is truncated in the middle by the view when it is longer.
+    The slot number sits in the gutter on its own. The name starts at the
+    label column and keeps its measured width; the email follows and gets
+    what is left before the right-hand state and age (``meta_w`` wide),
+    truncated in the middle by the view. A name too long for the line is cut
+    to it, and an email with less than EMAIL_MIN_W of room is left out
+    (``email_w`` 0).
     """
-    name_x = cols.label_x + num_w + NUM_GAP
     right = cols.reset_right - (meta_w + META_GAP if meta_w > 0 else 0.0)
-    return name_x, max(0.0, right - name_x)
+    name_x = cols.label_x
+    name_w = min(name_w, max(0.0, right - name_x))
+    email_x = name_x + name_w + EMAIL_GAP
+    email_w = right - email_x
+    return name_x, name_w, email_x, (email_w if email_w >= EMAIL_MIN_W else 0.0)
+
+
+def right_run(right: float, widths: list[float], gap: float) -> tuple[list[float], float]:
+    """Left edges for pieces laid out leftward from ``right``, ``gap`` apart.
+
+    ``widths`` are in reading order; the last piece ends at ``right``.
+    Returns the left edges in the same order and the run's total width.
+    """
+    xs = []
+    x = right
+    for w in reversed(widths):
+        x -= w
+        xs.append(x)
+        x -= gap
+    total = right - xs[-1] if xs else 0.0
+    return xs[::-1], total
+
+
+def card_rect(width: float, height: float) -> tuple[float, float, float, float]:
+    """(x, y, w, h) of the active account's card: inset like the menu selection."""
+    return (CARD_INSET, 1.0, width - 2 * CARD_INSET, height - 2.0)
+
+
+def hairline_rect(cols: Columns, height: float) -> tuple[float, float, float, float]:
+    """(x, y, w, h) of the rule along the bottom of a panel, under the text columns."""
+    return (cols.label_x, height - HAIRLINE, cols.reset_right - cols.label_x, HAIRLINE)
 
 
 def panel_height(n_rows: int, header_h: float, row_h: float) -> float:
@@ -343,12 +394,13 @@ def spoken_duration(text: str) -> str:
     return " ".join(parts) or text
 
 
-def _spoken_meta(meta_text: str) -> str:
-    out = []
-    for part in meta_text.split(" · "):
-        if part.endswith(" ago"):
-            part = f"{spoken_duration(part[: -len(' ago')])} ago"
-        out.append(part)
+def _spoken_meta(panel: AccountPanel) -> str:
+    out = panel.state_text.split(STATE_SEP) if panel.state_text else []
+    if panel.age_text:
+        age = panel.age_text
+        if age.endswith(" ago"):
+            age = f"{spoken_duration(age[: -len(' ago')])} ago"
+        out.append(age)
     return ", ".join(out)
 
 
@@ -357,8 +409,9 @@ def accessibility_label(panel: AccountPanel) -> str:
     # Always the full identity, whatever the display setting: a listener
     # has no other way to tell which email an alias belongs to.
     head = f"Account {panel.num}, {account_identity(panel.email, panel.alias)}"
-    if panel.meta_text:
-        head += f", {_spoken_meta(panel.meta_text)}"
+    meta = _spoken_meta(panel)
+    if meta:
+        head += f", {meta}"
     sentences = [head]
     for row in panel.rows:
         if row.state == "unknown":

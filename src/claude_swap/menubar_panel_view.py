@@ -27,6 +27,8 @@ from AppKit import (
     NSCompositingOperationClear,
     NSFont,
     NSFontAttributeName,
+    NSFontWeightBold,
+    NSFontWeightMedium,
     NSFontWeightRegular,
     NSFontWeightSemibold,
     NSForegroundColorAttributeName,
@@ -48,6 +50,11 @@ from claude_swap import menubar_panel as mp
 _LIVE_VIEWS = [0]  # views alive right now; see live_view_count()
 _ACTIVATE_KEYS = (36, 76)  # Return, keypad Enter
 
+CARD_ALPHA = 0.16  # the active account's accent card
+EXHAUSTED_FILL_ALPHA = 0.62  # an exhausted account's bar fills
+EXHAUSTED_OVER_ALPHA = 0.85  # an exhausted account's red over-limit percent
+TICK_ALPHA = 0.55  # the pace tick, label colour
+
 
 def live_view_count() -> int:
     """How many panel views exist, for the rebuild leak check."""
@@ -57,21 +64,27 @@ def live_view_count() -> int:
 # ---- fonts and colours -------------------------------------------------------------
 
 def _fonts() -> dict:
-    menu = NSFont.menuFontOfSize_(0.0)
+    menu = NSFont.menuFontOfSize_(0.0).pointSize()
     small = NSFont.smallSystemFontSize()
     return {
-        "title": menu,
-        "title_active": NSFont.systemFontOfSize_weight_(menu.pointSize(), NSFontWeightSemibold),
-        "meta": NSFont.systemFontOfSize_(small),
+        "title": NSFont.systemFontOfSize_weight_(menu, NSFontWeightMedium),
+        "title_active": NSFont.systemFontOfSize_weight_(menu, NSFontWeightSemibold),
         "label": NSFont.systemFontOfSize_(small),
         "digits": NSFont.monospacedDigitSystemFontOfSize_weight_(small, NSFontWeightRegular),
+        "num": NSFont.monospacedDigitSystemFontOfSize_weight_(small, NSFontWeightMedium),
+        "email": NSFont.systemFontOfSize_(small - 1.0),
+        "meta": NSFont.systemFontOfSize_(small),
+        "tag": NSFont.systemFontOfSize_weight_(small - 2.0, NSFontWeightBold),
     }
 
 
 def _fill_color(state: str):
-    # The TUI's three severity colours, mapped to their system equivalents.
-    if state in ("hot", "over"):
+    # The usage bands as system colours: green, yellow, orange near the
+    # limit, red at it.
+    if state == "over":
         return NSColor.systemRedColor()
+    if state == "hot":
+        return NSColor.systemOrangeColor()
     if state == "warn":
         return NSColor.systemYellowColor()
     return NSColor.systemGreenColor()
@@ -94,14 +107,19 @@ def _width(string: str, font) -> float:
     return _text(string, font, NSColor.labelColor()).size().width
 
 
+def _fill_rounded(rect, radius: float, color) -> None:
+    color.setFill()
+    NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(NSMakeRect(*rect), radius, radius).fill()
+
+
 # ---- layout shared by every panel in one menu -----------------------------------------
 
 class PanelLayout:
     """Fonts, heights and columns shared by all account panels in a menu.
 
     Built once per menu rebuild from every panel, so columns line up across
-    accounts: the label column fits the widest label, and the "(!)" note
-    column exists only when some row is over its limit.
+    accounts: the label column fits the widest label, and the slot number
+    gutter the widest number.
     """
 
     LABEL_MAX = 64.0  # a long model name is truncated rather than eating the bar
@@ -117,12 +135,12 @@ class PanelLayout:
             [_width("00h 00m", self.fonts["digits"])]
             + [_width(r.reset_text, self.fonts["digits"]) for r in rows]
         )
-        note_w = _width(mp.OVER_MARKER, self.fonts["digits"]) if any(r.note for r in rows) else 0.0
+        num_w = max((_width(str(p.num), self.fonts["num"]) for p in panels), default=0.0)
         self._widths = dict(
             label_w=min(self.LABEL_MAX, float(label_w)),
             pct_w=_width("100%", self.fonts["digits"]),
             reset_w=float(reset_w),
-            note_w=float(note_w),
+            num_w=float(num_w),
         )
         self.columns = self.columns_for(self.width)
 
@@ -303,92 +321,129 @@ class CswapUsagePanelView(NSView):
                     pass
 
 
+class _Ink:
+    """The text colours for one panel draw.
+
+    ``strong`` is the name and the percentages: the label colour, muted to
+    secondary for an exhausted account. Highlighted, every text is the
+    selection's text colour.
+    """
+
+    def __init__(self, highlighted: bool, exhausted: bool):
+        self.highlighted = highlighted
+        self.dim = exhausted and not highlighted
+        if highlighted:
+            self.primary = self.secondary = self.tertiary = NSColor.selectedMenuItemTextColor()
+        else:
+            self.primary = NSColor.labelColor()
+            self.secondary = NSColor.secondaryLabelColor()
+            self.tertiary = NSColor.tertiaryLabelColor()
+        self.strong = self.secondary if self.dim else self.primary
+
+
 def _draw_panel(view, dirty) -> None:
     panel, layout = view.panel, view.layout
     if panel is None or layout is None:
         return
     highlighted = view._highlighted()
     bounds = view.bounds()
-    fonts, cols = layout.fonts, layout.columns_for(bounds.size.width)
+    width, height = bounds.size.width, bounds.size.height
+    cols = layout.columns_for(width)
+    ink = _Ink(highlighted, panel.exhausted)
 
+    # The active account sits on an accent card; the selection replaces it.
     if highlighted:
         _draw_selection(bounds)
-        primary = secondary = NSColor.selectedMenuItemTextColor()
-    else:
-        primary = NSColor.labelColor()
-        secondary = NSColor.secondaryLabelColor()
+    elif panel.is_active:
+        _fill_rounded(
+            mp.card_rect(width, height), mp.CARD_RADIUS,
+            NSColor.controlAccentColor().colorWithAlphaComponent_(CARD_ALPHA),
+        )
 
-    # Header: dot, slot number, identity, then state and age on the right.
-    top = mp.TOP_PAD
-    h = layout.header_h
-    if panel.is_active:
-        dot_y = top + (h - mp.DOT_DIAMETER) / 2
-        (primary if highlighted else NSColor.controlAccentColor()).setFill()
-        NSBezierPath.bezierPathWithOvalInRect_(
-            NSMakeRect(mp.LEFT_INSET, dot_y, mp.DOT_DIAMETER, mp.DOT_DIAMETER)
-        ).fill()
-    num = _text(str(panel.num), fonts["title"], secondary)
-    num.drawAtPoint_((cols.label_x, top))
-    meta_w = 0.0
-    if panel.meta_text:
-        meta = _text(panel.meta_text, fonts["meta"], secondary)
-        meta_w = meta.size().width
-        meta_y = top + (h - _line_h(fonts["meta"])) / 2
-        meta.drawAtPoint_((cols.reset_right - meta_w, meta_y))
-    name_font = fonts["title_active"] if panel.is_active else fonts["title"]
-    name_color = secondary if panel.disabled else primary
-    name = _text(panel.title, name_font, name_color, NSLineBreakByTruncatingMiddle)
-    name_x, name_w = mp.header_name_span(cols, num.size().width, meta_w)
-    name.drawInRect_(NSMakeRect(name_x, top, name_w, h))
-
-    # Rows.
-    y = top + h + mp.HEADER_GAP
+    _draw_header(panel, layout, cols, ink)
+    y = mp.TOP_PAD + layout.header_h + mp.HEADER_GAP
     for row in panel.rows:
-        _draw_row(row, y, layout, cols, highlighted, primary, secondary)
+        _draw_row(row, y, layout, cols, ink)
         y += layout.row_h
 
+    # A rule under each inactive account; the active one has its card.
+    if not highlighted and not panel.is_active:
+        NSColor.separatorColor().setFill()
+        NSBezierPath.fillRect_(NSMakeRect(*mp.hairline_rect(cols, height)))
 
-def _draw_row(row, y, layout, cols, highlighted, primary, secondary) -> None:
+
+def _draw_header(panel, layout, cols, ink) -> None:
+    """Slot number, name, email; on the right the state words and the age."""
+    fonts, top, h = layout.fonts, mp.TOP_PAD, layout.header_h
+
+    def centred(font) -> float:
+        return top + (h - _line_h(font)) / 2
+
+    _text(str(panel.num), fonts["num"], ink.tertiary).drawAtPoint_((mp.LEFT_INSET, centred(fonts["num"])))
+
+    pieces = []  # (text, font), in reading order
+    for word in panel.state_text.split(mp.STATE_SEP) if panel.state_text else []:
+        if word == "active":
+            accent = ink.secondary if ink.highlighted else NSColor.controlAccentColor()
+            pieces.append((_text("ACTIVE", fonts["tag"], accent), fonts["tag"]))
+        else:
+            pieces.append((_text(word, fonts["meta"], ink.secondary), fonts["meta"]))
+    if panel.age_text:
+        pieces.append((_text(panel.age_text, fonts["meta"], ink.tertiary), fonts["meta"]))
+    xs, meta_w = mp.right_run(cols.reset_right, [t.size().width for t, _f in pieces], mp.AGE_GAP)
+    for (text, font), x in zip(pieces, xs):
+        text.drawAtPoint_((x, centred(font)))
+
+    name_font = fonts["title_active"] if panel.is_active else fonts["title"]
+    name = _text(panel.name_text, name_font, ink.strong, NSLineBreakByTruncatingMiddle)
+    natural_w = name.size().width
+    name_x, name_w, email_x, email_w = mp.header_spans(cols, natural_w, meta_w)
+    if name_w < natural_w:
+        name.drawInRect_(NSMakeRect(name_x, top, name_w, h))  # cut to the line, in the middle
+    else:
+        name.drawAtPoint_((name_x, top))  # whole: no rect for rounding to truncate
+    if panel.show_email and email_w > 0:
+        email = _text(panel.email, fonts["email"], ink.tertiary, NSLineBreakByTruncatingMiddle)
+        email.drawInRect_(NSMakeRect(email_x, centred(fonts["email"]), email_w, _line_h(fonts["email"])))
+
+
+def _draw_row(row, y, layout, cols, ink) -> None:
     fonts, row_h = layout.fonts, layout.row_h
     text_y = y + (row_h - _line_h(fonts["digits"])) / 2
     if row.state == "unknown":
-        note = _text(row.note, fonts["label"], secondary, NSLineBreakByTruncatingTail)
+        note = _text(row.note, fonts["label"], ink.secondary, NSLineBreakByTruncatingTail)
         note.drawInRect_(NSMakeRect(cols.label_x, text_y, cols.reset_right - cols.label_x, row_h))
         return
 
-    label = _text(row.label, fonts["label"], secondary, NSLineBreakByTruncatingTail)
+    label = _text(row.label, fonts["label"], ink.secondary, NSLineBreakByTruncatingTail)
     label.drawInRect_(NSMakeRect(cols.label_x, text_y, cols.label_w, row_h))
 
     bx, by, bw, bh = mp.bar_rect(cols, y, row_h)
     track = (
         NSColor.selectedMenuItemTextColor().colorWithAlphaComponent_(0.3)
-        if highlighted else NSColor.quaternaryLabelColor()
+        if ink.highlighted else NSColor.quaternaryLabelColor()
     )
-    track.setFill()
-    NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
-        NSMakeRect(bx, by, bw, bh), bh / 2, bh / 2
-    ).fill()
+    _fill_rounded((bx, by, bw, bh), bh / 2, track)
     fw = mp.fill_width(bw, row.fraction)
     if fw > 0:
-        _fill_color(row.state).setFill()
-        NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
-            NSMakeRect(bx, by, fw, bh), bh / 2, bh / 2
-        ).fill()
+        fill = _fill_color(row.state)
+        if ink.dim:
+            fill = fill.colorWithAlphaComponent_(EXHAUSTED_FILL_ALPHA)
+        _fill_rounded((bx, by, fw, bh), bh / 2, fill)
     if row.pace_fraction is not None:
-        tx, ty, tw, th = mp.tick_rect(cols, row.pace_fraction, by)
-        primary.setFill()
-        NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
-            NSMakeRect(tx, ty, tw, th), tw / 2, tw / 2
-        ).fill()
+        tick = ink.primary if ink.highlighted else NSColor.labelColor().colorWithAlphaComponent_(TICK_ALPHA)
+        tick.setFill()
+        NSBezierPath.fillRect_(NSMakeRect(*mp.tick_rect(cols, row.pace_fraction, by)))
 
-    if row.note and cols.note_right is not None:
-        note_color = primary if highlighted else NSColor.systemRedColor()
-        note = _text(row.note, fonts["digits"], note_color)
-        note.drawAtPoint_((cols.note_right - note.size().width, text_y))
-    pct = _text(row.pct_text, fonts["digits"], primary)
+    pct_color = ink.strong
+    if row.state == "over" and not ink.highlighted:
+        pct_color = NSColor.systemRedColor()
+        if ink.dim:
+            pct_color = pct_color.colorWithAlphaComponent_(EXHAUSTED_OVER_ALPHA)
+    pct = _text(row.pct_text, fonts["digits"], pct_color)
     pct.drawAtPoint_((cols.pct_right - pct.size().width, text_y))
     if row.reset_text:
-        reset = _text(row.reset_text, fonts["digits"], secondary)
+        reset = _text(row.reset_text, fonts["digits"], ink.tertiary)
         reset.drawAtPoint_((cols.reset_right - reset.size().width, text_y))
 
 
@@ -415,7 +470,7 @@ def _draw_fallback(view) -> None:
     panel = view.panel
     if panel is None:
         return
-    font = view.layout.fonts["title"] if view.layout is not None else NSFont.menuFontOfSize_(0.0)
+    font = NSFont.menuFontOfSize_(0.0)  # a native text row's font
     color = NSColor.selectedMenuItemTextColor() if highlighted else NSColor.labelColor()
     text = _text(panel.text_label, font, color, NSLineBreakByTruncatingTail)
     text.drawInRect_(NSMakeRect(
@@ -546,7 +601,7 @@ def attach_usage_panels(pairs, target=None, on_draw_failure=None, after_attach=N
     try:
         for native, view in zip(natives, views):
             _set_item_view(native, view)
-            # The accent dot marks the active account. A checkmark state would
+            # The accent card marks the active account. A checkmark state would
             # also reserve a state column that shifts every native item's text.
             native.setState_(0)
         if after_attach is not None:

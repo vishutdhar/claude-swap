@@ -125,12 +125,261 @@ def test_layout_uses_the_fixed_width_and_model_heights():
         assert frame.size.height == mp.panel_height(len(panel.rows), layout.header_h, layout.row_h)
 
 
-def test_layout_reserves_the_note_column_only_when_needed():
-    with_note = pv.PanelLayout(_panels())
+def test_an_over_row_does_not_narrow_the_bars():
+    # The "(!)" column is retired: a menu with an over-limit row (the second
+    # panel) lays out exactly like one without.
+    with_over = pv.PanelLayout(_panels())
     without = pv.PanelLayout(_panels()[:1])
-    assert with_note.columns.note_right is not None
-    assert without.columns.note_right is None
-    assert with_note.columns.bar_w < without.columns.bar_w
+    assert any(row.state == "over" for row in _panels()[1].rows)
+    assert with_over.columns == without.columns
+
+
+def test_a_two_digit_slot_number_widens_the_gutter():
+    one = mp.build_account_panel(("9", "a@x.com", False, {"five_hour": {"pct": 1.0}}, None, None, False, None), _NOW)
+    two = mp.build_account_panel(("12", "b@x.com", False, {"five_hour": {"pct": 1.0}}, None, None, False, None), _NOW)
+    num_font = pv._fonts()["num"]
+    assert pv.PanelLayout([one]).columns.label_x == mp.LEFT_INSET + mp.NUM_COLUMN
+    wide = pv.PanelLayout([one, two]).columns
+    assert wide.label_x >= mp.LEFT_INSET + pv._width("12", num_font) + mp.NUM_GAP
+
+
+# --- fonts and colours ------------------------------------------------------------------
+
+def _weight(font):
+    traits = font.fontDescriptor().objectForKey_(AppKit.NSFontTraitsAttribute)
+    return float(traits[AppKit.NSFontWeightTrait])
+
+
+def test_fonts():
+    fonts = pv._fonts()
+    menu = AppKit.NSFont.menuFontOfSize_(0.0).pointSize()
+    small = AppKit.NSFont.smallSystemFontSize()
+    sizes = {name: font.pointSize() for name, font in fonts.items()}
+    assert sizes == {
+        "title": menu, "title_active": menu, "label": small, "digits": small,
+        "num": small, "email": small - 1.0, "meta": small, "tag": small - 2.0,
+    }
+    weights = {name: _weight(font) for name, font in fonts.items()}
+    assert weights["title"] == pytest.approx(AppKit.NSFontWeightMedium, abs=0.01)
+    assert weights["title_active"] == pytest.approx(AppKit.NSFontWeightSemibold, abs=0.01)
+    assert weights["num"] == pytest.approx(AppKit.NSFontWeightMedium, abs=0.01)
+    assert weights["tag"] == pytest.approx(AppKit.NSFontWeightBold, abs=0.01)
+    for name in ("label", "digits", "email", "meta"):
+        assert weights[name] == pytest.approx(AppKit.NSFontWeightRegular, abs=0.01)
+
+
+@pytest.mark.parametrize(
+    "state, colour",
+    [("ok", "systemGreenColor"), ("warn", "systemYellowColor"),
+     ("hot", "systemOrangeColor"), ("over", "systemRedColor")],
+)
+def test_fill_colour_by_state(state, colour):
+    assert pv._fill_color(state).isEqual_(getattr(AppKit.NSColor, colour)())
+
+
+def _states():
+    """An active, an exhausted and a disabled account, as the redesign draws them."""
+    def entry(num, email, active, usage, alias=None, disabled=False):
+        return (num, email, active, usage, usage, alias, disabled, _NOW - 120)
+
+    entries = [
+        entry("1", "me@example.com", True,
+              {"five_hour": {"pct": 17.0}, "seven_day": {"pct": 87.0},
+               "scoped": [{"name": "Fable", "pct": 92.0}]}, alias="proton"),
+        entry("2", "spent@example.com", False,
+              {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 100.0},
+               "scoped": [{"name": "Fable", "pct": 75.0}]}, alias="meg"),
+        entry("3", "off@example.com", False, {"five_hour": {"pct": 5.0}}, disabled=True),
+    ]
+    return [mp.build_account_panel(e, _NOW) for e in entries]
+
+
+@pytest.mark.parametrize("highlighted", [False, True])
+@pytest.mark.parametrize("appearance", ["aqua", "darkAqua"])
+def test_active_exhausted_and_disabled_render_at_the_model_height(tmp_path, appearance, highlighted):
+    panels = _states()
+    assert [(p.is_active, p.exhausted, p.disabled) for p in panels] == [
+        (True, False, False), (False, True, False), (False, False, True),
+    ]
+    layout = pv.PanelLayout(panels)
+    expected = sum(mp.panel_height(len(p.rows), layout.header_h, layout.row_h) for p in panels)
+    path = tmp_path / f"{appearance}-{highlighted}.png"
+    assert pv.render_png(panels, str(path), appearance, highlighted=highlighted) == (mp.PANEL_WIDTH, expected)
+    rep = AppKit.NSBitmapImageRep.imageRepWithContentsOfFile_(str(path))
+    assert rep.pixelsWide() / rep.pixelsHigh() == pytest.approx(mp.PANEL_WIDTH / expected, rel=1e-3)
+
+
+def _alpha_at(view, rep, x, y):
+    """Alpha of the pixel at view point (x, y), y measured from the panel top."""
+    scale = rep.pixelsWide() / view.bounds().size.width
+    return rep.colorAtX_y_(int(x * scale), int(y * scale)).alphaComponent()
+
+
+def test_only_the_active_panel_sits_on_the_accent_card():
+    # Left of the slot number, inside the card's inset: tinted for the active
+    # account, untouched for the others.
+    panels = _states()
+    layout = pv.PanelLayout(panels)
+    alphas = []
+    for panel in panels:
+        view = pv.make_panel_view(panel, layout)
+        rep = _render(view)
+        alphas.append(_alpha_at(view, rep, mp.CARD_INSET + 2.0, view.bounds().size.height / 2))
+    assert 0.08 < alphas[0] < 0.3  # accent at 0.16
+    assert alphas[1] == 0.0 and alphas[2] == 0.0
+
+
+def _rgba(color):
+    color = color.colorUsingColorSpace_(AppKit.NSColorSpace.sRGBColorSpace())
+    return tuple(round(v, 3) for v in (
+        color.redComponent(), color.greenComponent(), color.blueComponent(), color.alphaComponent()
+    ))
+
+
+def test_inactive_panels_end_in_a_hairline_and_the_active_one_does_not():
+    panels = _states()
+    layout = pv.PanelLayout(panels)
+    x = layout.columns.label_x + 40.0  # under the bars, clear of any text
+    plain = []
+    for panel in panels:
+        view = pv.make_panel_view(panel, layout)
+        rep = _render(view)
+        scale = rep.pixelsWide() / view.bounds().size.width
+        bottom = rep.colorAtX_y_(int(x * scale), rep.pixelsHigh() - 1).alphaComponent()
+        above = _alpha_at(view, rep, x, view.bounds().size.height - 2.5)
+        plain.append((bottom > 0.02, above))
+    assert [has for has, _above in plain] == [False, True, True]
+    # A thin line, not a band (the active panel's card covers this spot).
+    assert all(above == 0.0 for _has, above in plain[1:])
+
+
+def test_highlighted_panels_have_no_hairline_over_the_selection():
+    # The bottom pixel row is plain selection, the same colour as the empty
+    # bottom padding just above it.
+    panels = _states()
+    layout = pv.PanelLayout(panels)
+    x = layout.columns.label_x + 40.0
+    for panel in panels:
+        view = pv.make_panel_view(panel, layout)
+        view.force_highlight = True
+        rep = _render(view)
+        scale = rep.pixelsWide() / view.bounds().size.width
+        bottom = rep.colorAtX_y_(int(x * scale), rep.pixelsHigh() - 1)
+        above = rep.colorAtX_y_(int(x * scale), int((view.bounds().size.height - 4.0) * scale))
+        assert _rgba(bottom) == _rgba(above)
+
+
+def test_an_exhausted_account_draws_its_bars_dimmed():
+    # Same usage, active versus not: the full red bar is opaque on the
+    # active card and see-through for the exhausted account.
+    usage = {"seven_day": {"pct": 100.0}}
+    active = mp.build_account_panel(("1", "a@x.com", True, usage, usage, None, False, None), _NOW)
+    spent = mp.build_account_panel(("2", "b@x.com", False, usage, usage, None, False, None), _NOW)
+    layout = pv.PanelLayout([active, spent])
+    alphas = []
+    for panel in (active, spent):
+        view = pv.make_panel_view(panel, layout)
+        rep = _render(view)
+        bx, by, bw, bh = mp.bar_rect(layout.columns, mp.TOP_PAD + layout.header_h + mp.HEADER_GAP, layout.row_h)
+        alphas.append(_alpha_at(view, rep, bx + bw / 2, by + bh / 2))
+    assert alphas[0] > 0.97
+    assert 0.55 < alphas[1] < 0.8  # 0.62 over the faint track
+
+
+# --- what each panel draws, and in which colour --------------------------------------
+
+def _drawn(monkeypatch, panel, layout=None, highlighted=False):
+    """Every string the view draws for ``panel``, with its font and colour.
+
+    The layout is measured before the spy goes in, so only drawing counts.
+    """
+    calls = []
+    real = pv._text
+    layout = layout or pv.PanelLayout([panel])
+    view = pv.make_panel_view(panel, layout)
+    view.force_highlight = highlighted
+
+    def spy(string, font, color, truncate=None):
+        calls.append((string, font, color))
+        return real(string, font, color, truncate)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(pv, "_text", spy)
+        _render(view)
+    return calls
+
+
+def _colour_of(calls, string):
+    (color,) = [c for s, _f, c in calls if s == string]
+    return color
+
+
+def _is(color, name, alpha=None):
+    want = getattr(AppKit.NSColor, name)()
+    if alpha is not None:
+        want = want.colorWithAlphaComponent_(alpha)
+    return color.isEqual_(want)
+
+
+def test_active_header_draws_number_name_email_tag_and_age(monkeypatch):
+    panel = _states()[0]
+    calls = _drawn(monkeypatch, panel)
+    strings = [s for s, _f, _c in calls]
+    for text in ("1", "proton", "me@example.com", "ACTIVE", "2m ago"):
+        assert text in strings
+    assert "proton  (me@example.com)" not in strings  # the old one-piece title
+    assert _is(_colour_of(calls, "1"), "tertiaryLabelColor")
+    assert _is(_colour_of(calls, "proton"), "labelColor")
+    assert _is(_colour_of(calls, "me@example.com"), "tertiaryLabelColor")
+    assert _is(_colour_of(calls, "ACTIVE"), "controlAccentColor")
+    assert _is(_colour_of(calls, "2m ago"), "tertiaryLabelColor")
+    fonts = pv._fonts()
+    name_font = [f for s, f, _c in calls if s == "proton"][0]
+    assert name_font.isEqual_(fonts["title_active"])
+
+
+def test_exhausted_panel_is_muted_with_a_red_percent_and_no_marker(monkeypatch):
+    panel = _states()[1]
+    calls = _drawn(monkeypatch, panel)
+    strings = [s for s, _f, _c in calls]
+    assert "(!)" not in strings
+    assert "active" not in strings and "ACTIVE" not in strings
+    assert _is(_colour_of(calls, "meg"), "secondaryLabelColor")
+    assert _is(_colour_of(calls, "100%"), "systemRedColor", 0.85)
+    assert _is(_colour_of(calls, "75%"), "secondaryLabelColor")
+    name_font = [f for s, f, _c in calls if s == "meg"][0]
+    assert name_font.isEqual_(pv._fonts()["title"])
+
+
+def test_disabled_panel_says_disabled_in_the_meta_colour(monkeypatch):
+    panel = _states()[2]
+    calls = _drawn(monkeypatch, panel)
+    assert _is(_colour_of(calls, "disabled"), "secondaryLabelColor")
+    assert [f for s, f, _c in calls if s == "disabled"][0].isEqual_(pv._fonts()["meta"])
+    assert _is(_colour_of(calls, "off"), "labelColor")  # name_text: the local part
+    assert "off@example.com" in [s for s, _f, _c in calls]
+
+
+def test_an_over_row_on_the_active_account_has_a_full_strength_red_percent(monkeypatch):
+    usage = {"five_hour": {"pct": 100.0}}
+    panel = mp.build_account_panel(("1", "a@x.com", True, usage, usage, None, False, None), _NOW)
+    calls = _drawn(monkeypatch, panel)
+    assert _is(_colour_of(calls, "100%"), "systemRedColor")
+
+
+def test_highlighted_panel_draws_every_text_in_the_selection_colour(monkeypatch):
+    for panel in _states():
+        calls = _drawn(monkeypatch, panel, highlighted=True)
+        assert calls
+        assert all(_is(c, "selectedMenuItemTextColor") for _s, _f, c in calls)
+
+
+def test_names_only_panel_draws_no_email_for_an_aliased_account(monkeypatch):
+    entry = ("4", "me@x.com", False, {"five_hour": {"pct": 1.0}}, None, "work", False, None)
+    shown = [s for s, _f, _c in _drawn(monkeypatch, mp.build_account_panel(entry, _NOW))]
+    hidden = [s for s, _f, _c in _drawn(monkeypatch, mp.build_account_panel(entry, _NOW, names_only=True))]
+    assert "work" in shown and "me@x.com" in shown
+    assert "work" in hidden and "me@x.com" not in hidden
 
 
 @pytest.mark.parametrize("appearance", ["aqua", "darkAqua"])
@@ -382,7 +631,7 @@ def test_attach_sets_views_and_keeps_text_titles():
 
 
 def test_attached_items_drop_the_checkmark_state():
-    # The accent dot marks the active account; a state column would push the
+    # The accent card marks the active account; a state column would push the
     # native items' text right of the panels' text.
     panels = _panels()
     items = _items(panels)
