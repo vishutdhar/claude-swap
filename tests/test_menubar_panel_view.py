@@ -168,7 +168,10 @@ def test_fonts():
         assert weights[name] == pytest.approx(AppKit.NSFontWeightRegular, abs=0.01)
 
 
-_BAND_COLOURS = {"ok": "systemGreenColor", "warn": "systemYellowColor", "over": "systemRedColor"}
+_BAND_COLOURS = {
+    "ok": "systemGreenColor", "warn": "systemYellowColor",
+    "crit": "systemRedColor", "over": "systemRedColor",
+}
 
 
 @pytest.mark.parametrize("state, colour", list(_BAND_COLOURS.items()))
@@ -211,6 +214,20 @@ def test_the_drawn_bar_follows_the_bands(monkeypatch, pct, colour):
     panel = mp.build_account_panel(("1", "a@x.com", True, usage, usage, None, False, None), _NOW)
     (fill,) = _bar_fills(monkeypatch, panel)
     assert _is(fill, colour)
+
+
+def test_a_red_row_below_the_limit_has_a_red_bar_but_a_plain_percent(monkeypatch):
+    # With red moved below the limit, 95% draws a red bar; only a window at
+    # its limit gets the red percent.
+    monkeypatch.setattr(mp, "CRIT_PCT", 90.0)
+    usage = {"five_hour": {"pct": 95.0}}
+    panel = mp.build_account_panel(("1", "a@x.com", True, usage, usage, None, False, None), _NOW)
+    (fill,) = _bar_fills(monkeypatch, panel)
+    assert _is(fill, "systemRedColor")
+    assert _is(_colour_of(_drawn(monkeypatch, panel), "95%"), "labelColor")
+    usage = {"five_hour": {"pct": 100.0}}
+    panel = mp.build_account_panel(("1", "a@x.com", True, usage, usage, None, False, None), _NOW)
+    assert _is(_colour_of(_drawn(monkeypatch, panel), "100%"), "systemRedColor")
 
 
 def _states():

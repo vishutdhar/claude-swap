@@ -15,6 +15,7 @@ import math
 import pytest
 
 from claude_swap import json_output, menubar, menubar_panel as mp
+from claude_swap.tui import theme
 from claude_swap.tui.theme import CRIT_PCT, WARN_PCT
 from claude_swap.usage_store import UsageEntry
 
@@ -65,20 +66,53 @@ def test_state_bands_sit_on_the_tui_constants():
 def test_state_thresholds_are_the_tui_constants():
     # Reused, not re-derived: the bar colour and the TUI bar colour agree.
     assert (mp.WARN_PCT, mp.CRIT_PCT) == (WARN_PCT, CRIT_PCT) == (75.0, 100.0)
+    # The limit is its own constant; red starts there today.
+    assert mp.LIMIT_PCT == theme.LIMIT_PCT == 100.0
+    assert theme.CRIT_PCT == theme.LIMIT_PCT
 
 
 def test_usage_state_reads_the_band_edges_from_the_theme(monkeypatch):
-    # One source of truth: move the theme's edges and the panel follows.
+    # One source of truth: move the theme's colour edges and the panel follows.
     monkeypatch.setattr(mp, "WARN_PCT", 50.0)
     monkeypatch.setattr(mp, "CRIT_PCT", 80.0)
-    assert [mp.usage_state(p) for p in (49.9, 50.0, 79.9, 80.0)] == ["ok", "warn", "warn", "over"]
+    assert [mp.usage_state(p) for p in (49.9, 50.0, 79.9, 80.0, 99.9, 100.0)] == [
+        "ok", "warn", "warn", "crit", "crit", "over",
+    ]
 
 
-def test_there_is_no_band_between_yellow_and_red():
-    # Red starts at the limit, so the old orange band is gone for good.
-    assert mp.STATES == ("ok", "warn", "over", "unknown")
+def test_over_is_the_limit_not_the_red_edge(monkeypatch):
+    # Moving red earlier changes the colour only: 90 to 99.9 turns red
+    # ("crit") but an account is over its limit at 100, never before.
+    monkeypatch.setattr(mp, "CRIT_PCT", 90.0)
+    assert [mp.usage_state(p) for p in (89.9, 90.0, 99.9, 100.0, 130.0)] == [
+        "warn", "crit", "crit", "over", "over",
+    ]
+
+
+def test_an_earlier_red_edge_does_not_exhaust_mute_or_hide_ahead(monkeypatch):
+    monkeypatch.setattr(mp, "CRIT_PCT", 90.0)
+    red = {"seven_day": {"pct": 95.0, "resets_at": _iso(6 * 86400)}}
+    panel = mp.build_account_panel(_entry(red, num=2, fetched_at=_NOW), _NOW)
+    (row,) = panel.rows
+    assert panel.exhausted is False
+    assert row.ahead is True  # 95% used one day into the week
+    assert "over limit" not in mp.accessibility_label(panel)
+    assert row.state == "crit"
+    walled = {"seven_day": {"pct": 100.0, "resets_at": _iso(6 * 86400)}}
+    panel = mp.build_account_panel(_entry(walled, num=2, fetched_at=_NOW), _NOW)
+    assert panel.exhausted is True
+    assert panel.rows[0].ahead is False
+    assert "over limit" in mp.accessibility_label(panel)
+
+
+def test_nothing_sits_between_yellow_and_the_limit_today():
+    # The orange band is gone for good. "crit" (red below the limit) exists
+    # only for a red edge moved below the limit; while red starts at the
+    # limit it is never returned.
+    assert mp.STATES == ("ok", "warn", "crit", "over", "unknown")
+    assert "hot" not in mp.STATES
     seen = {mp.usage_state(tenths / 10) for tenths in range(1501)} | {mp.usage_state(None)}
-    assert seen == set(mp.STATES)
+    assert seen == {"ok", "warn", "over", "unknown"}
 
 
 # --- window rows ---------------------------------------------------------------

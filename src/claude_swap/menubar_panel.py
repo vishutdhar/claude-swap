@@ -9,8 +9,8 @@ AppKit.
 
 Every number comes from the helpers the text row already uses (the live reset
 countdown, the weekly roll-forward, ``pace.compute_pace``), and the colour
-bands are the TUI's own ``WARN_PCT``/``CRIT_PCT``, so the bars, the text row
-and the terminal dashboard always agree.
+bands and the limit are the TUI's own ``WARN_PCT``/``CRIT_PCT``/``LIMIT_PCT``,
+so the bars, the text row and the terminal dashboard always agree.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ from claude_swap.menubar import (
     sentinel_note,
 )
 from claude_swap.tui.data import format_duration
-from claude_swap.tui.theme import CRIT_PCT, WARN_PCT
+from claude_swap.tui.theme import CRIT_PCT, LIMIT_PCT, WARN_PCT
 
 # ---- layout constants (points) --------------------------------------------------
 
@@ -64,7 +64,7 @@ STATE_SEP = " · "  # joins the state words ("active · disabled")
 # by a switch; neither is here.
 DEAD_LOGIN_NOTES = frozenset(sentinel_note(s) for s in (USAGE_RELOGIN_REQUIRED, USAGE_NO_CREDENTIALS))
 
-STATES = ("ok", "warn", "over", "unknown")
+STATES = ("ok", "warn", "crit", "over", "unknown")
 
 
 # ---- model --------------------------------------------------------------------------
@@ -128,13 +128,19 @@ class AccountPanel:
 def usage_state(pct: float | None) -> str:
     """Colour band for a percentage, using the TUI's thresholds.
 
-    "ok" (green) under ``WARN_PCT``, "warn" (yellow) from there up to the
-    limit, "over" (red) at ``CRIT_PCT``, which is the limit itself.
+    "ok" (green) under ``WARN_PCT``, "warn" (yellow) from there, "crit" (red)
+    from ``CRIT_PCT`` and "over" (red) at ``LIMIT_PCT``. "over" is the limit,
+    not a colour edge: it alone is spoken "over limit", mutes an exhausted
+    account and hides "(ahead)", so moving the red edge never changes when an
+    account counts as over. While red starts at the limit, "crit" is never
+    returned.
     """
     if pct is None:
         return "unknown"
-    if pct >= CRIT_PCT:
+    if pct >= LIMIT_PCT:
         return "over"
+    if pct >= CRIT_PCT:
+        return "crit"
     if pct >= WARN_PCT:
         return "warn"
     return "ok"

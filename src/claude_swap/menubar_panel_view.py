@@ -78,9 +78,9 @@ def _fonts() -> dict:
 
 
 def _fill_color(state: str):
-    # The usage bands as system colours: green, yellow while climbing, red at
-    # the limit.
-    if state == "over":
+    # The usage bands as system colours: green, yellow while climbing, red
+    # from the red edge ("crit") and at the limit ("over").
+    if state in ("crit", "over"):
         return NSColor.systemRedColor()
     if state == "warn":
         return NSColor.systemYellowColor()
