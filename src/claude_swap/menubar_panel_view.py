@@ -27,7 +27,6 @@ from AppKit import (
     NSCompositingOperationClear,
     NSFont,
     NSFontAttributeName,
-    NSFontWeightBold,
     NSFontWeightMedium,
     NSFontWeightRegular,
     NSFontWeightSemibold,
@@ -74,7 +73,7 @@ def _fonts() -> dict:
         "num": NSFont.monospacedDigitSystemFontOfSize_weight_(small, NSFontWeightMedium),
         "email": NSFont.systemFontOfSize_(small - 1.0),
         "meta": NSFont.systemFontOfSize_(small),
-        "tag": NSFont.systemFontOfSize_weight_(small - 2.0, NSFontWeightBold),
+        "tag": NSFont.systemFontOfSize_weight_(small - 2.0, NSFontWeightSemibold),
     }
 
 
@@ -249,6 +248,7 @@ class CswapUsagePanelView(NSView):
         self.on_draw_failure = None  # called when drawing raises
         self.focus_allowed = False  # granted by the menu delegate on highlight
         self.force_highlight = False  # offscreen rendering only
+        self.is_last = False  # the menu's last account row: a separator follows, so no hairline
         return self
 
     def dealloc(self):
@@ -324,12 +324,12 @@ class CswapUsagePanelView(NSView):
 class _Ink:
     """The text colours for one panel draw.
 
-    ``strong`` is the name and the percentages: the label colour, muted to
-    secondary for an exhausted account. Highlighted, every text is the
-    selection's text colour.
+    ``strong`` is the percentages: the label colour, muted to secondary for
+    an exhausted account. ``name`` is muted for an exhausted or a disabled
+    account. Highlighted, every text is the selection's text colour.
     """
 
-    def __init__(self, highlighted: bool, exhausted: bool):
+    def __init__(self, highlighted: bool, exhausted: bool, disabled: bool):
         self.highlighted = highlighted
         self.dim = exhausted and not highlighted
         if highlighted:
@@ -339,6 +339,7 @@ class _Ink:
             self.secondary = NSColor.secondaryLabelColor()
             self.tertiary = NSColor.tertiaryLabelColor()
         self.strong = self.secondary if self.dim else self.primary
+        self.name = self.secondary if (exhausted or disabled) else self.primary
 
 
 def _draw_panel(view, dirty) -> None:
@@ -349,7 +350,7 @@ def _draw_panel(view, dirty) -> None:
     bounds = view.bounds()
     width, height = bounds.size.width, bounds.size.height
     cols = layout.columns_for(width)
-    ink = _Ink(highlighted, panel.exhausted)
+    ink = _Ink(highlighted, panel.exhausted, panel.disabled)
 
     # The active account sits on an accent card; the selection replaces it.
     if highlighted:
@@ -366,8 +367,9 @@ def _draw_panel(view, dirty) -> None:
         _draw_row(row, y, layout, cols, ink)
         y += layout.row_h
 
-    # A rule under each inactive account; the active one has its card.
-    if not highlighted and not panel.is_active:
+    # A rule under each inactive account; the active one has its card, and
+    # the last one is followed by the menu's own separator.
+    if not highlighted and not panel.is_active and not view.is_last:
         NSColor.separatorColor().setFill()
         NSBezierPath.fillRect_(NSMakeRect(*mp.hairline_rect(cols, height)))
 
@@ -395,7 +397,7 @@ def _draw_header(panel, layout, cols, ink) -> None:
         text.drawAtPoint_((x, centred(font)))
 
     name_font = fonts["title_active"] if panel.is_active else fonts["title"]
-    name = _text(panel.name_text, name_font, ink.strong, NSLineBreakByTruncatingMiddle)
+    name = _text(panel.name_text, name_font, ink.name, NSLineBreakByTruncatingMiddle)
     natural_w = name.size().width
     name_x, name_w, email_x, email_w = mp.header_spans(cols, natural_w, meta_w)
     if name_w < natural_w:
@@ -561,12 +563,14 @@ def install_menu_delegate(nsmenu, on_open=None, on_close=None):
 
 # ---- building and attaching views ---------------------------------------------------
 
-def make_panel_view(panel, layout: PanelLayout, target=None, on_draw_failure=None):
+def make_panel_view(panel, layout: PanelLayout, target=None, on_draw_failure=None, is_last=False):
+    """The view for one panel; ``is_last`` marks the last account row in the menu."""
     view = CswapUsagePanelView.alloc().initWithFrame_(
         NSMakeRect(0.0, 0.0, layout.width, layout.height(panel))
     )
     view.panel = panel
     view.layout = layout
+    view.is_last = bool(is_last)
     view.account_target = target
     view.on_draw_failure = on_draw_failure
     view.setAutoresizingMask_(NSViewWidthSizable)  # the menu widens it to its own width
@@ -592,9 +596,13 @@ def attach_usage_panels(pairs, target=None, on_draw_failure=None, after_attach=N
     """
     pairs = list(pairs)
     layout = PanelLayout([panel for _item, panel in pairs])
+    # The pairs are the menu's account rows in order; a separator follows the last.
     views = [
-        make_panel_view(panel, layout, target=target, on_draw_failure=on_draw_failure)
-        for _item, panel in pairs
+        make_panel_view(
+            panel, layout, target=target, on_draw_failure=on_draw_failure,
+            is_last=(index == len(pairs) - 1),
+        )
+        for index, (_item, panel) in enumerate(pairs)
     ]
     natives = [item._menuitem for item, _panel in pairs]
     originals = [(native.view(), native.title(), native.state()) for native in natives]
@@ -634,9 +642,9 @@ def render_png(panels, path: str, appearance: str = "darkAqua", highlighted: boo
     container = NSView.alloc().initWithFrame_(NSMakeRect(0.0, 0.0, layout.width, total))
     container.setAppearance_(look)
     y = total
-    for panel, h in zip(panels, heights):
+    for index, (panel, h) in enumerate(zip(panels, heights)):
         y -= h
-        view = make_panel_view(panel, layout)
+        view = make_panel_view(panel, layout, is_last=(index == len(panels) - 1))
         view.setFrameOrigin_((0.0, y))
         view.force_highlight = highlighted
         container.addSubview_(view)

@@ -163,7 +163,7 @@ def test_fonts():
     assert weights["title"] == pytest.approx(AppKit.NSFontWeightMedium, abs=0.01)
     assert weights["title_active"] == pytest.approx(AppKit.NSFontWeightSemibold, abs=0.01)
     assert weights["num"] == pytest.approx(AppKit.NSFontWeightMedium, abs=0.01)
-    assert weights["tag"] == pytest.approx(AppKit.NSFontWeightBold, abs=0.01)
+    assert weights["tag"] == pytest.approx(AppKit.NSFontWeightSemibold, abs=0.01)  # the approved look
     for name in ("label", "digits", "email", "meta"):
         assert weights[name] == pytest.approx(AppKit.NSFontWeightRegular, abs=0.01)
 
@@ -251,6 +251,52 @@ def test_inactive_panels_end_in_a_hairline_and_the_active_one_does_not():
     assert [has for has, _above in plain] == [False, True, True]
     # A thin line, not a band (the active panel's card covers this spot).
     assert all(above == 0.0 for _has, above in plain[1:])
+
+
+def _bottom_alpha(view, x):
+    rep = _render(view)
+    scale = rep.pixelsWide() / view.bounds().size.width
+    return rep.colorAtX_y_(int(x * scale), rep.pixelsHigh() - 1).alphaComponent()
+
+
+def test_the_last_panel_has_no_hairline_whatever_its_state():
+    # A native separator follows the account rows; a hairline under the last
+    # panel would stack on it. Any other inactive panel keeps its hairline.
+    panels = _states()
+    layout = pv.PanelLayout(panels)
+    x = layout.columns.label_x + 40.0
+    for panel in panels[1:]:  # the inactive ones: exhausted, disabled
+        assert _bottom_alpha(pv.make_panel_view(panel, layout), x) > 0.02
+        assert _bottom_alpha(pv.make_panel_view(panel, layout, is_last=False), x) > 0.02
+        assert _bottom_alpha(pv.make_panel_view(panel, layout, is_last=True), x) == 0.0
+    assert _bottom_alpha(pv.make_panel_view(panels[0], layout, is_last=True), x) == 0.0
+
+
+def test_attach_marks_only_the_last_panel_as_last():
+    panels = _panels()
+    items = _items(panels)
+    pv.attach_usage_panels(list(zip(items, panels)))
+    assert [item._menuitem.view().is_last for item in items] == [False, False, True]
+
+
+@pytest.mark.parametrize("appearance", ["aqua", "darkAqua"])
+def test_render_png_draws_no_hairline_under_an_inactive_last_panel(tmp_path, appearance):
+    panels = _states()  # active, exhausted, disabled: an inactive panel last
+    layout = pv.PanelLayout(panels)
+    path = tmp_path / "last.png"
+    pv.render_png(panels, str(path), appearance)
+    rep = AppKit.NSBitmapImageRep.imageRepWithContentsOfFile_(str(path))
+    scale = rep.pixelsWide() / mp.PANEL_WIDTH
+    x = int((layout.columns.label_x + 40.0) * scale)
+
+    def at(y_pt):
+        return _rgba(rep.colorAtX_y_(x, int(y_pt * scale)))
+
+    heights = [layout.height(p) for p in panels]
+    second_end = heights[0] + heights[1]
+    assert at(second_end - 0.25) != at(second_end - 3.0)  # inactive, not last: a hairline
+    bottom = _rgba(rep.colorAtX_y_(x, rep.pixelsHigh() - 1))
+    assert bottom == at(sum(heights) - 3.0)  # last: plain background to the edge
 
 
 def test_highlighted_panels_have_no_hairline_over_the_selection():
@@ -356,8 +402,23 @@ def test_disabled_panel_says_disabled_in_the_meta_colour(monkeypatch):
     calls = _drawn(monkeypatch, panel)
     assert _is(_colour_of(calls, "disabled"), "secondaryLabelColor")
     assert [f for s, f, _c in calls if s == "disabled"][0].isEqual_(pv._fonts()["meta"])
-    assert _is(_colour_of(calls, "off"), "labelColor")  # name_text: the local part
     assert "off@example.com" in [s for s, _f, _c in calls]
+
+
+def test_a_disabled_account_keeps_its_dimmed_name(monkeypatch):
+    # Out of rotation reads as muted, as before the redesign; only the name
+    # dims, the numbers stay full strength (it is not exhausted).
+    panel = _states()[2]
+    assert panel.disabled and not panel.exhausted
+    calls = _drawn(monkeypatch, panel)
+    assert _is(_colour_of(calls, "off"), "secondaryLabelColor")  # name_text: the local part
+    assert _is(_colour_of(calls, "5%"), "labelColor")
+
+
+def test_an_active_disabled_account_dims_its_name_too(monkeypatch):
+    entry = ("1", "on@example.com", True, {"five_hour": {"pct": 5.0}}, None, "on", True, None)
+    calls = _drawn(monkeypatch, mp.build_account_panel(entry, _NOW))
+    assert _is(_colour_of(calls, "on"), "secondaryLabelColor")
 
 
 def test_an_over_row_on_the_active_account_has_a_full_strength_red_percent(monkeypatch):
