@@ -64,7 +64,7 @@ STATE_SEP = " · "  # joins the state words ("active · disabled")
 # by a switch; neither is here.
 DEAD_LOGIN_NOTES = frozenset(sentinel_note(s) for s in (USAGE_RELOGIN_REQUIRED, USAGE_NO_CREDENTIALS))
 
-STATES = ("ok", "warn", "hot", "over", "unknown")
+STATES = ("ok", "warn", "over", "unknown")
 
 
 # ---- model --------------------------------------------------------------------------
@@ -126,13 +126,15 @@ class AccountPanel:
 
 
 def usage_state(pct: float | None) -> str:
-    """Colour band for a percentage, using the TUI's thresholds."""
+    """Colour band for a percentage, using the TUI's thresholds.
+
+    "ok" (green) under ``WARN_PCT``, "warn" (yellow) from there up to the
+    limit, "over" (red) at ``CRIT_PCT``, which is the limit itself.
+    """
     if pct is None:
         return "unknown"
-    if pct >= 100.0:
-        return "over"
     if pct >= CRIT_PCT:
-        return "hot"
+        return "over"
     if pct >= WARN_PCT:
         return "warn"
     return "ok"

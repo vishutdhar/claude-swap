@@ -168,13 +168,49 @@ def test_fonts():
         assert weights[name] == pytest.approx(AppKit.NSFontWeightRegular, abs=0.01)
 
 
-@pytest.mark.parametrize(
-    "state, colour",
-    [("ok", "systemGreenColor"), ("warn", "systemYellowColor"),
-     ("hot", "systemOrangeColor"), ("over", "systemRedColor")],
-)
+_BAND_COLOURS = {"ok": "systemGreenColor", "warn": "systemYellowColor", "over": "systemRedColor"}
+
+
+@pytest.mark.parametrize("state, colour", list(_BAND_COLOURS.items()))
 def test_fill_colour_by_state(state, colour):
     assert pv._fill_color(state).isEqual_(getattr(AppKit.NSColor, colour)())
+
+
+def test_every_state_with_a_bar_has_a_band_colour():
+    # An unknown row draws a note instead of a bar; every other state is a band.
+    assert set(_BAND_COLOURS) == set(mp.STATES) - {"unknown"}
+
+
+def _bar_fills(monkeypatch, panel):
+    """The colours the view fills bars with, in drawing order (band colours only)."""
+    bands = [getattr(AppKit.NSColor, name)() for name in
+             ("systemGreenColor", "systemYellowColor", "systemOrangeColor", "systemRedColor")]
+    fills = []
+    real = pv._fill_rounded
+
+    def spy(rect, radius, color):
+        if any(color.isEqual_(band) for band in bands):
+            fills.append(color)
+        return real(rect, radius, color)
+
+    view = pv.make_panel_view(panel, pv.PanelLayout([panel]))
+    with monkeypatch.context() as patch:
+        patch.setattr(pv, "_fill_rounded", spy)
+        _render(view)
+    return fills
+
+
+@pytest.mark.parametrize(
+    "pct, colour",
+    [(74.9, "systemGreenColor"), (75.0, "systemYellowColor"), (92.0, "systemYellowColor"),
+     (99.9, "systemYellowColor"), (100.0, "systemRedColor"), (130.0, "systemRedColor")],
+)
+def test_the_drawn_bar_follows_the_bands(monkeypatch, pct, colour):
+    # Green under 75%, yellow from 75% up to the limit, red at 100% and over.
+    usage = {"five_hour": {"pct": pct}}
+    panel = mp.build_account_panel(("1", "a@x.com", True, usage, usage, None, False, None), _NOW)
+    (fill,) = _bar_fills(monkeypatch, panel)
+    assert _is(fill, colour)
 
 
 def _states():

@@ -35,21 +35,50 @@ def _entry(usage, *, num=1, email="a@x.com", active=False, alias=None,
 
 # --- usage state (the TUI's severity bands) ---------------------------------------
 
-def test_state_bands_follow_the_tui_thresholds():
-    assert mp.usage_state(None) == "unknown"
-    assert mp.usage_state(0.0) == "ok"
+@pytest.mark.parametrize(
+    "pct, state",
+    [
+        (None, "unknown"),
+        (0.0, "ok"),
+        (74.9, "ok"),
+        (74.99, "ok"),
+        (75.0, "warn"),
+        (92.0, "warn"),
+        (99.9, "warn"),
+        (99.99, "warn"),
+        (100.0, "over"),
+        (130.0, "over"),
+    ],
+)
+def test_state_bands(pct, state):
+    # Green under 75%, yellow from 75% up to the limit, red at 100% and over.
+    assert mp.usage_state(pct) == state
+
+
+def test_state_bands_sit_on_the_tui_constants():
     assert mp.usage_state(WARN_PCT - 0.01) == "ok"
     assert mp.usage_state(WARN_PCT) == "warn"
     assert mp.usage_state(CRIT_PCT - 0.01) == "warn"
-    assert mp.usage_state(CRIT_PCT) == "hot"
-    assert mp.usage_state(99.99) == "hot"
-    assert mp.usage_state(100.0) == "over"
-    assert mp.usage_state(130.0) == "over"
+    assert mp.usage_state(CRIT_PCT) == "over"
 
 
 def test_state_thresholds_are_the_tui_constants():
     # Reused, not re-derived: the bar colour and the TUI bar colour agree.
-    assert (mp.WARN_PCT, mp.CRIT_PCT) == (WARN_PCT, CRIT_PCT) == (70.0, 90.0)
+    assert (mp.WARN_PCT, mp.CRIT_PCT) == (WARN_PCT, CRIT_PCT) == (75.0, 100.0)
+
+
+def test_usage_state_reads_the_band_edges_from_the_theme(monkeypatch):
+    # One source of truth: move the theme's edges and the panel follows.
+    monkeypatch.setattr(mp, "WARN_PCT", 50.0)
+    monkeypatch.setattr(mp, "CRIT_PCT", 80.0)
+    assert [mp.usage_state(p) for p in (49.9, 50.0, 79.9, 80.0)] == ["ok", "warn", "warn", "over"]
+
+
+def test_there_is_no_band_between_yellow_and_red():
+    # Red starts at the limit, so the old orange band is gone for good.
+    assert mp.STATES == ("ok", "warn", "over", "unknown")
+    seen = {mp.usage_state(tenths / 10) for tenths in range(1501)} | {mp.usage_state(None)}
+    assert seen == set(mp.STATES)
 
 
 # --- window rows ---------------------------------------------------------------
@@ -65,7 +94,7 @@ def test_rows_for_all_windows_in_text_order():
     assert [r.label for r in rows] == ["5h", "7d", "Fable", "$"]
     five, seven, fable, spend = rows
     assert five == mp.WindowRow("5h", 0.46, "46%", "3h 43m", "ok", None, "")
-    assert (seven.pct_text, seven.reset_text, seven.state) == ("73%", "4d 22h", "warn")
+    assert (seven.pct_text, seven.reset_text, seven.state) == ("73%", "4d 22h", "ok")
     assert (fable.pct_text, fable.state) == ("85%", "warn")
     assert (spend.pct_text, spend.reset_text, spend.state, spend.pace_fraction) == ("30%", "", "ok", None)
 
@@ -324,7 +353,7 @@ def test_names_only_hides_the_email_only_where_the_text_row_does():
         ({"five_hour": {"pct": 100.0}, "seven_day": {"pct": 10.0}}, False, False, True),
         ({"seven_day": {"pct": 100.0}}, False, True, True),  # disabled does not matter
         ({"seven_day": {"pct": 100.0}}, True, False, False),  # the account in use is never dimmed
-        ({"seven_day": {"pct": 99.6}, "five_hour": {"pct": 95.0}}, False, False, False),  # hot is not over
+        ({"seven_day": {"pct": 99.6}, "five_hour": {"pct": 95.0}}, False, False, False),  # yellow is not over
         ("token expired", False, False, False),  # unknown is not over
         (None, False, False, False),
     ],
