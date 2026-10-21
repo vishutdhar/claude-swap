@@ -14,8 +14,9 @@ import math
 
 import pytest
 
-from claude_swap import menubar, menubar_panel as mp
+from claude_swap import json_output, menubar, menubar_panel as mp
 from claude_swap.tui.theme import CRIT_PCT, WARN_PCT
+from claude_swap.usage_store import UsageEntry
 
 _NOW = 1_000_000.0
 
@@ -116,6 +117,46 @@ def test_fraction_is_clamped_to_the_bar():
 def test_sentinel_string_is_one_unknown_row_with_the_text_wording():
     rows = mp.window_rows("token expired", _NOW, None)
     assert rows == [mp.WindowRow("", 0.0, "", "", "unknown", None, "token expired")]
+
+
+# --- dead login: the unknown rows only the user can fix ---------------------------
+
+_SENTINELS = sorted(
+    value for name, value in vars(json_output).items() if name.startswith("USAGE_") and isinstance(value, str)
+)
+_DEAD_LOGIN = {json_output.USAGE_RELOGIN_REQUIRED, json_output.USAGE_NO_CREDENTIALS}
+
+
+def _sentinel_panel(sentinel, **kw):
+    """A panel for a sentinel entry, through the snapshot's real display-usage path."""
+    display = menubar._account_display_usage(UsageEntry(sentinel=sentinel))
+    return mp.build_account_panel(_entry(display, **kw), _NOW)
+
+
+def test_every_sentinel_is_classified():
+    assert len(_SENTINELS) == 6
+    assert _DEAD_LOGIN < set(_SENTINELS)
+
+
+@pytest.mark.parametrize("sentinel", _SENTINELS)
+def test_only_a_dead_login_row_is_urgent(sentinel):
+    # Re-login needed and no credentials need the user; token expired retries
+    # by itself, a foreign credential is repaired by a switch, and an API key
+    # or a locked keychain is not a dead login.
+    (row,) = _sentinel_panel(sentinel).rows
+    assert row.state == "unknown"
+    assert row.urgent is (sentinel in _DEAD_LOGIN)
+
+
+def test_measured_and_unavailable_rows_are_never_urgent():
+    rows = mp.window_rows({"five_hour": {"pct": 100.0}}, _NOW, None) + mp.window_rows(None, _NOW, None)
+    assert [(r.state, r.urgent) for r in rows] == [("over", False), ("unknown", False)]
+
+
+def test_dead_login_accessibility_label_is_unchanged():
+    panel = _sentinel_panel(json_output.USAGE_RELOGIN_REQUIRED, num=2)
+    note = menubar.SENTINEL_NOTES[json_output.USAGE_RELOGIN_REQUIRED]
+    assert mp.accessibility_label(panel) == f"Account 2, a@x.com. {note}."
 
 
 def test_none_and_empty_usage_read_usage_unavailable():

@@ -428,6 +428,11 @@ def purge_menu_callbacks(registry: dict, nsmenu) -> None:
             purge_menu_callbacks(registry, sub)
 
 
+def sentinel_note(sentinel: str) -> str:
+    """What the menu shows for a usage sentinel: its note, else the sentinel itself."""
+    return SENTINEL_NOTES.get(sentinel, sentinel)
+
+
 def _account_display_usage(entry) -> dict | str | None:
     """Menu-display usage for a ``UsageEntry``.
 
@@ -436,7 +441,7 @@ def _account_display_usage(entry) -> dict | str | None:
     ``None``.
     """
     if entry.sentinel:
-        return SENTINEL_NOTES.get(entry.sentinel, entry.sentinel)
+        return sentinel_note(entry.sentinel)
     return entry.last_good
 
 

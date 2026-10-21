@@ -413,7 +413,9 @@ def _draw_row(row, y, layout, cols, ink) -> None:
     fonts, row_h = layout.fonts, layout.row_h
     text_y = y + (row_h - _line_h(fonts["digits"])) / 2
     if row.state == "unknown":
-        note = _text(row.note, fonts["label"], ink.secondary, NSLineBreakByTruncatingTail)
+        # A dead login is red, so it reads at a glance; every other note is secondary.
+        color = NSColor.systemRedColor() if row.urgent and not ink.highlighted else ink.secondary
+        note = _text(row.note, fonts["label"], color, NSLineBreakByTruncatingTail)
         note.drawInRect_(NSMakeRect(cols.label_x, text_y, cols.reset_right - cols.label_x, row_h))
         return
 

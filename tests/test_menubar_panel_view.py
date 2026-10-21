@@ -415,6 +415,41 @@ def test_a_disabled_account_keeps_its_dimmed_name(monkeypatch):
     assert _is(_colour_of(calls, "5%"), "labelColor")
 
 
+def _sentinel_panel(sentinel, num="5"):
+    from claude_swap.usage_store import UsageEntry
+
+    display = menubar._account_display_usage(UsageEntry(sentinel=sentinel))
+    return mp.build_account_panel((num, "dead@example.com", False, display, None, None, False, None), _NOW)
+
+
+@pytest.mark.parametrize("sentinel", ["re-login needed", "no credentials"])
+def test_a_dead_login_note_is_red(monkeypatch, sentinel):
+    panel = _sentinel_panel(sentinel)
+    (row,) = panel.rows
+    assert row.urgent
+    assert _is(_colour_of(_drawn(monkeypatch, panel), row.note), "systemRedColor")
+    assert _is(_colour_of(_drawn(monkeypatch, panel, highlighted=True), row.note), "selectedMenuItemTextColor")
+
+
+@pytest.mark.parametrize("sentinel", ["keychain unavailable", "api key", "token expired"])
+def test_other_unknown_notes_stay_secondary(monkeypatch, sentinel):
+    panel = _sentinel_panel(sentinel)
+    (row,) = panel.rows
+    assert not row.urgent
+    assert _is(_colour_of(_drawn(monkeypatch, panel), row.note), "secondaryLabelColor")
+
+
+@pytest.mark.parametrize("appearance", ["aqua", "darkAqua"])
+def test_render_png_with_a_dead_login_row(tmp_path, appearance):
+    panels = _states() + [_sentinel_panel("re-login needed", num="4")]
+    assert panels[-1].rows[0].urgent
+    layout = pv.PanelLayout(panels)
+    expected = sum(layout.height(p) for p in panels)
+    path = tmp_path / f"dead-{appearance}.png"
+    assert pv.render_png(panels, str(path), appearance) == (mp.PANEL_WIDTH, expected)
+    assert path.stat().st_size > 1000
+
+
 def test_an_active_disabled_account_dims_its_name_too(monkeypatch):
     entry = ("1", "on@example.com", True, {"five_hour": {"pct": 5.0}}, None, "on", True, None)
     calls = _drawn(monkeypatch, mp.build_account_panel(entry, _NOW))

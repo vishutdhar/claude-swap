@@ -19,11 +19,13 @@ import math
 from dataclasses import dataclass
 
 from claude_swap import pace
+from claude_swap.json_output import USAGE_NO_CREDENTIALS, USAGE_RELOGIN_REQUIRED
 from claude_swap.menubar import (
     _live_countdown,
     _rolled_weekly_window,
     account_identity,
     format_account_label,
+    sentinel_note,
 )
 from claude_swap.tui.data import format_duration
 from claude_swap.tui.theme import CRIT_PCT, WARN_PCT
@@ -55,6 +57,13 @@ HAIRLINE = 0.5  # the rule under each inactive account
 UNAVAILABLE = "usage unavailable"  # the text row's wording
 STATE_SEP = " · "  # joins the state words ("active · disabled")
 
+# A dead login: only the user can fix it (log in again, or add the account),
+# so its row is urgent. The panel is handed the sentinel's display text, not
+# the sentinel, so these are that text, made by the same helper the snapshot
+# uses. Token expired retries on its own and a foreign credential is repaired
+# by a switch; neither is here.
+DEAD_LOGIN_NOTES = frozenset(sentinel_note(s) for s in (USAGE_RELOGIN_REQUIRED, USAGE_NO_CREDENTIALS))
+
 STATES = ("ok", "warn", "hot", "over", "unknown")
 
 
@@ -71,7 +80,8 @@ class WindowRow:
     ``ahead`` is the text row's "(ahead)" signal for the same window. An
     ``unknown`` row has no bar; its ``note`` carries the text to show instead.
     Every other row's ``note`` is empty: an over-limit window shows as a red
-    percent, and its spoken label says "over limit".
+    percent, and its spoken label says "over limit". ``urgent`` marks an
+    unknown row whose note is a dead login (``DEAD_LOGIN_NOTES``).
     """
 
     label: str
@@ -82,6 +92,7 @@ class WindowRow:
     pace_fraction: float | None
     note: str
     ahead: bool = False
+    urgent: bool = False
 
 
 @dataclass(frozen=True)
@@ -166,8 +177,8 @@ def _weekly(window, now: float, fetched_at: float | None):
     return rolled, pace.compute_pace(rolled, fetched_at=fetched_at)
 
 
-def _unknown(note: str) -> WindowRow:
-    return WindowRow("", 0.0, "", "", "unknown", None, note)
+def _unknown(note: str, urgent: bool = False) -> WindowRow:
+    return WindowRow("", 0.0, "", "", "unknown", None, note, urgent=urgent)
 
 
 def window_rows(usage, now: float, fetched_at: float | None) -> list[WindowRow]:
@@ -180,7 +191,7 @@ def window_rows(usage, now: float, fetched_at: float | None) -> list[WindowRow]:
     the rolled window, exactly as ``menubar.usage_summary`` does.
     """
     if isinstance(usage, str):
-        return [_unknown(usage)]
+        return [_unknown(usage, urgent=usage in DEAD_LOGIN_NOTES)]
     if not isinstance(usage, dict):
         return [_unknown(UNAVAILABLE)]
     rows: list[WindowRow] = []
