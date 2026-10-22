@@ -600,6 +600,14 @@ def native_item_height() -> float:
     return _MEASURED["height"]
 
 
+# Native titles start this far right of LEFT_INSET. Measured live on
+# Oct 22, 2026 (a 2x capture, bars on, no checkmarks shown): with the text
+# at LEFT_INSET, the row's ink began at 461 px and the native "Settings" and
+# "Quit" titles' at 464 px, 1.5 pt further right. AppKit offers no way to
+# read a native title's origin offscreen, unlike the state column below.
+NATIVE_TITLE_OFFSET = 1.5
+
+
 def state_column_width() -> float:
     """How far a checkmark anywhere in a menu moves every native title right.
 
@@ -614,15 +622,16 @@ def state_column_width() -> float:
 def refresh_text_x(menu) -> float:
     """Where a native item's title starts in ``menu``, for the row's text.
 
-    ``LEFT_INSET`` (where the panels' slot numbers line up with native
-    titles), moved right by the state column when the menu shows one: in
-    text-row mode the active account's checkmark reserves it for every item.
+    ``LEFT_INSET`` plus ``NATIVE_TITLE_OFFSET`` (measured live), moved right
+    by the state column when the menu shows one: in text-row mode the
+    active account's checkmark reserves it for every item.
     """
+    x = mp.LEFT_INSET + NATIVE_TITLE_OFFSET
     if menu is not None and menu.showsStateColumn() and any(
         item.state() != 0 for item in menu.itemArray()
     ):
-        return mp.LEFT_INSET + state_column_width()
-    return mp.LEFT_INSET
+        return x + state_column_width()
+    return x
 
 
 def _draw_refresh_row(view) -> None:
@@ -647,7 +656,9 @@ def make_refresh_row_view(target=None, busy=False):
     """The Refresh now row's view, a native item tall; ``target`` takes its press."""
     font = NSFont.menuFontOfSize_(0.0)
     text_w = max(_width(REFRESH_TITLE, font), _width(REFRESHING_TITLE, font))
-    width = math.ceil(mp.LEFT_INSET + state_column_width() + text_w + mp.RIGHT_INSET)
+    width = math.ceil(
+        mp.LEFT_INSET + NATIVE_TITLE_OFFSET + state_column_width() + text_w + mp.RIGHT_INSET
+    )
     view = CswapRefreshRowView.alloc().initWithFrame_(
         NSMakeRect(0.0, 0.0, float(width), native_item_height())
     )

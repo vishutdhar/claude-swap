@@ -1231,13 +1231,41 @@ def _first_ink_column(view) -> float:
     raise AssertionError("nothing drawn")
 
 
+# Measured live (Oct 22, 2026, 2x capture, bars on, no checkmarks): the row's
+# text began 1.5 pt left of the native "Settings" and "Quit" titles.
+_LIVE_NATIVE_OFFSET = 1.5
+
+
+def _ink_offset(text) -> float:
+    """How far right of its origin ``text`` in the menu font starts to show ink."""
+    view = AppKit.NSView.alloc().initWithFrame_(AppKit.NSMakeRect(0.0, 0.0, 120.0, 24.0))
+    rep = view.bitmapImageRepForCachingDisplayInRect_(view.bounds())
+    scale = rep.pixelsWide() / view.bounds().size.width
+    AppKit.NSGraphicsContext.saveGraphicsState()
+    AppKit.NSGraphicsContext.setCurrentContext_(AppKit.NSGraphicsContext.graphicsContextWithBitmapImageRep_(rep))
+    pv._text(text, AppKit.NSFont.menuFontOfSize_(0.0), AppKit.NSColor.blackColor()).drawAtPoint_((10.0, 4.0))
+    AppKit.NSGraphicsContext.restoreGraphicsState()
+    for x in range(rep.pixelsWide()):
+        for y in range(rep.pixelsHigh()):
+            if rep.colorAtX_y_(x, y).alphaComponent() > 0.3:
+                return x / scale - 10.0
+    raise AssertionError("nothing drawn")
+
+
+def test_refresh_row_text_starts_where_native_titles_do():
+    # The row's text begins at LEFT_INSET plus the offset measured live, so
+    # its ink lines up with the native items above and below it.
+    m = _RefreshMenu(lambda: None)
+    expected = mp.LEFT_INSET + _LIVE_NATIVE_OFFSET + _ink_offset("Refresh now")
+    assert _first_ink_column(m.view) == pytest.approx(expected, abs=0.5)
+
+
 def test_refresh_row_text_moves_with_the_native_state_column():
-    # Native titles start at the panels' LEFT_INSET; a checkmark anywhere in
-    # the menu reserves a state column that moves every native title right,
-    # so the row's text moves by exactly the width AppKit adds for it.
+    # A checkmark anywhere in the menu reserves a state column that moves
+    # every native title right, so the row's text moves by exactly the
+    # width AppKit adds for it.
     m = _RefreshMenu(lambda: None)
     plain = _first_ink_column(m.view)
-    assert mp.LEFT_INSET <= plain < mp.LEFT_INSET + 2.0  # the glyph's own side bearing
     # The column's width, from a menu of native items alone (in m.menu the
     # wider row sets the menu's width, so the column would not show in it).
     native = AppKit.NSMenu.alloc().init()
