@@ -1002,6 +1002,12 @@ def create_app(switcher):
             # started under an older generation must not overwrite it.
             self._snapshot_gen = 0
             self._refresh_again = False  # a refresh asked for while one ran
+            self._fresh_again = False  # ... and it must re-measure (Refresh now)
+            # Refresh now keeps the menu open: set from the press until its
+            # reading has been shown, while the row says "Refreshing…".
+            self._press_pending = False
+            self._refresh_row = None  # the Refresh now row's view in the current menu
+            self._shown_rows: list = []  # (number, item) of the current menu's account rows
             self._setup_native_menu()
             self.rebuild_menu()
             # Background display refresh on the user's interval, plus a fast
@@ -1015,13 +1021,13 @@ def create_app(switcher):
                 self._start_engine()
 
         # ---- display refresh plumbing ----------------------------------------
-        def refresh_async(self, full=False):
+        def refresh_async(self, full=False, fresh=False):
             if self._refreshing:
                 return  # in-flight guard: one worker at a time (SnapshotSource
                         # pacing state is only touched by this single worker)
             self._refreshing = True
             threading.Thread(
-                target=self._worker, args=(full, self._snapshot_gen), daemon=True
+                target=self._worker, args=(full, self._snapshot_gen, fresh), daemon=True
             ).start()
 
         def _request_refresh(self):
@@ -1031,14 +1037,18 @@ def create_app(switcher):
             else:
                 self.refresh_async()
 
-        def _worker(self, full, generation=0):
+        def _worker(self, full, generation=0, fresh=False):
             # Lock-free handoff: worker only rebinds plain attributes (atomic in
             # CPython); the main-thread sync tick reads them. While the engine
-            # runs it already paces all fetching, so the display reads store-only.
+            # runs it already paces all fetching, so the display reads store-only;
+            # Refresh now (``fresh``) re-measures all the same, as
+            # ``cswap list --fresh`` may while ``cswap auto`` runs.
             try:
                 try:
                     raw = self._snapshot_source.take(
-                        full=full, store_only=self._engine is not None
+                        full=full,
+                        store_only=self._engine is not None and not fresh,
+                        fresh=fresh,
                     )
                 except Exception:
                     # Keep the last good snapshot rather than blanking the menu.
@@ -1057,6 +1067,115 @@ def create_app(switcher):
                     self._dirty = True  # picked up by on_sync_tick on the main thread
             finally:
                 self._refreshing = False
+                if self._press_pending:
+                    # The sync tick cannot run while the menu is open; this
+                    # reaches the main thread at once either way.
+                    self._report_refresh()
+
+        def _report_refresh(self):
+            """Hand the end of a reading to the main thread (``_refresh_finished``)."""
+            try:
+                from claude_swap import menubar_panel_view as pv
+
+                pv.call_on_main(self._refresh_finished)
+            except Exception:
+                # The sync tick finishes the press once the menu has closed.
+                self.switcher._logger.debug("could not report a refresh to the main thread", exc_info=True)
+
+        def on_refresh_pressed(self):
+            """Refresh now: re-measure every account; the open menu redraws in place.
+
+            Runs on the main thread, during menu tracking when the row was
+            pressed, so it only marks the row and starts (or queues) the
+            reading. The reading's end comes back in ``_refresh_finished``.
+            """
+            if self._press_pending:
+                return  # the row already says Refreshing…
+            self._press_pending = True
+            self._show_refreshing(True)
+            if self._refreshing:
+                # One worker at a time: the reading asked for runs as soon as
+                # the one in flight reports back.
+                self._refresh_again = True
+                self._fresh_again = True
+            else:
+                self.refresh_async(full=True, fresh=True)
+
+        def _refresh_finished(self):
+            """A reading ended while a press waited (main thread, also during tracking).
+
+            The open menu takes the current snapshot in place when its rows
+            still fit; otherwise it is rebuilt after it closes, as always. A
+            reading still owed to the press (it came while another ran, or a
+            rename dropped one) starts now. Either way the row ends as
+            Refresh now, so it never stays Refreshing… however the reading
+            ended. Idempotent: the hop and the sync tick may both call it.
+            """
+            if not self._press_pending or self._refreshing:
+                return  # nothing waits, or the reading in flight reports back itself
+            try:
+                if self._menu_open and not self.apply_snapshot_in_place(self.snapshot):
+                    self._rebuild_pending = True  # rows changed: rebuild after the close
+                if self._refresh_again:
+                    self._refresh_again = False
+                    fresh, self._fresh_again = self._fresh_again, False
+                    self.refresh_async(full=fresh, fresh=fresh)
+                    return  # it reports back in turn; the row stays Refreshing…
+            except Exception:
+                self.switcher._logger.debug("Refresh now could not finish in place", exc_info=True)
+                self._rebuild_pending = True
+            self._press_pending = False
+            self._show_refreshing(False)
+
+        def _show_refreshing(self, busy):
+            row = self._refresh_row
+            if row is None:
+                return
+            try:
+                row.set_busy(busy)
+            except Exception:
+                self.switcher._logger.debug("could not update the Refresh now row", exc_info=True)
+
+        def apply_snapshot_in_place(self, snap) -> bool:
+            """Redraw the open menu from ``snap`` without rebuilding it; False to wait.
+
+            A rebuild swaps every row under the pointer, so it waits for the
+            menu to close (``rebuild_menu``). While the account rows still
+            stand for the same accounts at the same heights, they take the new
+            reading where they are: each panel view its new model, or each
+            text row its new title, and the menu bar title follows.
+            ``snapshot`` and ``_dirty`` are left as they are, so the rebuild
+            after the menu closes draws this same snapshot, submenus included.
+            """
+            from claude_swap import menubar_panel_view as pv
+            from claude_swap.menubar_panel import build_account_panel, fits_in_place
+
+            rows = self._shown_rows
+            entries = list(snap["accounts"])
+            views = [item._menuitem.view() for _num, item in rows]
+            if views and all(isinstance(view, pv.CswapUsagePanelView) for view in views):
+                now = time.time()
+                names_only = self.settings.show_names_only
+                panels = [build_account_panel(entry, now, names_only=names_only) for entry in entries]
+                layout = pv.PanelLayout(panels)
+                if not fits_in_place(
+                    [(view.panel.num, view.frame().size.height) for view in views],
+                    [(panel.num, layout.height(panel)) for panel in panels],
+                ):
+                    return False
+                for view, panel in zip(views, panels):
+                    pv.update_panel_view(view, panel, layout)
+            elif all(view is None for view in views):
+                if not fits_in_place(
+                    [(num, None) for num, _item in rows], [(entry[0], None) for entry in entries]
+                ):
+                    return False
+                for (_num, item), entry in zip(rows, entries):
+                    self._label_text_row(item, entry)
+            else:
+                return False
+            self._set_title(snap)
+            return True
 
         def _log_usage(self, snap):
             """Log each account's session/weekly limits when they change.
@@ -1086,7 +1205,10 @@ def create_app(switcher):
             self._drain_rename_outcomes()
             if self._refresh_again and not self._refreshing:
                 self._refresh_again = False
-                self.refresh_async()
+                fresh, self._fresh_again = self._fresh_again, False
+                self.refresh_async(full=fresh, fresh=fresh)
+            elif self._press_pending and not self._refreshing:
+                self._refresh_finished()  # its hop has not landed yet, or never will
             dashboard_error = self._dashboard.take_error()
             if dashboard_error:
                 rumps.notification("claude-swap", "Could not open dashboard", dashboard_error)
@@ -1190,12 +1312,7 @@ def create_app(switcher):
             # Read once: a worker refresh can replace self.snapshot at any
             # moment, and every part of this menu must describe one snapshot.
             snap = self.snapshot
-            self.title = format_title(
-                snap["active_email"],
-                snap["active_usage"],
-                self.settings,
-                alias=snap.get("active_alias"),
-            )
+            self._set_title(snap)
             # Stop a rumps memory leak: rumps registers each menu item's callback
             # in the process-global NSApp._ns_to_py_and_callback, but Menu.clear()
             # never removes them, so rebuilding the whole menu on every refresh
@@ -1211,6 +1328,8 @@ def create_app(switcher):
                 purge_menu_callbacks(_reg, self.menu._menu)
             self.menu.clear()
             account_items = self._account_items(snap)
+            refresh_item = rumps.MenuItem("Refresh now", callback=self.on_refresh_now)
+            self._attach_refresh_row(refresh_item)
 
             self.menu = [
                 *account_items,
@@ -1229,30 +1348,61 @@ def create_app(switcher):
                 self._history_menu(rumps),
                 None,
                 self._settings_menu(rumps),
-                rumps.MenuItem("Refresh now", callback=self.on_refresh_now),
+                refresh_item,
                 rumps.MenuItem("Quit", callback=self.on_quit),
             ]
+
+        def _set_title(self, snap):
+            self.title = format_title(
+                snap["active_email"],
+                snap["active_usage"],
+                self.settings,
+                alias=snap.get("active_alias"),
+            )
+
+        def _attach_refresh_row(self, item):
+            """Draw Refresh now as a row whose press keeps the menu open.
+
+            If the row cannot be made, the native item stays: it closes the
+            menu, as it always did, and still re-measures.
+            """
+            self._refresh_row = None
+            if self._account_target is None:
+                return
+            try:
+                from claude_swap import menubar_panel_view as pv
+
+                view = pv.make_refresh_row_view(target=self._account_target, busy=self._press_pending)
+                item._menuitem.setView_(view)
+            except Exception:
+                self.switcher._logger.debug("Refresh now row unavailable; native item", exc_info=True)
+                return
+            self._refresh_row = view
+
+        def _label_text_row(self, item, entry):
+            """An account text row's title, checkmark and accessible name."""
+            num, email, is_active, display, _last_good, alias, disabled, fetched_at, *_extra = entry
+            now = time.time()  # one clock: the two labels' countdowns agree
+            item.title = format_account_label(
+                num, email, display, now, alias=alias, disabled=disabled,
+                fetched_at=fetched_at, names_only=self.settings.show_names_only,
+            )
+            item.state = 1 if is_active else 0
+            # The accessible name (AXTitle, what VoiceOver reads) is always the
+            # full row: with names only the visible row hides an alias's email.
+            item._menuitem.setAccessibilityTitle_(format_account_label(
+                num, email, display, now, alias=alias, disabled=disabled, fetched_at=fetched_at,
+            ))
 
         def _account_items(self, snap):
             """One row per account: a text row, drawn as a usage panel when enabled."""
             rows = []  # (account number, item)
-            for num, email, is_active, display, _last_good, alias, disabled, fetched_at, *_extra in snap["accounts"]:
-                item = rumps.MenuItem(
-                    format_account_label(
-                        num, email, display, alias=alias, disabled=disabled,
-                        fetched_at=fetched_at, names_only=self.settings.show_names_only,
-                    ),
-                    callback=self._make_switch_to(num),
-                )
-                item.state = 1 if is_active else 0
-                if self.settings.show_names_only and alias:
-                    # The visible row hides the email; the accessible name
-                    # (AXTitle, what VoiceOver reads) keeps the full row.
-                    item._menuitem.setAccessibilityTitle_(format_account_label(
-                        num, email, display, alias=alias, disabled=disabled,
-                        fetched_at=fetched_at,
-                    ))
+            for entry in snap["accounts"]:
+                num = entry[0]
+                item = rumps.MenuItem(str(num), callback=self._make_switch_to(num))
+                self._label_text_row(item, entry)
                 rows.append((num, item))
+            self._shown_rows = rows
             if not rows:
                 return [rumps.MenuItem("No managed accounts", callback=None)]
             if (
@@ -1297,6 +1447,7 @@ def create_app(switcher):
                     self._activate_account,
                     is_open=lambda: self._menu_open,
                     menu=self.menu._menu,
+                    on_refresh=self.on_refresh_pressed,
                 )
                 self._install_menu_delegate()
             except Exception:
@@ -1578,7 +1729,8 @@ def create_app(switcher):
             self.refresh_async()
 
         def on_refresh_now(self, _sender):
-            self.refresh_async(full=True)  # explicit user refresh → full pass
+            # The native item, shown only when the row view could not be made.
+            self.on_refresh_pressed()
 
         def on_quit(self, _sender):
             # A rename still saving would be lost silently with the process.

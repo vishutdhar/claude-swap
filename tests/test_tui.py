@@ -408,6 +408,23 @@ class TestSnapshotSource:
         source.take(store_only=True)
         assert fake.fetch_sets == [set()]
 
+    def test_fresh_re_measures_and_only_when_asked(self, tmp_path):
+        # The menu bar's Refresh now asks for what `cswap list --fresh` does;
+        # every other take is the plain call every existing caller makes.
+        calls = []
+
+        class Fresh(FakeSwitcher):
+            def accounts_snapshot(self, fetch=None, **kw):
+                calls.append((fetch, kw))
+                return super().accounts_snapshot(fetch=fetch)
+
+        fake = Fresh([make_account(1, active=True), make_account(2)], tmp_path)
+        source = tui_data.SnapshotSource(fake)
+        source.take(full=True, fresh=True)
+        source.take()
+        source.take(full=True)
+        assert calls == [(None, {"fresh": True}), (None, {}), (None, {})]
+
     def test_expired_sentinel_retained_until_fetched_at_advances(self, tmp_path):
         expired = make_account(
             1,
@@ -1585,6 +1602,28 @@ class TestAccountsSnapshot:
         assert all(not acc.switchable for acc in snap.accounts)
         assert all(acc.usage.sentinel is not None for acc in snap.accounts)
         assert isinstance(snap.taken_at, float)
+
+    def test_fresh_reaches_the_usage_collection(self, temp_home, mock_claude_config, monkeypatch):
+        # Routed exactly as `cswap list --fresh` routes it: into the one
+        # collection pass, where UsageStore.reserve decides what is re-measured.
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        data = switcher._get_sequence_data()
+        data["sequence"] = [1]
+        data["accounts"] = {"1": {"email": "test@example.com", "uuid": "test-uuid-1234"}}
+        switcher._write_json(switcher.sequence_file, data)
+        seen = []
+        real = switcher._collect_usage_entries
+
+        def spy(accounts_info, fetch=None, **kw):
+            seen.append((fetch, kw.get("fresh")))
+            return real(accounts_info, fetch=fetch, **kw)
+
+        monkeypatch.setattr(switcher, "_collect_usage_entries", spy)
+        switcher.accounts_snapshot(fetch=set(), fresh=True)  # store-only: no network
+        switcher.accounts_snapshot(fetch=set())
+        assert seen == [(set(), True), (set(), False)]
 
 
 # ---------------------------------------------------------------------------

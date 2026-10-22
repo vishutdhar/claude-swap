@@ -27,10 +27,13 @@ from claude_swap.usage_store import UsageEntry
 class SnapshotSource:
     """Takes one coherent snapshot per call; the store paces the network.
 
-    ``full=True`` (the user's explicit refresh) is accepted for API
-    stability but is no faster than a normal pass: even an explicit refresh
-    is capped by the store's serve TTL and poll plans. ``store_only=True``
-    reads the store without any network eligibility.
+    ``full=True`` is accepted for API stability but is no faster than a
+    normal pass: it is capped by the store's serve TTL and poll plans.
+    ``fresh=True`` (the menu bar's Refresh now) re-measures every candidate
+    past the serve TTL and the poll plans, exactly as ``cswap list --fresh``
+    does; the store still refuses quarantined, backed-off, claimed and
+    recently-429'd slots. ``store_only=True`` reads the store without any
+    network eligibility.
     """
 
     def __init__(self, switcher: ClaudeAccountSwitcher) -> None:
@@ -39,11 +42,15 @@ class SnapshotSource:
         self._lock = threading.Lock()
 
     def take(
-        self, *, full: bool = False, store_only: bool = False
+        self, *, full: bool = False, store_only: bool = False, fresh: bool = False
     ) -> AccountsSnapshot:
         """Blocking snapshot pass; call from a thread worker."""
         fetch: set[str] | None = set() if store_only else None
-        snap = self.switcher.accounts_snapshot(fetch=fetch)
+        # `fresh` rides along only when asked for, as `cswap list --fresh`
+        # does, so every other take stays the call it always was.
+        snap = self.switcher.accounts_snapshot(
+            fetch=fetch, **({"fresh": True} if fresh else {})
+        )
         with self._lock:
             snap = self._reconcile(snap)
             self._last = snap

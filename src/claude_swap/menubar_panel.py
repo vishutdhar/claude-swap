@@ -394,6 +394,19 @@ def panel_height(n_rows: int, header_h: float, row_h: float) -> float:
     return float(math.ceil(TOP_PAD + header_h + HEADER_GAP + n_rows * row_h + BOTTOM_PAD))
 
 
+def fits_in_place(shown, new) -> bool:
+    """Whether an open menu showing ``shown`` rows can redraw them as ``new``.
+
+    Each is the menu's account rows in order, as ``(account number,
+    height)``; a text row's height is None. Only the same accounts in the
+    same order at the same heights qualify: then every row keeps its place
+    and only its drawing changes. Anything else (an account added, removed
+    or moved, a panel that gained or lost a bar row) moves rows under the
+    pointer, so the menu is rebuilt after it closes instead.
+    """
+    return [(str(num), h) for num, h in shown] == [(str(num), h) for num, h in new]
+
+
 # ---- accessibility ---------------------------------------------------------------
 
 _UNITS = {"d": "day", "h": "hour", "m": "minute", "s": "second"}

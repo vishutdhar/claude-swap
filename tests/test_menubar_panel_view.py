@@ -12,6 +12,8 @@ from __future__ import annotations
 import gc
 import logging
 import sys
+import threading
+import time
 
 import pytest
 
@@ -994,3 +996,334 @@ def test_no_growth_across_200_rebuilds(target):
         root.clear()
     gc.collect()
     assert pv.live_view_count() == base_views - len(panels)
+
+
+# --- Refresh now: a native-looking row whose press keeps the menu open ---------------
+
+class _RefreshMenu:
+    """A real NSMenu: the refresh row above a native Quit, and the open flag the app keeps."""
+
+    def __init__(self, on_refresh):
+        self.open = True
+        self.menu = AppKit.NSMenu.alloc().init()
+        self.target = pv.make_account_target(
+            lambda _num: None, is_open=lambda: self.open, menu=self.menu, on_refresh=on_refresh
+        )
+        self.item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Refresh now", None, "")
+        self.view = pv.make_refresh_row_view(target=self.target)
+        self.item.setView_(self.view)
+        self.menu.addItem_(self.item)
+        self.quit = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Quit", "terminate:", "")
+        self.menu.addItem_(self.quit)
+
+
+@pytest.fixture
+def pressed():
+    return []
+
+
+@pytest.fixture
+def cancelled(monkeypatch):
+    calls = []
+    monkeypatch.setattr(pv, "_cancel_tracking", lambda menu: calls.append(menu))
+    return calls
+
+
+def test_refresh_row_click_asks_the_app_and_keeps_the_menu_open(on_screen, pressed, cancelled):
+    m = _RefreshMenu(lambda: pressed.append(1))
+    m.view.force_highlight = True
+    m.view.mouseUp_(_mouse_up(m.view, inside=True))
+    assert pressed == [1]
+    assert cancelled == []  # tracking goes on: the menu stays open
+
+
+def test_refresh_row_release_outside_or_unhighlighted_does_nothing(on_screen, pressed, cancelled):
+    m = _RefreshMenu(lambda: pressed.append(1))
+    m.view.mouseUp_(_mouse_up(m.view, inside=True))  # not highlighted
+    m.view.force_highlight = True
+    m.view.mouseUp_(_mouse_up(m.view, inside=False))
+    m.view.mouseUp_(None)
+    assert pressed == [] and cancelled == []
+
+
+def test_refresh_row_ignores_presses_while_refreshing(on_screen, pressed):
+    m = _RefreshMenu(lambda: pressed.append(1))
+    m.view.set_busy(True)
+    m.view.force_highlight = True
+    m.view.mouseUp_(_mouse_up(m.view))
+    m.view.keyDown_(_key_event(36))
+    assert m.view.accessibilityPerformPress() is False
+    assert pressed == []
+    m.view.set_busy(False)
+    assert m.view.accessibilityPerformPress() is True
+    assert pressed == [1]
+
+
+def test_refresh_row_press_after_the_menu_closed_does_nothing(on_screen, pressed):
+    m = _RefreshMenu(lambda: pressed.append(1))
+    m.open = False
+    assert m.view.accessibilityPerformPress() is False
+    assert pressed == []
+
+
+def test_refresh_row_press_from_a_detached_row_does_nothing(on_screen, pressed):
+    m = _RefreshMenu(lambda: pressed.append(1))
+    m.menu.removeItem_(m.item)
+    assert m.view.accessibilityPerformPress() is False
+    assert pressed == []
+
+
+def test_refresh_row_handler_errors_are_logged_not_raised(on_screen, caplog):
+    def boom():
+        raise RuntimeError("refresh failed")
+
+    m = _RefreshMenu(boom)
+    with caplog.at_level(logging.DEBUG, logger="claude-swap"):
+        assert m.view.accessibilityPerformPress() is False  # must not raise out of AppKit
+    assert any(r.exc_info for r in caplog.records)
+
+
+@pytest.mark.parametrize("code", [36, 76])  # Return, keypad Enter
+def test_return_on_the_refresh_row_works_through_the_delegate(on_screen, pressed, cancelled, code):
+    m = _RefreshMenu(lambda: pressed.append(1))
+    delegate = pv.install_menu_delegate(m.menu)
+    assert not m.view.acceptsFirstResponder()  # the menu just opened: nothing selected
+    delegate.menu_willHighlightItem_(m.menu, m.item)
+    assert m.view.acceptsFirstResponder()
+    m.view.force_highlight = True
+    m.view.keyDown_(_key_event(code))
+    assert pressed == [1] and cancelled == []
+    delegate.menu_willHighlightItem_(m.menu, m.quit)
+    assert not m.view.acceptsFirstResponder()  # Return on Quit is the menu's own
+    delegate.menu_willHighlightItem_(m.menu, m.item)
+    delegate.menuDidClose_(m.menu)
+    assert not m.view.acceptsFirstResponder()  # the next open starts clean
+
+
+def test_highlighting_the_refresh_row_takes_focus_from_a_panel():
+    panels = _panels()
+    menu = AppKit.NSMenu.alloc().init()
+    delegate = pv.install_menu_delegate(menu)
+    panel_item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("p", None, "")
+    panel_view = pv.make_panel_view(panels[0], pv.PanelLayout(panels))
+    panel_item.setView_(panel_view)
+    menu.addItem_(panel_item)
+    row_item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Refresh now", None, "")
+    row = pv.make_refresh_row_view()
+    row_item.setView_(row)
+    menu.addItem_(row_item)
+    delegate.menu_willHighlightItem_(menu, panel_item)
+    assert [panel_view.acceptsFirstResponder(), row.acceptsFirstResponder()] == [True, False]
+    delegate.menu_willHighlightItem_(menu, row_item)
+    assert [panel_view.acceptsFirstResponder(), row.acceptsFirstResponder()] == [False, True]
+
+
+def test_a_panel_still_closes_the_menu_on_its_own_press(on_screen, switched, cancelled, monkeypatch):
+    monkeypatch.setattr(pv.AppHelper, "callAfter", lambda fn, *a, **k: fn(*a, **k))
+    m = _Menu(_panels(), switched.append)
+    assert m.views[1].accessibilityPerformPress() is True
+    assert cancelled == [m.menu] and switched == ["2"]
+
+
+def test_refresh_row_is_an_accessible_button():
+    view = pv.make_refresh_row_view()
+    assert view.isAccessibilityElement()
+    assert view.accessibilityRole() == AppKit.NSAccessibilityButtonRole
+    assert view.accessibilityLabel() == "Refresh now"
+    view.set_busy(True)
+    assert view.accessibilityLabel() == "Refreshing\u2026"
+    view.set_busy(False)
+    assert view.accessibilityLabel() == "Refresh now"
+
+
+def _row_drawn(monkeypatch, view):
+    """(text, colour) for every string the view draws, and whether it drew the selection."""
+    texts, selections = [], []
+    real_text, real_selection = pv._text, pv._draw_selection
+
+    def text_spy(string, font, color, truncate=None):
+        texts.append((string, color))
+        return real_text(string, font, color, truncate)
+
+    def selection_spy(bounds):
+        selections.append(bounds)
+        return real_selection(bounds)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(pv, "_text", text_spy)
+        patch.setattr(pv, "_draw_selection", selection_spy)
+        _render(view)
+    return texts, bool(selections)
+
+
+def _same_colour(a, b):
+    return a.isEqual_(b)
+
+
+def test_refresh_row_draws_its_title_like_a_native_item(monkeypatch):
+    view = pv.make_refresh_row_view()
+    (text, colour), = _row_drawn(monkeypatch, view)[0]
+    assert text == "Refresh now" and _same_colour(colour, AppKit.NSColor.labelColor())
+    view.force_highlight = True
+    texts, selected = _row_drawn(monkeypatch, view)
+    assert selected
+    assert texts[0][0] == "Refresh now"
+    assert _same_colour(texts[0][1], AppKit.NSColor.selectedMenuItemTextColor())
+
+
+@pytest.mark.parametrize("highlighted", [False, True])
+def test_a_refreshing_row_reads_refreshing_in_the_secondary_colour(monkeypatch, highlighted):
+    view = pv.make_refresh_row_view()
+    view.set_busy(True)
+    view.force_highlight = highlighted
+    texts, selected = _row_drawn(monkeypatch, view)
+    assert [t for t, _c in texts] == ["Refreshing\u2026"]
+    assert _same_colour(texts[0][1], AppKit.NSColor.secondaryLabelColor())
+    assert not selected  # an inert row, like a disabled item: no selection
+
+
+def _in_window(view):
+    """Put ``view`` in an offscreen window: AppKit only tracks needsDisplay there."""
+    window = AppKit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+        view.frame(), AppKit.NSWindowStyleMaskBorderless, AppKit.NSBackingStoreBuffered, False
+    )
+    window.setReleasedWhenClosed_(False)
+    window.contentView().addSubview_(view)
+    view.display()  # drawn: nothing pending
+    assert not view.needsDisplay()
+    return window
+
+
+def test_set_busy_marks_the_row_for_display():
+    view = pv.make_refresh_row_view()
+    window = _in_window(view)
+    view.set_busy(True)
+    assert view.needsDisplay()
+    window.close()
+
+
+def _menu_height(*items):
+    menu = AppKit.NSMenu.alloc().init()
+    for item in items:
+        menu.addItem_(item)
+    return menu.size().height
+
+
+def test_refresh_row_is_exactly_a_native_item_tall():
+    # Measured against AppKit itself: a menu holding the row is as tall as
+    # one holding a native item in its place.
+    def native(title):
+        return AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, "terminate:", "")
+
+    row_item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Refresh now", None, "")
+    row_item.setView_(pv.make_refresh_row_view())
+    assert _menu_height(native("Quit"), row_item) == _menu_height(native("Quit"), native("Refresh now"))
+
+
+def _first_ink_column(view) -> float:
+    """The leftmost column, in points, where the view drew anything."""
+    rep = _render(view)
+    scale = rep.pixelsWide() / view.bounds().size.width
+    for x in range(rep.pixelsWide()):
+        for y in range(rep.pixelsHigh()):
+            if rep.colorAtX_y_(x, y).alphaComponent() > 0.3:
+                return x / scale
+    raise AssertionError("nothing drawn")
+
+
+def test_refresh_row_text_moves_with_the_native_state_column():
+    # Native titles start at the panels' LEFT_INSET; a checkmark anywhere in
+    # the menu reserves a state column that moves every native title right,
+    # so the row's text moves by exactly the width AppKit adds for it.
+    m = _RefreshMenu(lambda: None)
+    plain = _first_ink_column(m.view)
+    assert mp.LEFT_INSET <= plain < mp.LEFT_INSET + 2.0  # the glyph's own side bearing
+    # The column's width, from a menu of native items alone (in m.menu the
+    # wider row sets the menu's width, so the column would not show in it).
+    native = AppKit.NSMenu.alloc().init()
+    quit_item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Quit", "terminate:", "")
+    native.addItem_(quit_item)
+    without = native.size().width
+    quit_item.setState_(1)
+    column = native.size().width - without
+    assert column > 0
+    m.quit.setState_(1)
+    assert _first_ink_column(m.view) - plain == pytest.approx(column, abs=0.5)
+
+
+# --- in place: a panel view takes a new model without being rebuilt ------------------
+
+def test_update_panel_view_swaps_the_model_and_redraws():
+    panels = _panels()
+    layout = pv.PanelLayout(panels)
+    view = pv.make_panel_view(panels[0], layout)
+    usage = {"five_hour": {"pct": 12.0}, "seven_day": {"pct": 34.0}, "scoped": [{"name": "Fable", "pct": 56.0}]}
+    newer = mp.build_account_panel(("1", "user0@example.com", True, usage, usage, None, False, _NOW), _NOW)
+    new_layout = pv.PanelLayout([newer, *panels[1:]])
+    window = _in_window(view)
+    pv.update_panel_view(view, newer, new_layout)
+    assert view.panel is newer and view.layout is new_layout
+    assert view.needsDisplay()
+    assert view.accessibilityLabel() == mp.accessibility_label(newer)
+    window.close()
+
+
+# --- the hop back to the main thread: it must run while a menu is tracking ------------
+
+def _pump_tracking(until, timeout=3.0):
+    """Run the main run loop the way an open menu does, until ``until()``."""
+    # The running app always has its NSApplication, and it is what makes
+    # event tracking one of the common modes; without it nothing queued in
+    # the common modes would run in this mode.
+    AppKit.NSApplication.sharedApplication()
+    deadline = time.monotonic() + timeout
+    while not until() and time.monotonic() < deadline:
+        AppKit.NSRunLoop.currentRunLoop().runMode_beforeDate_(
+            AppKit.NSEventTrackingRunLoopMode, AppKit.NSDate.dateWithTimeIntervalSinceNow_(0.02)
+        )
+    return until()
+
+
+def test_a_call_from_a_worker_runs_on_the_main_thread_while_a_menu_tracks():
+    AppKit.NSApplication.sharedApplication()
+    ran = []
+    worker = threading.Thread(
+        target=pv.call_on_main, args=(lambda: ran.append(threading.current_thread() is threading.main_thread()),)
+    )
+    worker.start()
+    worker.join()
+    assert _pump_tracking(lambda: ran)  # the rumps timers never fire in this mode
+    assert ran == [True]
+
+
+_HOP_SPY: list = []  # an Objective-C class can be defined once per process
+
+
+def _hop_spy():
+    if not _HOP_SPY:
+        class _HopSpy(pv.CswapMainThreadCall):
+            def performSelectorOnMainThread_withObject_waitUntilDone_modes_(self, selector, arg, wait, modes):
+                _HopSpy.posted.append((selector, arg, wait, list(modes)))
+
+        _HOP_SPY.append(_HopSpy)
+    spy = _HOP_SPY[0]
+    spy.posted = []
+    return spy
+
+
+def test_the_hop_is_queued_in_the_common_run_loop_modes():
+    spy = _hop_spy()
+    spy.alloc().init().post()
+    ((selector, arg, wait, modes),) = spy.posted
+    name = selector.decode() if isinstance(selector, bytes) else str(selector)
+    assert (name, arg, wait, modes) == ("run:", None, False, [AppKit.NSRunLoopCommonModes])
+
+
+def test_a_failing_call_on_the_main_thread_is_logged_not_raised(caplog):
+    def boom():
+        raise RuntimeError("apply failed")
+
+    AppKit.NSApplication.sharedApplication()
+    with caplog.at_level(logging.DEBUG, logger="claude-swap"):
+        pv.call_on_main(boom)
+        assert _pump_tracking(lambda: any(r.exc_info for r in caplog.records))

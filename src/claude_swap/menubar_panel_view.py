@@ -4,6 +4,8 @@ Turns an ``AccountPanel`` model (``menubar_panel``) into a view that an
 ``NSMenuItem`` shows in place of its title. There is no data logic here: the
 model decides every number and state, and ``menubar_panel`` decides every
 position. This module only measures fonts, picks semantic colours and draws.
+It also draws the Refresh now row, a native-looking item whose press keeps
+the menu open while the panels above it redraw in place.
 
 Only semantic ``NSColor``s and the system font are used, so light mode, dark
 mode and Increase Contrast all follow the system with nothing hard-coded.
@@ -13,6 +15,7 @@ Imported lazily by the rumps glue, like rumps itself.
 from __future__ import annotations
 
 import logging
+import math
 
 import objc
 from AppKit import (
@@ -33,6 +36,8 @@ from AppKit import (
     NSForegroundColorAttributeName,
     NSLineBreakByTruncatingMiddle,
     NSLineBreakByTruncatingTail,
+    NSMenu,
+    NSMenuItem,
     NSMouseInRect,
     NSMutableParagraphStyle,
     NSObject,
@@ -41,7 +46,7 @@ from AppKit import (
     NSView,
     NSViewWidthSizable,
 )
-from Foundation import NSMakeRect
+from Foundation import NSMakeRect, NSRunLoopCommonModes
 from PyObjCTools import AppHelper
 
 from claude_swap import menubar_panel as mp
@@ -152,7 +157,7 @@ class PanelLayout:
 # ---- activation: one stable target, never rumps' per-item registry ----------------
 
 class CswapAccountTarget(NSObject):
-    """Where a panel's click, Return or accessibility press lands.
+    """Where a panel's or the Refresh now row's click, Return or accessibility press lands.
 
     rumps looks up a menu item's Python callback when the action is
     dispatched, and ``rebuild_menu`` purges those entries; an activation
@@ -183,6 +188,32 @@ class CswapAccountTarget(NSObject):
         return True
 
     @objc.python_method
+    def activate_refresh(self, view) -> bool:
+        """Refresh now from the open menu, which stays open.
+
+        The same checks as a panel press. Unlike a panel, tracking is not
+        cancelled and nothing waits for it to unwind: the app's handler runs
+        now, during tracking, and only marks the row and starts a reading.
+        """
+        log = logging.getLogger("claude-swap")
+        is_open = getattr(self, "is_open", None)
+        if is_open is None or not is_open():
+            log.debug("refresh press ignored: the menu is not open")
+            return False
+        if not _attached(view, getattr(self, "menu", None)):
+            log.debug("refresh press ignored: the row is not in the open menu")
+            return False
+        handler = getattr(self, "on_refresh", None)
+        if handler is None:
+            return False
+        try:
+            handler()
+        except Exception:  # never raise out of an AppKit callback
+            log.debug("Menu bar: Refresh now failed", exc_info=True)
+            return False
+        return True
+
+    @objc.python_method
     def _dispatch(self, number) -> None:
         handler = getattr(self, "handler", None)
         if handler is None:
@@ -195,17 +226,18 @@ class CswapAccountTarget(NSObject):
             )
 
 
-def make_account_target(handler, is_open=None, menu=None):
+def make_account_target(handler, is_open=None, menu=None, on_refresh=None):
     """The app's long-lived activation target.
 
-    ``handler(number)`` performs the switch; ``is_open()`` reports whether
-    ``menu`` (the app's root menu) is on screen. Without both, every
-    request is refused.
+    ``handler(number)`` performs the switch; ``on_refresh()`` starts the
+    Refresh now reading; ``is_open()`` reports whether ``menu`` (the app's
+    root menu) is on screen. Without both, every request is refused.
     """
     target = CswapAccountTarget.alloc().init()
     target.handler = handler
     target.is_open = is_open
     target.menu = menu
+    target.on_refresh = on_refresh
     return target
 
 
@@ -227,31 +259,29 @@ def _cancel_tracking(menu) -> None:
         menu.cancelTracking()
 
 
-# ---- the view ---------------------------------------------------------------------
+# ---- the views ---------------------------------------------------------------------
 
-class CswapUsagePanelView(NSView):
-    """One account block: header line and one bar per usage window."""
+class CswapMenuRowView(NSView):
+    """A menu row this module draws, acting like the native item it replaces.
+
+    Shared by the account panels and the Refresh now row: the highlight is
+    the item's own highlight state, and a mouse-up inside the highlighted
+    row, Return while the menu delegate has given the row focus, or an
+    accessibility press activates it. What activating does is the
+    subclass's ``_activate``.
+    """
 
     HIGHLIGHT_INSET = 5.0  # matches the native selection's inset from the menu edge
     HIGHLIGHT_RADIUS = 8.0
 
     def initWithFrame_(self, frame):
-        self = objc.super(CswapUsagePanelView, self).initWithFrame_(frame)
+        self = objc.super(CswapMenuRowView, self).initWithFrame_(frame)
         if self is None:
             return None
-        _LIVE_VIEWS[0] += 1
-        self.panel = None
-        self.layout = None
         self.account_target = None  # CswapAccountTarget
-        self.on_draw_failure = None  # called when drawing raises
         self.focus_allowed = False  # granted by the menu delegate on highlight
         self.force_highlight = False  # offscreen rendering only
-        self.is_last = False  # the menu's last account row: a separator follows, so no hairline
         return self
-
-    def dealloc(self):
-        _LIVE_VIEWS[0] -= 1
-        objc.super(CswapUsagePanelView, self).dealloc()
 
     def isFlipped(self):
         return True
@@ -262,11 +292,9 @@ class CswapUsagePanelView(NSView):
         item = self.enclosingMenuItem()
         return bool(item is not None and item.isHighlighted())
 
-    # -- activation: behave like the plain item the panel replaces ---------------
+    # -- activation: behave like the plain item the row replaces -----------------
     def _activate(self) -> bool:
-        """Ask the app's target to switch to this panel's account."""
-        target = self.account_target
-        return bool(target is not None and target.activate_panel(self))
+        return False
 
     def mouseUp_(self, event):
         # Like a native item: a release outside the row (press, drag away,
@@ -281,15 +309,15 @@ class CswapUsagePanelView(NSView):
         self._activate()
 
     def acceptsFirstResponder(self):
-        # Only while the menu has this panel highlighted. Accepting always
+        # Only while the menu has this row highlighted. Accepting always
         # made the first panel the menu window's initial focus, so the menu
         # opened with an account selected and Return would switch to it.
         return bool(self.focus_allowed)
 
     def keyDown_(self, event):
         # AppKit does not send a view item's action on Return; the menu
-        # delegate makes the highlighted panel first responder so it can.
-        # Only the highlighted panel acts. Every other key is left alone: menu
+        # delegate makes the highlighted row first responder so it can.
+        # Only the highlighted row acts. Every other key is left alone: menu
         # tracking moves the selection and handles Escape itself (the same
         # with or without forwarding, checked live), and a key forwarded up
         # the responder chain would end at NSResponder's default, a beep.
@@ -298,6 +326,30 @@ class CswapUsagePanelView(NSView):
 
     def accessibilityPerformPress(self):
         return self._activate()
+
+
+class CswapUsagePanelView(CswapMenuRowView):
+    """One account block: header line and one bar per usage window."""
+
+    def initWithFrame_(self, frame):
+        self = objc.super(CswapUsagePanelView, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        _LIVE_VIEWS[0] += 1
+        self.panel = None
+        self.layout = None
+        self.on_draw_failure = None  # called when drawing raises
+        self.is_last = False  # the menu's last account row: a separator follows, so no hairline
+        return self
+
+    def dealloc(self):
+        _LIVE_VIEWS[0] -= 1
+        objc.super(CswapUsagePanelView, self).dealloc()
+
+    def _activate(self) -> bool:
+        """Ask the app's target to switch to this panel's account."""
+        target = self.account_target
+        return bool(target is not None and target.activate_panel(self))
 
     # -- drawing ----------------------------------------------------------------
     def drawRect_(self, dirty):
@@ -451,7 +503,7 @@ def _draw_row(row, y, layout, cols, ink) -> None:
 
 def _draw_selection(bounds) -> None:
     """The native menu selection: accent colour, inset from the menu edge."""
-    inset, radius = CswapUsagePanelView.HIGHLIGHT_INSET, CswapUsagePanelView.HIGHLIGHT_RADIUS
+    inset, radius = CswapMenuRowView.HIGHLIGHT_INSET, CswapMenuRowView.HIGHLIGHT_RADIUS
     NSColor.controlAccentColor().setFill()
     NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
         NSMakeRect(inset, 0.0, bounds.size.width - 2 * inset, bounds.size.height), radius, radius
@@ -481,16 +533,143 @@ def _draw_fallback(view) -> None:
     ))
 
 
+# ---- the Refresh now row ----------------------------------------------------------------
+
+REFRESH_TITLE = "Refresh now"
+REFRESHING_TITLE = "Refreshing\u2026"
+FALLBACK_ITEM_HEIGHT = 22.0  # a native item's height when AppKit cannot be asked
+
+_MEASURED: dict = {}  # AppKit's own menu metrics, measured once per process
+
+
+def refresh_row_text(busy: bool) -> str:
+    return REFRESHING_TITLE if busy else REFRESH_TITLE
+
+
+class CswapRefreshRowView(CswapMenuRowView):
+    """The Refresh now row: drawn like a native item, but its press keeps the menu open.
+
+    A native item's press always closes the menu. This row asks the app to
+    re-measure instead and stays, so the bars above it redraw while the user
+    watches; a click outside or Escape closes the menu as with any menu.
+    While the reading runs it says Refreshing in the secondary colour and,
+    like a disabled item, neither highlights nor acts.
+    """
+
+    def initWithFrame_(self, frame):
+        self = objc.super(CswapRefreshRowView, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self.busy = False
+        return self
+
+    @objc.python_method
+    def set_busy(self, busy) -> None:
+        self.busy = bool(busy)
+        self.setAccessibilityLabel_(refresh_row_text(self.busy))
+        self.setNeedsDisplay_(True)
+
+    def _activate(self) -> bool:
+        if self.busy:
+            return False
+        target = self.account_target
+        return bool(target is not None and target.activate_refresh(self))
+
+    def drawRect_(self, dirty):
+        try:
+            _draw_refresh_row(self)
+        except Exception:  # never raise out of an AppKit callback
+            logging.getLogger("claude-swap").debug("Refresh now row failed to draw", exc_info=True)
+
+
+def _menu_size(states):
+    """The size AppKit gives a menu of native items with these states."""
+    menu = NSMenu.alloc().init()
+    for state in states:
+        item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(REFRESH_TITLE, None, "")
+        item.setState_(state)
+        menu.addItem_(item)
+    return menu.size()
+
+
+def native_item_height() -> float:
+    """A native menu item's height, measured from AppKit: what one more item adds to a menu."""
+    if "height" not in _MEASURED:
+        height = float(_menu_size([0, 0]).height - _menu_size([0]).height)
+        _MEASURED["height"] = height if 10.0 <= height <= 60.0 else FALLBACK_ITEM_HEIGHT
+    return _MEASURED["height"]
+
+
+def state_column_width() -> float:
+    """How far a checkmark anywhere in a menu moves every native title right.
+
+    Measured from AppKit: the width a menu gains when one item is checked.
+    """
+    if "column" not in _MEASURED:
+        column = float(_menu_size([1]).width - _menu_size([0]).width)
+        _MEASURED["column"] = column if 0.0 <= column <= 60.0 else 0.0
+    return _MEASURED["column"]
+
+
+def refresh_text_x(menu) -> float:
+    """Where a native item's title starts in ``menu``, for the row's text.
+
+    ``LEFT_INSET`` (where the panels' slot numbers line up with native
+    titles), moved right by the state column when the menu shows one: in
+    text-row mode the active account's checkmark reserves it for every item.
+    """
+    if menu is not None and menu.showsStateColumn() and any(
+        item.state() != 0 for item in menu.itemArray()
+    ):
+        return mp.LEFT_INSET + state_column_width()
+    return mp.LEFT_INSET
+
+
+def _draw_refresh_row(view) -> None:
+    bounds = view.bounds()
+    highlighted = view._highlighted() and not view.busy
+    if highlighted:
+        _draw_selection(bounds)
+    font = NSFont.menuFontOfSize_(0.0)  # a native item's font
+    if view.busy:
+        color = NSColor.secondaryLabelColor()
+    elif highlighted:
+        color = NSColor.selectedMenuItemTextColor()
+    else:
+        color = NSColor.labelColor()
+    item = view.enclosingMenuItem()
+    x = refresh_text_x(item.menu() if item is not None else None)
+    y = (bounds.size.height - _line_h(font)) / 2
+    _text(refresh_row_text(view.busy), font, color).drawAtPoint_((x, y))
+
+
+def make_refresh_row_view(target=None, busy=False):
+    """The Refresh now row's view, a native item tall; ``target`` takes its press."""
+    font = NSFont.menuFontOfSize_(0.0)
+    text_w = max(_width(REFRESH_TITLE, font), _width(REFRESHING_TITLE, font))
+    width = math.ceil(mp.LEFT_INSET + state_column_width() + text_w + mp.RIGHT_INSET)
+    view = CswapRefreshRowView.alloc().initWithFrame_(
+        NSMakeRect(0.0, 0.0, float(width), native_item_height())
+    )
+    view.account_target = target
+    view.setAutoresizingMask_(NSViewWidthSizable)  # the menu widens it to its own width
+    view.setAccessibilityElement_(True)
+    view.setAccessibilityRole_(NSAccessibilityButtonRole)
+    view.set_busy(busy)
+    return view
+
+
 # ---- the menu delegate ----------------------------------------------------------------
 
 class CswapPanelMenuDelegate(NSObject):
-    """Reports the menu opening and closing, and routes Return to panels.
+    """Reports the menu opening and closing, and routes Return to drawn rows.
 
     ``on_open``/``on_close`` let the app hold rebuilds while the menu is on
     screen. During tracking, key events go to the menu window's first
-    responder: making the highlighted panel first responder lets Return
-    reach it, and when a native item is highlighted focus is taken back so
-    Return on that item is left entirely to the menu.
+    responder: making the highlighted row (a panel or the Refresh now row)
+    first responder lets Return reach it, and when a native item is
+    highlighted focus is taken back so Return on that item is left entirely
+    to the menu.
     """
 
     @objc.python_method
@@ -506,14 +685,14 @@ class CswapPanelMenuDelegate(NSObject):
         self._call("on_open")
 
     def menuDidClose_(self, menu):
-        for other in _panel_views(menu):
+        for other in _row_views(menu):
             other.focus_allowed = False  # the next open starts with nothing selected
         self._call("on_close")
 
     def menu_willHighlightItem_(self, menu, item):
         view = item.view() if item is not None else None
-        target = view if isinstance(view, CswapUsagePanelView) else None
-        for other in _panel_views(menu):
+        target = view if isinstance(view, CswapMenuRowView) else None
+        for other in _row_views(menu):
             if other is not target:
                 other.focus_allowed = False
         if target is not None:
@@ -522,21 +701,21 @@ class CswapPanelMenuDelegate(NSObject):
             if window is not None:
                 window.makeFirstResponder_(target)
             return
-        # A native item is highlighted: take focus back from any panel, so
-        # Return on that item is left entirely to the menu. All panels share
+        # A native item is highlighted: take focus back from any drawn row,
+        # so Return on that item is left entirely to the menu. All rows share
         # the menu's window.
-        for other in _panel_views(menu):
+        for other in _row_views(menu):
             window = other.window()
             if window is not None:
-                if isinstance(window.firstResponder(), CswapUsagePanelView):
+                if isinstance(window.firstResponder(), CswapMenuRowView):
                     window.makeFirstResponder_(None)
                 return
 
 
-def _panel_views(menu):
+def _row_views(menu):
     return [
         item.view() for item in menu.itemArray()
-        if isinstance(item.view(), CswapUsagePanelView)
+        if isinstance(item.view(), CswapMenuRowView)
     ]
 
 
@@ -581,6 +760,19 @@ def make_panel_view(panel, layout: PanelLayout, target=None, on_draw_failure=Non
     return view
 
 
+def update_panel_view(view, panel, layout) -> None:
+    """Show ``panel`` in an attached view, drawn with ``layout``: Refresh now in place.
+
+    The view keeps its item, frame and place in the open menu; only its
+    model, its spoken label and its drawing change. The caller checked that
+    the height did not change (``menubar_panel.fits_in_place``).
+    """
+    view.panel = panel
+    view.layout = layout
+    view.setAccessibilityLabel_(mp.accessibility_label(panel))
+    view.setNeedsDisplay_(True)
+
+
 def _set_item_view(nsitem, view) -> None:
     nsitem.setView_(view)
 
@@ -623,6 +815,41 @@ def attach_usage_panels(pairs, target=None, on_draw_failure=None, after_attach=N
             except Exception:
                 pass
         raise
+
+
+# ---- back to the main thread while a menu is open -----------------------------------
+
+class CswapMainThreadCall(NSObject):
+    """One Python call carried to the main thread, run there even while a menu is open.
+
+    An open menu runs the main run loop in its event-tracking mode. rumps
+    adds its timers, the app's one-second sync tick among them, in the
+    default mode only, so nothing they would do happens until the menu
+    closes. A call queued in the common modes, which include event
+    tracking, runs as soon as the main thread is free either way.
+    """
+
+    def run_(self, _arg):
+        fn, self.fn = getattr(self, "fn", None), None
+        if fn is None:
+            return
+        try:
+            fn()
+        except Exception:  # never raise out of an AppKit callback
+            logging.getLogger("claude-swap").debug("menu bar main-thread call failed", exc_info=True)
+
+    @objc.python_method
+    def post(self) -> None:
+        self.performSelectorOnMainThread_withObject_waitUntilDone_modes_(
+            "run:", None, False, [NSRunLoopCommonModes]
+        )
+
+
+def call_on_main(fn) -> None:
+    """Run ``fn`` on the main thread soon, also while a menu is tracking. Never waits."""
+    call = CswapMainThreadCall.alloc().init()
+    call.fn = fn
+    call.post()
 
 
 # ---- offscreen rendering (visual checks) ------------------------------------------

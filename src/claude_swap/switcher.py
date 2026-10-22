@@ -1812,7 +1812,9 @@ class ClaudeAccountSwitcher:
             accounts_info, fetch=fetch, scheduled=scheduled
         )
 
-    def accounts_snapshot(self, fetch: set[str] | None = None) -> AccountsSnapshot:
+    def accounts_snapshot(
+        self, fetch: set[str] | None = None, fresh: bool = False
+    ) -> AccountsSnapshot:
         """One-pass structured snapshot of every managed account, for the TUI.
 
         Metadata, active-slot detection, and usage entries all come from a
@@ -1821,10 +1823,13 @@ class ClaudeAccountSwitcher:
         collectors and disagree about the active slot or freshness. ``fetch``
         has ``_collect_usage_entries`` semantics: ``None`` makes every stale
         account eligible; a set restricts which accounts *may* be fetched
-        this pass.
+        this pass. ``fresh`` re-measures every candidate now, as
+        ``list_accounts(fresh=True)`` (``cswap list --fresh``) does.
         """
         accounts_info = self._build_accounts_info()
-        entries = self._collect_usage_entries(accounts_info, fetch=fetch)
+        entries = self._collect_usage_entries(
+            accounts_info, fetch=fetch, fresh=fresh
+        )
         seq_data = self._get_sequence_data() or {}
         active_number: str | None = None
         accounts: list[AccountSnapshot] = []

@@ -713,3 +713,33 @@ def test_title_prefers_the_alias():
     s = menubar.MenuBarSettings(show_account_name=True, title_pct="off")
     assert menubar.format_title("longname@x.com", {"five_hour": {"pct": 5.0}}, s, alias="work") == "⇄ work"
     assert menubar.format_title("longname@x.com", {"five_hour": {"pct": 5.0}}, s) == "⇄ longname"
+
+
+# --- Refresh now in an open menu: redraw in place, or wait for it to close ---------
+
+_SHOWN = [("1", 64.0), ("2", 48.0)]
+
+
+def test_the_same_accounts_at_the_same_heights_update_in_place():
+    assert mp.fits_in_place(_SHOWN, [("1", 64.0), ("2", 48.0)])
+
+
+def test_numbers_compare_as_text():
+    assert mp.fits_in_place([(1, 64.0)], [("1", 64.0)])
+
+
+@pytest.mark.parametrize("new", [
+    [("2", 48.0), ("1", 64.0)],  # the same accounts in another order
+    [("1", 64.0)],  # one removed
+    [("1", 64.0), ("2", 48.0), ("3", 48.0)],  # one added
+    [("1", 64.0), ("3", 48.0)],  # another account in the second row
+    [("1", 64.0), ("2", 64.0)],  # a panel grew a row (a sentinel note became bars)
+    [("1", 64.0), ("2", 30.0)],  # a panel shrank (bars became one note)
+])
+def test_any_other_shape_waits_for_the_menu_to_close(new):
+    assert not mp.fits_in_place(_SHOWN, new)
+
+
+def test_text_rows_compare_by_account_alone():
+    assert mp.fits_in_place([("1", None), ("2", None)], [("1", None), ("2", None)])
+    assert not mp.fits_in_place([("1", None), ("2", None)], [("2", None), ("1", None)])

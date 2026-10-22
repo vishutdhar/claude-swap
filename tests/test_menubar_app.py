@@ -1116,3 +1116,301 @@ def test_a_prompt_without_a_field_editor_still_opens(missing):
         _alert = Alert()
 
     menubar.plain_text_entry(Prompt())  # returns without raising
+
+
+# --- Refresh now: re-measure and redraw while the menu stays open --------------------
+#
+# An open menu runs the main run loop in the event-tracking mode, where the
+# rumps timers (the sync tick included) never fire. _pump runs it in that mode
+# only, so anything that lands here landed while a menu would be open.
+
+def _pump(until, timeout=5.0):
+    # The running app always has its NSApplication (``menubar.run`` makes it
+    # before the app), and that is what makes event tracking one of the
+    # common modes. rumps only makes it in App.run, which tests never call.
+    AppKit.NSApplication.sharedApplication()
+    deadline = time.monotonic() + timeout
+    while not until() and time.monotonic() < deadline:
+        AppKit.NSRunLoop.currentRunLoop().runMode_beforeDate_(
+            AppKit.NSEventTrackingRunLoopMode, AppKit.NSDate.dateWithTimeIntervalSinceNow_(0.02)
+        )
+    return until()
+
+
+def _refresh_item(app):
+    (item,) = [i for i in app.menu._menu.itemArray() if i.title() == "Refresh now"]
+    return item
+
+
+def _row(app):
+    return _refresh_item(app).view()
+
+
+def _pcts(app):
+    return [i.view().panel.rows[0].pct_text for i in _account_items(app)]
+
+
+class _Source:
+    """Records every take's arguments; answers with ``answers`` in turn (the last repeats)."""
+
+    def __init__(self, *answers, gate=None):
+        self.answers = list(answers)
+        self.takes = []
+        self.gate = gate  # held by the first take, as a slow read would be
+
+    def take(self, **kw):
+        self.takes.append(kw)
+        if self.gate is not None and len(self.takes) == 1:
+            self.gate.wait(5)
+        answer = self.answers[min(len(self.takes), len(self.answers)) - 1]
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+
+def _wait_idle(app, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while app._refreshing and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not app._refreshing
+
+
+_BEFORE = _snap(_entry("1", "a@x.com", active=True, pct=10.0), _entry("2", "b@x.com", pct=20.0))
+_AFTER = _snap(_entry("1", "a@x.com", active=True, pct=55.0), _entry("2", "b@x.com", pct=66.0))
+
+
+@pytest.fixture
+def shown(app, monkeypatch):
+    """The app showing _BEFORE in an open menu; returns a function that installs a source."""
+    monkeypatch.setattr(menubar, "_adapt_snapshot", lambda raw: raw)
+    app.snapshot = _BEFORE
+    app.rebuild_menu()
+
+    def use(source):
+        app._snapshot_source = source
+        _open(app)
+        return source
+
+    return use
+
+
+def test_refresh_now_is_a_row_view_that_remembers_a_refresh_in_flight(app):
+    app.rebuild_menu()
+    row = _row(app)
+    assert isinstance(row, pv.CswapRefreshRowView) and not row.busy
+    app._press_pending = True  # a press still waiting for its reading
+    app.rebuild_menu()
+    assert _row(app).busy
+
+
+def test_refresh_now_re_measures_and_redraws_the_open_menu_in_place(app, shown, on_screen, monkeypatch):
+    cancelled = []
+    monkeypatch.setattr(pv, "_cancel_tracking", lambda menu: cancelled.append(menu))
+    source = shown(_Source(_AFTER))
+    items = list(app.menu._menu.itemArray())
+    views = [i.view() for i in _account_items(app)]
+    assert _row(app).accessibilityPerformPress()
+    assert cancelled == []  # the menu stays open
+    assert _row(app).busy  # "Refreshing…"
+    assert _pump(lambda: not _row(app).busy)
+    assert source.takes == [{"full": True, "store_only": False, "fresh": True}]
+    assert list(app.menu._menu.itemArray()) == items  # nothing swapped under the pointer
+    assert [i.view() for i in _account_items(app)] == views  # the same views, redrawn
+    assert _pcts(app) == ["55%", "66%"]
+    assert app.title == menubar.format_title("a@x.com", _AFTER["active_usage"], app.settings)
+    # The full rebuild still runs once the menu closes, from the same snapshot.
+    _close(app)
+    app.on_sync_tick(None)
+    assert _pcts(app) == ["55%", "66%"]
+    assert app.snapshot is _AFTER
+
+
+def test_refresh_now_by_mouse_keeps_tracking(app, shown, on_screen, monkeypatch):
+    cancelled = []
+    monkeypatch.setattr(pv, "_cancel_tracking", lambda menu: cancelled.append(menu))
+    shown(_Source(_AFTER))
+    row = _row(app)
+    row.force_highlight = True
+    b = row.bounds()
+    event = AppKit.NSEvent.mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure_(
+        AppKit.NSEventTypeLeftMouseUp, (b.size.width / 2, b.size.height / 2), 0, 0, 0, None, 0, 1, 0.0
+    )
+    row.mouseUp_(event)
+    assert _pump(lambda: _pcts(app) == ["55%", "66%"])
+    assert cancelled == []
+    assert app._menu_open
+
+
+def test_refresh_now_waits_for_the_close_when_an_account_was_added(app, shown, on_screen):
+    grown = _snap(
+        _entry("1", "a@x.com", active=True, pct=55.0), _entry("2", "b@x.com", pct=66.0), _entry("3", "c@x.com"),
+    )
+    shown(_Source(grown))
+    items = list(app.menu._menu.itemArray())
+    old_title = app.title
+    assert _row(app).accessibilityPerformPress()
+    assert _pump(lambda: not _row(app).busy)  # the row comes back either way
+    assert list(app.menu._menu.itemArray()) == items
+    assert _pcts(app) == ["10%", "20%"]  # left alone: a rebuild would move rows under the pointer
+    assert app.title == old_title
+    _close(app)
+    app.on_sync_tick(None)
+    assert [_title_num(i) for i in _account_items(app)] == ["1", "2", "3"]
+
+
+def test_refresh_now_waits_for_the_close_when_a_panel_changed_height(app, shown, on_screen):
+    taller = {"five_hour": {"pct": 66.0}, "seven_day": {"pct": 70.0}}  # a second bar row
+    grown = _snap(
+        _entry("1", "a@x.com", active=True, pct=55.0),
+        ("2", "b@x.com", False, taller, taller, None, False, None),
+    )
+    shown(_Source(grown))
+    assert _row(app).accessibilityPerformPress()
+    assert _pump(lambda: not _row(app).busy)
+    assert _pcts(app) == ["10%", "20%"]
+    assert app._rebuild_pending
+    _close(app)
+    app.on_sync_tick(None)
+    assert [len(i.view().panel.rows) for i in _account_items(app)] == [1, 2]
+
+
+def test_a_failed_refresh_gives_the_row_back(app, shown, on_screen):
+    source = shown(_Source(RuntimeError("network down")))
+    assert _row(app).accessibilityPerformPress()
+    assert _pump(lambda: not _row(app).busy)
+    assert len(source.takes) == 1
+    assert _pcts(app) == ["10%", "20%"]  # the last good reading stays
+    assert not app._press_pending
+    assert _row(app).accessibilityPerformPress()  # and it can be pressed again
+
+
+def test_refresh_now_during_a_timer_refresh_re_measures_right_after_it(app, shown, on_screen):
+    gate = threading.Event()
+    middle = _snap(_entry("1", "a@x.com", active=True, pct=30.0), _entry("2", "b@x.com", pct=40.0))
+    source = shown(_Source(middle, _AFTER, gate=gate))
+    app.on_refresh_tick(None)  # a timer read is in flight
+    assert app._refreshing
+    assert _row(app).accessibilityPerformPress()
+    gate.set()
+    assert _pump(lambda: not _row(app).busy)
+    assert [t["fresh"] for t in source.takes] == [False, True]
+    assert _pcts(app) == ["55%", "66%"]
+
+
+def test_refresh_now_during_a_refresh_with_the_menu_closed_still_re_measures(app, monkeypatch):
+    # Closed menu: no hop needed, the sync tick runs the owed fresh read.
+    monkeypatch.setattr(menubar, "_adapt_snapshot", lambda raw: raw)
+    gate = threading.Event()
+    source = _Source(_BEFORE, _AFTER, gate=gate)
+    app._snapshot_source = source
+    app.refresh_async()
+    app.on_refresh_pressed()
+    gate.set()
+    deadline = time.monotonic() + 5
+    while (len(source.takes) < 2 or app._refreshing or app._press_pending) and time.monotonic() < deadline:
+        app.on_sync_tick(None)
+        time.sleep(0.02)
+    assert [t["fresh"] for t in source.takes] == [False, True]
+    assert not app._press_pending
+    assert not _row(app).busy
+
+
+def test_refresh_now_finishing_after_the_menu_closed_rebuilds_as_before(app, shown, on_screen):
+    gate = threading.Event()
+    shown(_Source(_AFTER, gate=gate))
+    views = [i.view() for i in _account_items(app)]
+    assert _row(app).accessibilityPerformPress()
+    _close(app)
+    gate.set()
+    assert _pump(lambda: not app._press_pending)
+    assert [v.panel.rows[0].pct_text for v in views] == ["10%", "20%"]  # nothing in place
+    app.on_sync_tick(None)  # the tick rebuilds, as it always has
+    assert _pcts(app) == ["55%", "66%"]
+    assert not _row(app).busy
+
+
+def test_text_rows_update_in_place_when_the_bars_are_off(app, shown, on_screen):
+    app.settings.show_usage_bars = False
+    app.rebuild_menu()
+    shown(_Source(_AFTER))
+    items = list(app.menu._menu.itemArray())
+    assert _row(app).accessibilityPerformPress()
+    assert _pump(lambda: not _row(app).busy)
+    assert list(app.menu._menu.itemArray()) == items
+    titles = [i.title() for i in _account_items(app)]
+    assert titles[0].startswith("1  a@x.com  5h 55%") and titles[1].startswith("2  b@x.com  5h 66%")
+    assert [i.state() for i in _account_items(app)] == [1, 0]
+
+
+def test_the_timer_refresh_is_not_fresh(app, monkeypatch):
+    monkeypatch.setattr(menubar, "_adapt_snapshot", lambda raw: raw)
+    source = _Source(_BEFORE)
+    app._snapshot_source = source
+    app.on_refresh_tick(None)
+    _wait_idle(app)
+    assert source.takes == [{"full": False, "store_only": False, "fresh": False}]
+
+
+def test_refresh_now_re_measures_even_with_the_engine_on(app, monkeypatch):
+    # The hosted engine paces its own reads, so the display reads the store
+    # alone; an explicit Refresh now still re-measures.
+    monkeypatch.setattr(menubar, "_adapt_snapshot", lambda raw: raw)
+    source = _Source(_BEFORE)
+    app._snapshot_source = source
+    monkeypatch.setattr(app, "_engine", object())
+    app.on_refresh_tick(None)
+    _wait_idle(app)
+    app.on_refresh_pressed()
+    _wait_idle(app)
+    assert source.takes == [
+        {"full": False, "store_only": True, "fresh": False},
+        {"full": True, "store_only": False, "fresh": True},
+    ]
+
+
+def test_a_second_press_while_refreshing_reads_once(app, monkeypatch):
+    monkeypatch.setattr(menubar, "_adapt_snapshot", lambda raw: raw)
+    gate = threading.Event()
+    source = _Source(_BEFORE, gate=gate)
+    app._snapshot_source = source
+    app.on_refresh_pressed()
+    app.on_refresh_pressed()
+    gate.set()
+    _wait_idle(app)
+    assert len(source.takes) == 1
+
+
+def test_the_text_fallback_row_also_re_measures(app, monkeypatch):
+    # Without the row view (it failed to build), Refresh now is the native
+    # item again: it closes the menu as before, and still re-measures.
+    monkeypatch.setattr(menubar, "_adapt_snapshot", lambda raw: raw)
+
+    def fails(**_kw):
+        raise RuntimeError("no view")
+
+    monkeypatch.setattr(pv, "make_refresh_row_view", fails)
+    app.rebuild_menu()
+    item = _refresh_item(app)
+    assert item.view() is None
+    source = _Source(_BEFORE)
+    app._snapshot_source = source
+    item.target().callback_(item)
+    _wait_idle(app)
+    assert source.takes == [{"full": True, "store_only": False, "fresh": True}]
+
+
+def test_the_reading_reports_back_through_the_common_modes_hop(app, shown, on_screen, monkeypatch):
+    # The sync tick cannot run while the menu is open: the worker's end must
+    # come back through the hop queued in the common modes.
+    hops = []
+    real = pv.call_on_main
+
+    def spy(fn):
+        hops.append(threading.current_thread() is threading.main_thread())
+        real(fn)
+
+    monkeypatch.setattr(pv, "call_on_main", spy)
+    shown(_Source(_AFTER))
+    assert _row(app).accessibilityPerformPress()
+    assert _pump(lambda: not _row(app).busy)
+    assert hops == [False]  # once, from the worker thread
