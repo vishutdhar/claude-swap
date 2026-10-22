@@ -1414,3 +1414,125 @@ def test_the_reading_reports_back_through_the_common_modes_hop(app, shown, on_sc
     assert _row(app).accessibilityPerformPress()
     assert _pump(lambda: not _row(app).busy)
     assert hops == [False]  # once, from the worker thread
+
+
+# --- a repaint that fails must not strand the reading the press is owed --------------
+
+def _repaint_fails_first(app, monkeypatch):
+    """The first in-place repaint raises; later ones run for real."""
+    real, calls = app.apply_snapshot_in_place, []
+
+    def flaky(snap):
+        calls.append(snap)
+        if len(calls) == 1:
+            raise RuntimeError("repaint failed")
+        return real(snap)
+
+    monkeypatch.setattr(app, "apply_snapshot_in_place", flaky)
+    return calls
+
+
+def test_a_failed_repaint_still_runs_the_fresh_read_the_press_is_owed(app, shown, on_screen, monkeypatch):
+    # Pressed while a timer read ran: that read's repaint raises. The fresh
+    # read is still started now, while the menu tracks (no timer would ever
+    # start it), and the row says Refreshing… until it answers.
+    timer_read, fresh_read = threading.Event(), threading.Event()
+    middle = _snap(_entry("1", "a@x.com", active=True, pct=30.0), _entry("2", "b@x.com", pct=40.0))
+    takes = []
+
+    class Source:
+        def take(self, **kw):
+            takes.append(kw)
+            if len(takes) == 1:
+                timer_read.wait(5)
+                return middle
+            fresh_read.wait(5)
+            return _AFTER
+
+    shown(Source())
+    repaints = _repaint_fails_first(app, monkeypatch)
+    app.on_refresh_tick(None)  # a timer read is in flight
+    assert _row(app).accessibilityPerformPress()
+    timer_read.set()
+    assert _pump(lambda: len(takes) == 2)  # the owed read started despite the failure
+    assert [t["fresh"] for t in takes] == [False, True]
+    assert len(repaints) == 1  # the timer read's repaint, which raised
+    _pump(lambda: False, timeout=0.3)  # meanwhile the menu goes on tracking
+    assert _row(app).busy and app._press_pending  # still Refreshing…
+    fresh_read.set()
+    assert _pump(lambda: not _row(app).busy)
+    assert len(repaints) == 2
+    assert _pcts(app) == ["55%", "66%"]  # the final reading is drawn
+    assert not app._refreshing and not app._press_pending
+
+
+def test_a_failed_repaint_with_no_read_owed_gives_the_row_back(app, shown, on_screen, monkeypatch, caplog):
+    source = shown(_Source(_AFTER))
+
+    def fails(_snap):
+        raise RuntimeError("repaint failed")
+
+    monkeypatch.setattr(app, "apply_snapshot_in_place", fails)
+    with caplog.at_level(logging.DEBUG, logger="claude-swap"):
+        assert _row(app).accessibilityPerformPress()
+        assert _pump(lambda: not _row(app).busy)
+    assert len(source.takes) == 1  # nothing else was started
+    assert not app._refreshing and not app._press_pending
+    assert any(r.exc_info and "repaint failed" in str(r.exc_info[1]) for r in caplog.records)
+    assert app._rebuild_pending  # today's way: rebuilt once the menu closes
+    _close(app)
+    app.on_sync_tick(None)
+    assert _pcts(app) == ["55%", "66%"]
+
+
+def test_an_owed_read_that_cannot_start_gives_the_row_back(app, shown, on_screen, monkeypatch):
+    # The fresh read owed to a press fails to start (no thread): the row
+    # comes back, and the in-flight flag does not stay set and block the
+    # next reading.
+    gate = threading.Event()
+    source = shown(_Source(_BEFORE, _AFTER, gate=gate))
+    app.on_refresh_tick(None)  # a timer read is in flight
+    assert _row(app).accessibilityPerformPress()
+    real, starts = app.refresh_async, []
+
+    def cannot_start(full=False, fresh=False):
+        starts.append(fresh)
+        if len(starts) == 1:
+            app._refreshing = True  # refresh_async sets it before starting its thread
+            raise RuntimeError("can't start new thread")
+        return real(full=full, fresh=fresh)
+
+    monkeypatch.setattr(app, "refresh_async", cannot_start)
+    gate.set()
+    assert _pump(lambda: not _row(app).busy)
+    assert starts == [True]
+    assert not app._refreshing and not app._press_pending
+    assert _row(app).accessibilityPerformPress()  # a later press reads again
+    assert _pump(lambda: not _row(app).busy)
+    assert starts == [True, True]
+    assert [t["fresh"] for t in source.takes] == [False, True]
+    assert _pcts(app) == ["55%", "66%"]
+
+
+def test_an_owed_read_that_finishes_at_once_is_still_drawn(app, shown, on_screen, monkeypatch):
+    # The owed fresh read can finish before the code that started it looks
+    # again. Its answer must still be drawn and only then the row come back.
+    gate = threading.Event()
+    middle = _snap(_entry("1", "a@x.com", active=True, pct=30.0), _entry("2", "b@x.com", pct=40.0))
+    shown(_Source(middle, _AFTER, gate=gate))
+    app.on_refresh_tick(None)  # a timer read is in flight
+    assert _row(app).accessibilityPerformPress()
+    real = app.refresh_async
+
+    def and_let_it_finish(full=False, fresh=False):
+        real(full=full, fresh=fresh)
+        deadline = time.monotonic() + 5
+        while fresh and app._refreshing and time.monotonic() < deadline:
+            time.sleep(0.01)  # the owed read is done before its starter goes on
+
+    monkeypatch.setattr(app, "refresh_async", and_let_it_finish)
+    gate.set()
+    assert _pump(lambda: not _row(app).busy)
+    _pump(lambda: False, timeout=0.3)  # let any late report land
+    assert _pcts(app) == ["55%", "66%"]
+    assert not app._press_pending

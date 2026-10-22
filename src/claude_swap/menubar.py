@@ -1107,23 +1107,34 @@ def create_app(switcher):
             The open menu takes the current snapshot in place when its rows
             still fit; otherwise it is rebuilt after it closes, as always. A
             reading still owed to the press (it came while another ran, or a
-            rename dropped one) starts now. Either way the row ends as
-            Refresh now, so it never stays Refreshing… however the reading
-            ended. Idempotent: the hop and the sync tick may both call it.
+            rename dropped one) starts now, whether or not the repaint
+            worked: while the menu tracks, nothing else would start it. The
+            row stays Refreshing… until that reading answers, and ends as
+            Refresh now only once no reading is owed, so it never stays
+            Refreshing… however the reading ended. Idempotent: the hop and
+            the sync tick may both call it.
             """
             if not self._press_pending or self._refreshing:
                 return  # nothing waits, or the reading in flight reports back itself
             try:
                 if self._menu_open and not self.apply_snapshot_in_place(self.snapshot):
                     self._rebuild_pending = True  # rows changed: rebuild after the close
-                if self._refresh_again:
-                    self._refresh_again = False
-                    fresh, self._fresh_again = self._fresh_again, False
-                    self.refresh_async(full=fresh, fresh=fresh)
-                    return  # it reports back in turn; the row stays Refreshing…
             except Exception:
-                self.switcher._logger.debug("Refresh now could not finish in place", exc_info=True)
-                self._rebuild_pending = True
+                self.switcher._logger.debug("Refresh now could not repaint in place", exc_info=True)
+                self._rebuild_pending = True  # today's way: rebuild after the close
+            if self._refresh_again:
+                self._refresh_again = False
+                fresh, self._fresh_again = self._fresh_again, False
+                # Nothing was reading (checked above), so this starts one.
+                # Whether it did is known here, not from _refreshing later:
+                # a quick reading may already have finished by then.
+                try:
+                    self.refresh_async(full=fresh, fresh=fresh)
+                except Exception:
+                    self.switcher._logger.debug("Refresh now could not start its reading", exc_info=True)
+                    self._refreshing = False  # no worker started; do not block the next one
+                else:
+                    return  # it reports back in turn; the row stays Refreshing…
             self._press_pending = False
             self._show_refreshing(False)
 
