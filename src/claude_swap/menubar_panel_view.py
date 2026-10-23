@@ -376,7 +376,8 @@ class _Ink:
 
     ``strong`` is the percentages: the label colour, muted to secondary for
     an exhausted account. ``name`` is muted for an exhausted or a disabled
-    account. Highlighted, every text is the selection's text colour.
+    (paused or held) account. Highlighted, every text is the selection's
+    text colour.
     """
 
     def __init__(self, highlighted: bool, exhausted: bool, disabled: bool):
@@ -434,7 +435,7 @@ def _draw_header(panel, layout, cols, ink) -> None:
     _text(str(panel.num), fonts["num"], ink.tertiary).drawAtPoint_((mp.LEFT_INSET, centred(fonts["num"])))
 
     pieces = []  # (text, font), in reading order
-    for word in panel.state_text.split(mp.STATE_SEP) if panel.state_text else []:
+    for word in panel.state_words:  # "held · 28m" stays one piece
         if word == "active":
             accent = ink.secondary if ink.highlighted else NSColor.controlAccentColor()
             pieces.append((_text("ACTIVE", fonts["tag"], accent), fonts["tag"]))

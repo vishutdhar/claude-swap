@@ -189,6 +189,14 @@ def _live_countdown(window: dict | str | None, now: float) -> str | None:
     ts = _resets_at_ts(window)
     if ts == float("inf"):
         return None
+    return _countdown_until(ts, now)
+
+
+def _countdown_until(ts: float, now: float) -> str | None:
+    """Time left until ``ts`` as the rows show it ("4d 22h", "2h 5m", "28m").
+
+    ``None`` once ``ts`` has passed.
+    """
     remaining = int(ts - now)
     if remaining <= 0:
         return None
@@ -286,6 +294,113 @@ def usage_summary(
     return " · ".join(parts) if parts else "usage unavailable"
 
 
+# ---- held or paused --------------------------------------------------------
+#
+# cswap keeps one disabled flag per account. The owner sets it (``cswap
+# disable``) to pause an account, and the rotation daemon (``cswap-rotate``,
+# a separate script) sets the same flag for its 5-hour guard, holding an
+# account out of rotation for a while near its 5-hour limit. The daemon
+# records each of its holds in a marker file; that file is the only way to
+# tell the two apart, so the menu bar reads it, with the daemon's own
+# tolerant rules (``read_hold_marker`` in that script).
+
+HOLD_MARKER_NAME = "cswap-rotate.hold5h"
+_HOLD_SLOT_RE = re.compile(r"^\d+$")
+_HOLD_RELEASE_STATES = ("releasing", "released")
+
+
+def hold_marker_path() -> Path:
+    """The rotation daemon's hold marker (resolved on each call, from ``$HOME``)."""
+    return Path.home() / "Library" / "Logs" / HOLD_MARKER_NAME
+
+
+def _hold_time(text: str) -> float | None:
+    """Epoch seconds of an ISO 8601 time with an offset; None for anything else."""
+    try:
+        when = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        return None  # the daemon refuses a time without an offset too
+    return when.timestamp()
+
+
+def read_hold_marker(path: Path | None = None) -> dict[str, tuple[str | None, float | None, str | None]] | None:
+    """The rotation guard's holds on disk: slot -> (email, release time, release state).
+
+    Mirrors the daemon's parser. Each whitespace-separated entry is
+    ``N:email:<ISO release time>``, with ``:releasing`` (the guard is
+    enabling it; still the guard's) or ``:released`` (the guard is done with
+    it) appended while a release is under way. Older entries are a bare
+    ``N`` or ``N:email``. A missing file is no holds (``{}``); a file that
+    cannot be read, or any entry that does not parse, is unknown (``None``):
+    nothing in it can be trusted then. ``path`` defaults to
+    ``hold_marker_path()``.
+    """
+    try:
+        raw = (path if path is not None else hold_marker_path()).read_bytes().decode("utf-8")
+    except FileNotFoundError:
+        return {}
+    except (OSError, RuntimeError, UnicodeDecodeError):  # RuntimeError: no home directory
+        return None
+    out: dict[str, tuple[str | None, float | None, str | None]] = {}
+    for token in raw.split():
+        num, _, rest = token.partition(":")
+        if not _HOLD_SLOT_RE.match(num):
+            return None
+        email, _, when = rest.partition(":")
+        state = None
+        for candidate in _HOLD_RELEASE_STATES:
+            if when == candidate or when.endswith(":" + candidate):
+                state = candidate
+                when = "" if when == candidate else when[: -len(":" + candidate)]
+                break
+        until = _hold_time(when) if when else None
+        if when and until is None:
+            return None
+        out[num] = (email or None, until, state)
+    return out
+
+
+@dataclass(frozen=True)
+class GuardHold:
+    """The rotation guard's hold on one account."""
+
+    until: float | None  # when the guard is due to release it (epoch seconds), if recorded
+
+
+def guard_hold(holds, num, email: str) -> GuardHold | None:
+    """The rotation guard's hold on this account, from a ``read_hold_marker`` read.
+
+    An entry counts only when it names this slot AND this email, as the
+    daemon checks: a hold belongs to the account it was taken on, not to
+    whoever sits in the slot now, and a bare slot names no account. A
+    ``released`` entry is the guard done with it, so a slot still disabled
+    is the owner's. An unknown read (``None``) holds nothing.
+    """
+    entry = (holds or {}).get(str(num))
+    if entry is None:
+        return None
+    held_email, until, state = entry
+    if held_email is None or held_email != email or state == "released":
+        return None
+    return GuardHold(until)
+
+
+def out_of_rotation_word(hold: GuardHold | None, now: float) -> str:
+    """Why a disabled account is out of rotation: "held · 28m", "held" or "paused".
+
+    "held" is the rotation guard's temporary hold, followed by the time
+    until its recorded release in the rows' countdown format; just "held"
+    when no release time is recorded or it has passed (the guard lets it go
+    on its next tick). Any other disable is the owner's: "paused".
+    """
+    if hold is None:
+        return "paused"
+    countdown = _countdown_until(hold.until, now) if hold.until is not None else None
+    return f"held · {countdown}" if countdown else "held"
+
+
 def format_account_label(
     num,
     email: str,
@@ -295,9 +410,16 @@ def format_account_label(
     disabled: bool = False,
     fetched_at: float | None = None,
     names_only: bool = False,
+    holds=None,
 ) -> str:
-    """Build one account row's menu label."""
-    marker = "  (disabled)" if disabled else ""
+    """Build one account row's menu label.
+
+    A disabled account says why, from ``holds`` (the snapshot's read of the
+    rotation guard's marker): "(held · 28m)" or "(paused)".
+    """
+    if now is None:
+        now = time.time()
+    marker = f"  ({out_of_rotation_word(guard_hold(holds, num, email), now)})" if disabled else ""
     identity = account_identity(email, alias, names_only=names_only)
     return f"{num}  {identity}{marker}  {usage_summary(usage, now, fetched_at)}"
 
@@ -451,18 +573,23 @@ EMPTY_SNAPSHOT: dict = {
     "active_usage": None,
     "active_alias": None,
     "orgs": {},  # account number -> organization uuid ("" = personal)
+    "holds": {},  # the rotation guard's holds (read_hold_marker); None when unreadable
 }
 
 
-def _adapt_snapshot(snap) -> dict:
+def _adapt_snapshot(snap, marker_path: Path | None = None) -> dict:
     """Adapt an ``AccountsSnapshot`` to the menu bar's render dict.
 
     Shape: ``{"accounts": [(num, email, is_active, display_usage, last_good, alias, disabled, fetched_at), ...],
     "active_email": str | None, "active_usage": dict | str | None,
-    "active_alias": str | None}``. The snapshot itself is produced by
-    ``SnapshotSource`` (the paced read path), so this is a pure transform — no
-    fetching, no I/O. Per-account ``fetched_at`` is the underlying
-    measurement's fetch time, used only for the pace marker (issue #125).
+    "active_alias": str | None, "holds": ...}``. The snapshot itself is
+    produced by ``SnapshotSource`` (the paced read path), so this fetches
+    nothing; its one read is the rotation guard's small hold marker
+    (``read_hold_marker``, at ``marker_path``), taken here once per snapshot
+    on the worker thread so that every row, panel and redraw of this
+    snapshot agrees on which accounts are held, and no menu draw touches the
+    disk. Per-account ``fetched_at`` is the underlying measurement's fetch
+    time, used only for the pace marker (issue #125).
     """
     accounts = []
     orgs = {}
@@ -486,6 +613,7 @@ def _adapt_snapshot(snap) -> dict:
         "active_usage": active_usage,
         "active_alias": active_alias,
         "orgs": orgs,
+        "holds": read_hold_marker(marker_path),
     }
 
 
@@ -1164,10 +1292,14 @@ def create_app(switcher):
             rows = self._shown_rows
             entries = list(snap["accounts"])
             views = [item._menuitem.view() for _num, item in rows]
+            holds = snap.get("holds")
             if views and all(isinstance(view, pv.CswapUsagePanelView) for view in views):
                 now = time.time()
                 names_only = self.settings.show_names_only
-                panels = [build_account_panel(entry, now, names_only=names_only) for entry in entries]
+                panels = [
+                    build_account_panel(entry, now, names_only=names_only, holds=holds)
+                    for entry in entries
+                ]
                 layout = pv.PanelLayout(panels)
                 if not fits_in_place(
                     [(view.panel.num, view.frame().size.height) for view in views],
@@ -1182,7 +1314,7 @@ def create_app(switcher):
                 ):
                     return False
                 for (_num, item), entry in zip(rows, entries):
-                    self._label_text_row(item, entry)
+                    self._label_text_row(item, entry, holds)
             else:
                 return False
             self._set_title(snap)
@@ -1390,28 +1522,33 @@ def create_app(switcher):
                 return
             self._refresh_row = view
 
-        def _label_text_row(self, item, entry):
-            """An account text row's title, checkmark and accessible name."""
+        def _label_text_row(self, item, entry, holds=None):
+            """An account text row's title, checkmark and accessible name.
+
+            ``holds`` is the snapshot's read of the rotation guard's marker.
+            """
             num, email, is_active, display, _last_good, alias, disabled, fetched_at, *_extra = entry
             now = time.time()  # one clock: the two labels' countdowns agree
             item.title = format_account_label(
                 num, email, display, now, alias=alias, disabled=disabled,
-                fetched_at=fetched_at, names_only=self.settings.show_names_only,
+                fetched_at=fetched_at, names_only=self.settings.show_names_only, holds=holds,
             )
             item.state = 1 if is_active else 0
             # The accessible name (AXTitle, what VoiceOver reads) is always the
             # full row: with names only the visible row hides an alias's email.
             item._menuitem.setAccessibilityTitle_(format_account_label(
                 num, email, display, now, alias=alias, disabled=disabled, fetched_at=fetched_at,
+                holds=holds,
             ))
 
         def _account_items(self, snap):
             """One row per account: a text row, drawn as a usage panel when enabled."""
             rows = []  # (account number, item)
+            holds = snap.get("holds")
             for entry in snap["accounts"]:
                 num = entry[0]
                 item = rumps.MenuItem(str(num), callback=self._make_switch_to(num))
-                self._label_text_row(item, entry)
+                self._label_text_row(item, entry, holds)
                 rows.append((num, item))
             self._shown_rows = rows
             if not rows:
@@ -1421,10 +1558,10 @@ def create_app(switcher):
                 and not self._bars_broken
                 and self._account_target is not None
             ):
-                self._attach_usage_bars(rows, snap["accounts"])
+                self._attach_usage_bars(rows, snap["accounts"], holds)
             return [item for _num, item in rows]
 
-        def _attach_usage_bars(self, rows, accounts):
+        def _attach_usage_bars(self, rows, accounts, holds=None):
             """Draw every account row as a usage panel, or leave them all as text.
 
             Panels are paired with rows by account number. Any failure here
@@ -1438,7 +1575,7 @@ def create_app(switcher):
                 now = time.time()
                 names_only = self.settings.show_names_only
                 panels = {
-                    entry[0]: build_account_panel(entry, now, names_only=names_only)
+                    entry[0]: build_account_panel(entry, now, names_only=names_only, holds=holds)
                     for entry in accounts
                 }
                 pv.attach_usage_panels(
@@ -1517,7 +1654,9 @@ def create_app(switcher):
             return menu
 
         def _disable_menu(self, rumps, snap):
-            menu = rumps.MenuItem("Disable / enable account")
+            # cswap's disable flag, named for what the owner does with it: a
+            # pause is theirs, unlike a hold of the rotation guard.
+            menu = rumps.MenuItem("Pause / resume account")
             accounts = snap["accounts"]
             if not accounts:
                 menu.add(rumps.MenuItem("No managed accounts", callback=None))
@@ -1526,8 +1665,8 @@ def create_app(switcher):
                 item = rumps.MenuItem(
                     f"{num}  {name}", callback=self._make_toggle_disabled(num, disabled)
                 )
-                # A check-mark reads as "held out of rotation" — same glyph the
-                # active row uses, but here it means disabled, not selected.
+                # A check-mark reads as "out of rotation" (paused, or held by
+                # the rotation guard): the active row's glyph, not "selected".
                 item.state = 1 if disabled else 0
                 menu.add(item)
             return menu

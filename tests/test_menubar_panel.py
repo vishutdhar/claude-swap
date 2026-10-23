@@ -14,7 +14,7 @@ import math
 
 import pytest
 
-from claude_swap import json_output, menubar, menubar_panel as mp
+from claude_swap import json_output, menubar, menubar_panel as mp, oauth
 from claude_swap.tui import theme
 from claude_swap.tui.theme import CRIT_PCT, WARN_PCT
 from claude_swap.usage_store import UsageEntry
@@ -309,7 +309,7 @@ def test_panel_title_is_the_text_rows_identity_with_alias():
     panel = mp.build_account_panel(_entry(usage, num=4, alias="work", disabled=True), _NOW)
     assert panel.title == "work  (a@x.com)"
     assert panel.email == "a@x.com"
-    assert (panel.state_text, panel.age_text) == ("disabled", None)
+    assert (panel.state_text, panel.age_text) == ("paused", None)
     text = menubar.format_account_label(4, "a@x.com", usage, _NOW, alias="work", disabled=True)
     assert text.startswith(f"4  {panel.title}")
 
@@ -358,9 +358,9 @@ def test_state_and_age_are_separate_fields():
     disabled = mp.build_account_panel(_entry(usage, disabled=True), _NOW)
     both = mp.build_account_panel(_entry(usage, active=True, disabled=True, fetched_at=_NOW), _NOW)
     assert (active.state_text, active.age_text) == ("active", "2m ago")
-    assert (disabled.state_text, disabled.age_text) == ("disabled", None)
-    assert (both.state_text, both.age_text) == ("active · disabled", "0s ago")
-    assert both.state_text.split(mp.STATE_SEP) == ["active", "disabled"]
+    assert (disabled.state_text, disabled.age_text) == ("paused", None)
+    assert (both.state_text, both.age_text) == ("active · paused", "0s ago")
+    assert both.state_words == ("active", "paused")
     # Replaced, not kept beside the new fields: nothing else read it.
     assert "meta_text" not in {f.name for f in dataclasses.fields(mp.AccountPanel)}
 
@@ -659,7 +659,102 @@ def test_accessibility_still_says_over_limit_now_the_marker_is_not_drawn():
 
 def test_accessibility_label_for_a_sentinel_row():
     panel = mp.build_account_panel(_entry("token expired", num=2, disabled=True), _NOW)
-    assert mp.accessibility_label(panel) == "Account 2, a@x.com, disabled. token expired."
+    assert mp.accessibility_label(panel) == "Account 2, a@x.com, paused. token expired."
+
+
+# --- held or paused: the rotation guard's hold, or the owner's own disable -------------
+
+_USAGE_12 = {"five_hour": {"pct": 12.0}}
+_HOLDS = {"2": ("a@x.com", _NOW + 28 * 60, None)}  # a read of the guard's marker
+
+
+def _held(holds=_HOLDS, **kw):
+    kw.setdefault("num", 2)
+    kw.setdefault("disabled", True)
+    return mp.build_account_panel(_entry(_USAGE_12, **kw), _NOW, holds=holds)
+
+
+def _clock(ts):
+    return oauth.reset_clock_string(
+        _dt.datetime.fromtimestamp(ts, _dt.timezone.utc), _dt.datetime.fromtimestamp(_NOW, _dt.timezone.utc)
+    )
+
+
+def test_a_guard_hold_says_held_with_its_countdown():
+    panel = _held()
+    assert panel.state_text == "held · 28m"
+    assert panel.state_words == ("held · 28m",)  # one piece: the countdown belongs to the word
+    assert panel.disabled  # the name dims as before
+
+
+@pytest.mark.parametrize("until", [_NOW - 60, _NOW, None])
+def test_a_hold_past_or_without_its_release_time_is_just_held(until):
+    panel = _held(holds={"2": ("a@x.com", until, None)})
+    assert panel.state_words == ("held",)
+
+
+def test_a_hold_being_released_is_still_held():
+    panel = _held(holds={"2": ("a@x.com", _NOW + 28 * 60, "releasing")})
+    assert panel.state_words == ("held · 28m",)
+
+
+@pytest.mark.parametrize(
+    "holds",
+    [
+        None,  # the marker could not be read
+        {},  # no marker
+        {"2": ("someone@else.com", _NOW + 28 * 60, None)},  # the slot now holds another account
+        {"2": ("a@x.com", _NOW + 28 * 60, "released")},  # the guard let it go; disabled since by the owner
+        {"2": (None, None, None)},  # a bare slot names no account
+    ],
+)
+def test_a_disable_the_guard_does_not_hold_is_paused(holds):
+    panel = _held(holds=holds)
+    assert panel.state_words == ("paused",)
+    assert panel.disabled
+
+
+def test_active_comes_first_when_held():
+    panel = _held(active=True, fetched_at=_NOW - 120)
+    assert panel.state_words == ("active", "held · 28m")
+    assert panel.state_text == "active · held · 28m"
+    assert panel.age_text == "2m ago"
+
+
+def test_an_enabled_account_named_in_the_marker_has_no_state_word():
+    panel = _held(disabled=False)
+    assert (panel.state_words, panel.state_text) == ((), "")
+
+
+def test_a_held_panels_text_label_is_the_text_row():
+    panel = _held()
+    assert panel.text_label == menubar.format_account_label(
+        2, "a@x.com", _USAGE_12, _NOW, disabled=True, holds=_HOLDS
+    )
+    assert "(held · 28m)" in panel.text_label
+
+
+def test_spoken_label_names_the_guard_and_its_release_time():
+    label = mp.accessibility_label(_held())
+    assert label == f"Account 2, a@x.com, held by the rotation guard until {_clock(_NOW + 28 * 60)}. 5 hour, 12 percent."
+
+
+def test_spoken_label_for_a_hold_past_its_release_time():
+    label = mp.accessibility_label(_held(holds={"2": ("a@x.com", _NOW - 60, None)}))
+    assert label == "Account 2, a@x.com, held by the rotation guard. 5 hour, 12 percent."
+
+
+def test_spoken_label_for_a_pause():
+    label = mp.accessibility_label(_held(holds={}))
+    assert label == "Account 2, a@x.com, paused. 5 hour, 12 percent."
+
+
+def test_spoken_label_active_and_held_keeps_active_first():
+    label = mp.accessibility_label(_held(active=True, fetched_at=_NOW - 120))
+    assert label == (
+        f"Account 2, a@x.com, active, held by the rotation guard until {_clock(_NOW + 28 * 60)}, "
+        "2 minutes ago. 5 hour, 12 percent."
+    )
 
 
 def test_a_wider_row_still_builds_its_panel():

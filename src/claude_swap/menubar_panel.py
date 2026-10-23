@@ -17,14 +17,19 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
-from claude_swap import pace
+from claude_swap import oauth, pace
 from claude_swap.json_output import USAGE_NO_CREDENTIALS, USAGE_RELOGIN_REQUIRED
 from claude_swap.menubar import (
+    GuardHold,
+    _countdown_until,
     _live_countdown,
     _rolled_weekly_window,
     account_identity,
     format_account_label,
+    guard_hold,
+    out_of_rotation_word,
     sentinel_note,
 )
 from claude_swap.tui.data import format_duration
@@ -55,7 +60,7 @@ CARD_RADIUS = 6.0
 HAIRLINE = 0.5  # the rule under each inactive account
 
 UNAVAILABLE = "usage unavailable"  # the text row's wording
-STATE_SEP = " · "  # joins the state words ("active · disabled")
+STATE_SEP = " · "  # joins the state words ("active · held · 28m")
 
 # A dead login: only the user can fix it (log in again, or add the account),
 # so its row is urgent. The panel is handed the sentinel's display text, not
@@ -100,7 +105,8 @@ class AccountPanel:
     """One account's block: header fields plus its window rows.
 
     The header shows ``name_text`` and, after it, the email (unless
-    ``show_email`` is off); on the right, ``state_text`` and ``age_text``.
+    ``show_email`` is off); on the right, each of ``state_words`` and then
+    ``age_text``.
     """
 
     num: str
@@ -108,13 +114,20 @@ class AccountPanel:
     name_text: str  # the alias, else the email's local part
     email: str
     is_active: bool
-    disabled: bool
-    state_text: str  # "active", "disabled", "active · disabled", or ""
+    disabled: bool  # out of rotation, paused or held: the name dims either way
+    # ("active", "held · 28m"), ("paused",) or (); each word is drawn as one piece
+    state_words: tuple[str, ...]
+    spoken_states: tuple[str, ...]  # the same states as VoiceOver says them
     age_text: str | None  # "2m ago", or None when the reading's age is unknown
     rows: tuple[WindowRow, ...]
     text_label: str  # the plain text row, for accessibility and type-select
     alias: str | None = None  # kept so the accessibility label can name the email
     show_email: bool = True  # off where Show names only hides it in the text row
+
+    @property
+    def state_text(self) -> str:
+        """The state words as one line: "active · held · 28m", "paused", or ""."""
+        return STATE_SEP.join(self.state_words)
 
     @property
     def exhausted(self) -> bool:
@@ -230,7 +243,19 @@ def age_text(fetched_at: float | None, now: float) -> str | None:
     return f"{format_duration(max(0.0, now - fetched_at))} ago"
 
 
-def build_account_panel(entry: tuple, now: float, names_only: bool = False) -> AccountPanel:
+def _spoken_out_of_rotation(hold: GuardHold | None, now: float) -> str:
+    """The state word as VoiceOver says it: who holds the account, and until when."""
+    if hold is None:
+        return "paused"
+    if hold.until is None or _countdown_until(hold.until, now) is None:
+        return "held by the rotation guard"  # no countdown shown: no time said
+    clock = oauth.reset_clock_string(
+        datetime.fromtimestamp(hold.until, timezone.utc), datetime.fromtimestamp(now, timezone.utc)
+    )
+    return f"held by the rotation guard until {clock}"
+
+
+def build_account_panel(entry: tuple, now: float, names_only: bool = False, holds=None) -> AccountPanel:
     """Panel model for one snapshot account row.
 
     ``entry`` is ``(num, email, is_active, display_usage, last_good, alias,
@@ -238,14 +263,20 @@ def build_account_panel(entry: tuple, now: float, names_only: bool = False) -> A
     panel reads the same display usage the text row reads. ``names_only``
     is Settings → Show names only, applied exactly as the text row applies it:
     an aliased account's email is hidden, an account without an alias keeps it.
+    ``holds`` is the snapshot's read of the rotation guard's marker
+    (``snap["holds"]``): a disabled account it holds is "held", any other
+    disabled account "paused", as in the text row.
     """
     # Fields past the eighth are for other readers; a wider row still builds.
     num, email, is_active, display, _last_good, alias, disabled, fetched_at, *_extra = entry
-    states = []
+    words, spoken = [], []
     if is_active:
-        states.append("active")
+        words.append("active")
+        spoken.append("active")
     if disabled:
-        states.append("disabled")
+        hold = guard_hold(holds, num, email)
+        words.append(out_of_rotation_word(hold, now))
+        spoken.append(_spoken_out_of_rotation(hold, now))
     return AccountPanel(
         num=num,
         title=account_identity(email, alias, names_only=names_only),
@@ -255,12 +286,13 @@ def build_account_panel(entry: tuple, now: float, names_only: bool = False) -> A
         email=email,
         is_active=bool(is_active),
         disabled=bool(disabled),
-        state_text=STATE_SEP.join(states),
+        state_words=tuple(words),
+        spoken_states=tuple(spoken),
         age_text=age_text(fetched_at, now),
         rows=tuple(window_rows(display, now, fetched_at)),
         text_label=format_account_label(
             num, email, display, now, alias=alias, disabled=disabled,
-            fetched_at=fetched_at, names_only=names_only,
+            fetched_at=fetched_at, names_only=names_only, holds=holds,
         ),
         alias=alias,
         show_email=not (names_only and alias),  # account_identity's names-only rule
@@ -427,7 +459,7 @@ def spoken_duration(text: str) -> str:
 
 
 def _spoken_meta(panel: AccountPanel) -> str:
-    out = panel.state_text.split(STATE_SEP) if panel.state_text else []
+    out = list(panel.spoken_states)
     if panel.age_text:
         age = panel.age_text
         if age.endswith(" ago"):

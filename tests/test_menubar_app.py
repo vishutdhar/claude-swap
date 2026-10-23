@@ -414,10 +414,110 @@ def test_rename_submenu_follows_disable_and_lists_every_account(app):
     app.snapshot = _snap(_entry_alias("1", "a@x.com", "work", active=True), _entry_alias("2", "b@x.com", None))
     app.rebuild_menu()
     titles = _root_titles(app)
-    assert titles.index("Rename account") == titles.index("Disable / enable account") + 1
+    assert titles.index("Rename account") == titles.index("Pause / resume account") + 1
     assert [i.title() for i in _submenu(app, "Rename account").itemArray()] == [
         "1  work  (a@x.com)", "2  b@x.com",
     ]
+
+
+# --- held or paused ---------------------------------------------------------------
+
+def _disabled_entry(num, email, active=False, pct=10.0):
+    usage = {"five_hour": {"pct": pct}}
+    return (num, email, active, usage, usage, None, True, None)
+
+
+def _held_snap(until_s=28 * 60 + 30, holds=None):
+    snap = _snap(_entry("1", "a@x.com", active=True), _disabled_entry("2", "b@x.com"))
+    snap["holds"] = holds if holds is not None else {"2": ("b@x.com", time.time() + until_s, None)}
+    return snap
+
+
+def test_the_toggle_submenu_says_pause_and_resume(app):
+    app.snapshot = _held_snap()
+    app.rebuild_menu()
+    titles = _root_titles(app)
+    assert "Pause / resume account" in titles
+    assert not any("isable" in t or "nable" in t for t in titles)
+    items = _submenu(app, "Pause / resume account").itemArray()
+    assert [(i.title(), i.state()) for i in items] == [("1  a@x.com", 0), ("2  b@x.com", 1)]
+
+
+def test_the_pause_item_still_flips_the_disabled_flag(app):
+    calls = []
+    app.switcher.set_account_disabled = lambda num, disabled: calls.append((num, disabled))
+    app.snapshot = _held_snap()
+    app.rebuild_menu()
+    for item in _submenu(app, "Pause / resume account").itemArray():
+        item.target().callback_(item)
+    assert calls == [("1", True), ("2", False)]
+
+
+def test_text_rows_say_held_with_the_countdown(app):
+    app.settings.show_usage_bars = False
+    app.snapshot = _held_snap()
+    app.rebuild_menu()
+    second = _account_items(app)[1]
+    assert second.title().startswith("2  b@x.com  (held · 28m)  5h 10%")
+    assert second.accessibilityTitle().startswith("2  b@x.com  (held · 28m)")
+
+
+def test_text_rows_say_paused_without_a_hold(app):
+    app.settings.show_usage_bars = False
+    app.snapshot = _held_snap(holds={})
+    app.rebuild_menu()
+    assert _account_items(app)[1].title().startswith("2  b@x.com  (paused)  5h 10%")
+
+
+def test_panels_say_held_from_the_snapshots_marker_read(app):
+    app.snapshot = _held_snap()
+    app.rebuild_menu()
+    panels = [i.view().panel for i in _account_items(app)]
+    assert [p.state_words for p in panels] == [("active",), ("held · 28m",)]
+
+
+def test_the_in_place_redraw_takes_the_new_hold(app, on_screen):
+    app.snapshot = _held_snap(holds={})
+    app.rebuild_menu()
+    _open(app)
+    assert _account_items(app)[1].view().panel.state_words == ("paused",)
+    assert app.apply_snapshot_in_place(_held_snap())
+    assert _account_items(app)[1].view().panel.state_words == ("held · 28m",)
+    _close(app)
+
+
+def test_a_refresh_reads_the_guards_marker_into_the_snapshot(app, monkeypatch):
+    # The real adaptation path, under this test's own home (conftest).
+    from pathlib import Path
+
+    marker = Path.home() / "Library" / "Logs" / "cswap-rotate.hold5h"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("2:b@x.com:2099-01-01T00:00:00+00:00\n", encoding="utf-8")
+
+    class _Usage:
+        last_good = {"five_hour": {"pct": 10.0}}
+        sentinel = None
+        fetched_at = None
+
+    class _Acct:
+        def __init__(self, number, email, is_active, disabled):
+            self.number, self.email, self.is_active, self.disabled = number, email, is_active, disabled
+            self.alias, self.org_uuid, self.usage = None, "", _Usage()
+
+    class _Raw:
+        accounts = [_Acct("1", "a@x.com", True, False), _Acct("2", "b@x.com", False, True)]
+
+    class _Source:
+        def take(self, **_kw):
+            return _Raw()
+
+    app._snapshot_source = _Source()
+    app.refresh_async()
+    _wait_idle(app)
+    assert app.snapshot["holds"] == {"2": ("b@x.com", 4070908800.0, None)}
+    app.settings.show_usage_bars = False
+    app.rebuild_menu()
+    assert "(held · " in _account_items(app)[1].title()
 
 
 def _choose_rename(app, index):

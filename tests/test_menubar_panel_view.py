@@ -452,12 +452,38 @@ def test_exhausted_panel_is_muted_with_a_red_percent_and_no_marker(monkeypatch):
     assert name_font.isEqual_(pv._fonts()["title"])
 
 
-def test_disabled_panel_says_disabled_in_the_meta_colour(monkeypatch):
+def test_disabled_panel_says_paused_in_the_meta_colour(monkeypatch):
+    # Disabled with no hold of the rotation guard on it: the owner's pause.
     panel = _states()[2]
     calls = _drawn(monkeypatch, panel)
-    assert _is(_colour_of(calls, "disabled"), "secondaryLabelColor")
-    assert [f for s, f, _c in calls if s == "disabled"][0].isEqual_(pv._fonts()["meta"])
+    assert _is(_colour_of(calls, "paused"), "secondaryLabelColor")
+    assert [f for s, f, _c in calls if s == "paused"][0].isEqual_(pv._fonts()["meta"])
+    assert "disabled" not in [s for s, _f, _c in calls]
     assert "off@example.com" in [s for s, _f, _c in calls]
+
+
+_HELD_ENTRY = ("3", "off@example.com", False, {"five_hour": {"pct": 5.0}}, None, None, True, _NOW - 120)
+_HOLDS = {"3": ("off@example.com", _NOW + 28 * 60, None)}
+
+
+def test_a_held_panel_draws_its_countdown_with_the_word(monkeypatch):
+    panel = mp.build_account_panel(_HELD_ENTRY, _NOW, holds=_HOLDS)
+    calls = _drawn(monkeypatch, panel)
+    strings = [s for s, _f, _c in calls]
+    # One piece, so the countdown never reads as the age beside it.
+    assert "held · 28m" in strings and "held" not in strings and "28m" not in strings
+    assert _is(_colour_of(calls, "held · 28m"), "secondaryLabelColor")
+    assert [f for s, f, _c in calls if s == "held · 28m"][0].isEqual_(pv._fonts()["meta"])
+    assert "2m ago" in strings
+    assert _is(_colour_of(calls, "off"), "secondaryLabelColor")  # the name dims, as for a pause
+    assert _is(_colour_of(calls, "5%"), "labelColor")  # the numbers do not
+
+
+def test_an_active_held_panel_draws_the_tag_then_the_hold(monkeypatch):
+    entry = ("3",) + _HELD_ENTRY[1:2] + (True,) + _HELD_ENTRY[3:]
+    calls = _drawn(monkeypatch, mp.build_account_panel(entry, _NOW, holds=_HOLDS))
+    strings = [s for s, _f, _c in calls]
+    assert strings.index("ACTIVE") < strings.index("held · 28m") < strings.index("2m ago")
 
 
 def test_a_disabled_account_keeps_its_dimmed_name(monkeypatch):

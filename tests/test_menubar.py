@@ -240,9 +240,178 @@ def test_format_account_label_with_alias():
     assert label == "2  dev  (loc@papaya.asia)  5h 42% · 7d 18% · $ 30%"
 
 
-def test_format_account_label_disabled_marker():
+def test_format_account_label_paused_marker():
+    # Disabled with no hold of the rotation guard on it: the owner's own pause.
     label = menubar.format_account_label(2, "loc@papaya.asia", _USAGE, disabled=True)
-    assert label == "2  loc@papaya.asia  (disabled)  5h 42% · 7d 18% · $ 30%"
+    assert label == "2  loc@papaya.asia  (paused)  5h 42% · 7d 18% · $ 30%"
+
+
+# --- held or paused: the rotation guard's hold marker ------------------------------
+#
+# cswap knows one disabled flag per account. The rotation daemon
+# (cswap-rotate, a separate script) sets that same flag for its 5-hour guard
+# and records each hold in ~/Library/Logs/cswap-rotate.hold5h as
+# `N:email:<ISO release time>`, with `:releasing` / `:released` appended
+# while a release is under way. These tests mirror its tolerant parser.
+
+_HOLD_NOW = 1_800_000_000.0
+
+
+def _hold_iso(delta_s):
+    return _dt.datetime.fromtimestamp(_HOLD_NOW + delta_s, _dt.timezone.utc).isoformat()
+
+
+def _marker(tmp_path, text):
+    path = tmp_path / "cswap-rotate.hold5h"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_hold_marker_missing_file_is_no_holds(tmp_path):
+    assert menubar.read_hold_marker(tmp_path / "cswap-rotate.hold5h") == {}
+
+
+def test_hold_marker_unreadable_is_unknown(tmp_path):
+    # A directory where the file should be, and bytes that are not UTF-8:
+    # a marker that cannot be read is unknown, never "no holds".
+    assert menubar.read_hold_marker(tmp_path) is None
+    bad = tmp_path / "bad.hold5h"
+    bad.write_bytes(b"2:b@x.com:\xff\xfe")
+    assert menubar.read_hold_marker(bad) is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "junk",
+        ":b@x.com",  # no slot
+        "2:b@x.com:not-a-time",
+        "2:b@x.com:2026-10-23T01:10:00",  # a time with no offset, as the daemon refuses it
+        "2:b@x.com:2026-10-23T01:10:00+00:00 junk",  # one bad token spoils the read
+    ],
+)
+def test_hold_marker_garbage_is_unknown(tmp_path, text):
+    assert menubar.read_hold_marker(_marker(tmp_path, text)) is None
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("2", {"2": (None, None, None)}),  # the first release's bare slot: no identity
+        ("2:b@x.com", {"2": ("b@x.com", None, None)}),  # no release time recorded
+        (f"2:b@x.com:{_hold_iso(1680)}", {"2": ("b@x.com", _HOLD_NOW + 1680, None)}),
+        (f"2:b@x.com:{_hold_iso(1680)}:releasing", {"2": ("b@x.com", _HOLD_NOW + 1680, "releasing")}),
+        (f"2:b@x.com:{_hold_iso(1680)}:released", {"2": ("b@x.com", _HOLD_NOW + 1680, "released")}),
+        ("2:b@x.com:releasing", {"2": ("b@x.com", None, "releasing")}),
+        ("2:b@x.com:2026-10-23T01:10:00Z", {"2": ("b@x.com", 1792717800.0, None)}),  # "Z" is UTC
+    ],
+)
+def test_hold_marker_entry_forms(tmp_path, text, expected):
+    assert menubar.read_hold_marker(_marker(tmp_path, text + "\n")) == expected
+
+
+def test_hold_marker_reads_the_live_shape(tmp_path):
+    text = "2:dharvishut@gmail.com:2026-10-23T01:10:00.372185+00:00\n"
+    when = _dt.datetime(2026, 10, 23, 1, 10, 0, 372185, tzinfo=_dt.timezone.utc).timestamp()
+    assert menubar.read_hold_marker(_marker(tmp_path, text)) == {"2": ("dharvishut@gmail.com", when, None)}
+
+
+def test_hold_marker_two_entries(tmp_path):
+    text = f"2:b@x.com:{_hold_iso(1680)}\n3:c@x.com:{_hold_iso(60)}:released\n"
+    assert menubar.read_hold_marker(_marker(tmp_path, text)) == {
+        "2": ("b@x.com", _HOLD_NOW + 1680, None),
+        "3": ("c@x.com", _HOLD_NOW + 60, "released"),
+    }
+
+
+def test_hold_marker_default_path_is_the_daemons_under_home(tmp_path, monkeypatch):
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    path = menubar.hold_marker_path()
+    assert path == tmp_path / "Library" / "Logs" / "cswap-rotate.hold5h"
+    assert menubar.read_hold_marker() == {}  # not there yet
+    path.parent.mkdir(parents=True)
+    path.write_text(f"2:b@x.com:{_hold_iso(60)}\n", encoding="utf-8")
+    assert menubar.read_hold_marker() == {"2": ("b@x.com", _HOLD_NOW + 60, None)}
+
+
+_UNTIL = _HOLD_NOW + 28 * 60
+
+
+_NOT_HELD = "not held"
+
+
+@pytest.mark.parametrize(
+    "holds, num, email, held_until",
+    [
+        ({"2": ("b@x.com", _UNTIL, None)}, "2", "b@x.com", _UNTIL),
+        ({"2": ("b@x.com", _UNTIL, None)}, 2, "b@x.com", _UNTIL),  # an int slot
+        ({"2": ("b@x.com", None, None)}, "2", "b@x.com", None),  # held, no release time recorded
+        # Still the guard's while the release is under way.
+        ({"2": ("b@x.com", _UNTIL, "releasing")}, "2", "b@x.com", _UNTIL),
+        # The guard is done with it: a slot still disabled is the owner's.
+        ({"2": ("b@x.com", _UNTIL, "released")}, "2", "b@x.com", _NOT_HELD),
+        # A hold belongs to the account it was taken on, not the slot.
+        ({"2": ("b@x.com", _UNTIL, None)}, "2", "other@x.com", _NOT_HELD),
+        ({"2": ("b@x.com", _UNTIL, None)}, "3", "b@x.com", _NOT_HELD),
+        ({"2": (None, None, None)}, "2", "b@x.com", _NOT_HELD),  # a bare slot names no account
+        ({}, "2", "b@x.com", _NOT_HELD),
+        (None, "2", "b@x.com", _NOT_HELD),  # unknown: never held
+    ],
+)
+def test_guard_hold_needs_the_slot_and_the_email(holds, num, email, held_until):
+    expected = None if held_until == _NOT_HELD else menubar.GuardHold(held_until)
+    assert menubar.guard_hold(holds, num, email) == expected
+
+
+@pytest.mark.parametrize(
+    "held_until, expected",
+    [
+        (_UNTIL, "held · 28m"),
+        (_HOLD_NOW + 2 * 3600 + 5 * 60, "held · 2h 5m"),  # the rows' countdown format
+        (_HOLD_NOW + 30, "held · 0m"),
+        (_HOLD_NOW, "held"),  # due now
+        (_HOLD_NOW - 60, "held"),  # past: the guard releases it on its next tick
+        (None, "held"),  # no release time recorded
+        (_NOT_HELD, "paused"),
+    ],
+)
+def test_out_of_rotation_word(held_until, expected):
+    hold = None if held_until == _NOT_HELD else menubar.GuardHold(held_until)
+    assert menubar.out_of_rotation_word(hold, _HOLD_NOW) == expected
+
+
+def _held_label(holds, disabled=True, email="loc@papaya.asia"):
+    return menubar.format_account_label(2, email, _USAGE, _HOLD_NOW, disabled=disabled, holds=holds)
+
+
+def test_format_account_label_says_held_with_its_countdown():
+    holds = {"2": ("loc@papaya.asia", _UNTIL, None)}
+    assert _held_label(holds) == "2  loc@papaya.asia  (held · 28m)  5h 42% · 7d 18% · $ 30%"
+
+
+def test_format_account_label_held_past_its_release_is_just_held():
+    holds = {"2": ("loc@papaya.asia", _HOLD_NOW - 60, None)}
+    assert _held_label(holds) == "2  loc@papaya.asia  (held)  5h 42% · 7d 18% · $ 30%"
+
+
+@pytest.mark.parametrize(
+    "holds",
+    [
+        {},  # no marker file
+        None,  # a marker that cannot be read
+        {"2": ("someone@else.com", _UNTIL, None)},  # the slot now holds another account
+        {"2": ("loc@papaya.asia", _UNTIL, "released")},  # the guard let it go; the owner disabled it since
+        {"3": ("loc@papaya.asia", _UNTIL, None)},  # another slot
+    ],
+)
+def test_format_account_label_paused_when_the_guard_does_not_hold_it(holds):
+    assert _held_label(holds) == "2  loc@papaya.asia  (paused)  5h 42% · 7d 18% · $ 30%"
+
+
+def test_format_account_label_says_nothing_for_an_enabled_account_in_the_marker():
+    # Not disabled: whatever the marker says, it is in rotation.
+    holds = {"2": ("loc@papaya.asia", _UNTIL, None)}
+    assert _held_label(holds, disabled=False) == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30%"
 
 
 # --- usage logging -------------------------------------------------------------
@@ -501,6 +670,32 @@ def test_adapt_snapshot_shape_and_active_selection():
 
 def test_adapt_snapshot_empty():
     assert menubar._adapt_snapshot(_FakeSnap([])) == menubar.EMPTY_SNAPSHOT
+
+
+def test_adapt_snapshot_reads_the_hold_marker_once(tmp_path, monkeypatch):
+    path = _marker(tmp_path, f"2:b@x.com:{_hold_iso(60)}\n")
+    reads = []
+    real = menubar.read_hold_marker
+    monkeypatch.setattr(menubar, "read_hold_marker", lambda p=None: reads.append(p) or real(p))
+    accts = [
+        _FakeAcct("1", "a@x.com", True, _FakeEntry(last_good={"five_hour": {"pct": 1.0}})),
+        _FakeAcct("2", "b@x.com", False, _FakeEntry(), disabled=True),
+    ]
+    snap = menubar._adapt_snapshot(_FakeSnap(accts), marker_path=path)
+    assert reads == [path]  # once for the whole snapshot, not once per account
+    assert snap["holds"] == {"2": ("b@x.com", _HOLD_NOW + 60, None)}
+
+
+def test_adapt_snapshot_reads_the_daemons_marker_by_default(tmp_path, monkeypatch):
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    path = menubar.hold_marker_path()
+    path.parent.mkdir(parents=True)
+    path.write_text(f"2:b@x.com:{_hold_iso(60)}\n", encoding="utf-8")
+    assert menubar._adapt_snapshot(_FakeSnap([]))["holds"] == {"2": ("b@x.com", _HOLD_NOW + 60, None)}
+
+
+def test_adapt_snapshot_keeps_an_unreadable_marker_unknown(tmp_path):
+    assert menubar._adapt_snapshot(_FakeSnap([]), marker_path=tmp_path)["holds"] is None
 
 
 # --- weekly reset roll-forward (static 7-day cadence) --------------------------
