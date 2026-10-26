@@ -27,7 +27,6 @@ import sys
 import tempfile
 import threading
 import time
-import traceback
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
@@ -557,40 +556,68 @@ def purge_menu_callbacks(registry: dict, nsmenu) -> None:
 # failing or stalled read freezes the menu while its ages keep ticking on
 # every draw. These lines are the only trace of that, so they are WARNINGs;
 # they are rate-limited so a read failing every minute cannot flood the log,
-# and they never carry a token: exception text from the usage and credential
-# paths can hold one.
+# and they never carry a secret: exception text from the usage and
+# credential paths can hold one.
 
 SNAPSHOT_FAILURE_WINDOW_S = 600.0  # one line per exception class per window
+SNAPSHOT_FAILURE_CLASSES_MAX = 32  # live windows kept; the oldest goes first
 SLOW_SNAPSHOT_S = 60.0  # a read longer than this logs its duration
 SNAPSHOT_ERROR_TEXT_LIMIT = 200  # characters of exception text kept
-# Token-shaped text: 80 or more token characters in a row. OAuth access and
-# refresh tokens are far longer than that; ordinary error text has no such run.
-TOKEN_SHAPE = re.compile(r"[A-Za-z0-9._~+/=-]{80,}")
+REDACTED = "<redacted>"
+# Secrets are redacted by meaning as well as by length. A value after a key
+# that names a secret (refreshToken=..., "access_token": "...", password:
+# ..., x-api-key=...): the key is matched case-insensitively as the end of
+# the name, with = or : and optional quotes; a quoted value is taken whole,
+# up to its closing quote or the end of the text, and an auth scheme's value
+# ("Authorization: Bearer abc") takes the credential after the scheme too.
+_SECRET_KEY = (
+    r"(?:refreshtoken|accesstoken|api_key|apikey|token|secret|password|passwd"
+    r"|key|bearer|authorization|credentials?)"
+)
+SECRET_VALUE = re.compile(
+    r"(?i)(" + _SECRET_KEY + r"[\"']?\s*[:=]\s*)"
+    r"((?:bearer|basic|digest)\s+[^\s\"',;)}\]]+|\"[^\"]*\"?|'[^']*'?|[^\s\"',;)}\]]+)"
+)
+# A bearer credential with no key before it ("sent bearer abc").
+BEARER_VALUE = re.compile(r"(?i)\b(bearer\s+)[^\s\"',;)}\]]+")
+# Any run of 20 or more token characters, keyed or not. Every OAuth token and
+# API key is longer than that (the 80+ runs the first version caught are a
+# subset); ordinary words are shorter, though long paths and identifiers in
+# an error's text are redacted too, which the raise site makes up for.
+SECRET_RUN = re.compile(r"[A-Za-z0-9._~+/=-]{20,}")
 
 
 def scrubbed_error_text(exc: BaseException, limit: int = SNAPSHOT_ERROR_TEXT_LIMIT) -> str:
-    """An exception's text for the log: one line, token-shaped runs replaced
-    by ``<token>``, at most ``limit`` characters.
+    """An exception's text for the log: one line, secrets replaced by
+    ``<redacted>``, at most ``limit`` characters.
 
-    Scrubbed before it is cut: cutting first could leave a token's head too
-    short to look like a token.
+    Scrubbed before it is cut: cutting first could leave a secret's head too
+    short to be recognised.
     """
     try:
         text = str(exc)
     except Exception:
         return "<unprintable>"
-    return TOKEN_SHAPE.sub("<token>", " ".join(text.split()))[:limit]
+    text = " ".join(text.split())
+    text = SECRET_VALUE.sub(lambda m: m.group(1) + REDACTED, text)
+    text = BEARER_VALUE.sub(lambda m: m.group(1) + REDACTED, text)
+    text = SECRET_RUN.sub(REDACTED, text)
+    return text[:limit]
 
 
-def _raise_site(exc: BaseException) -> str:
-    """" (at file.py:123 in func)" for the innermost frame, or ""."""
+def _frames(exc: BaseException) -> list[str]:
+    """Each traceback frame as "file.py:123 in func", outermost first.
+
+    Never the source lines ``traceback.format_tb`` adds: a failing frame's
+    own source could hold a secret, and the log does not need it.
+    """
+    out = []
     tb = exc.__traceback__
-    if tb is None:
-        return ""
-    while tb.tb_next is not None:
+    while tb is not None:
+        code = tb.tb_frame.f_code
+        out.append(f"{os.path.basename(code.co_filename)}:{tb.tb_lineno} in {code.co_name}")
         tb = tb.tb_next
-    code = tb.tb_frame.f_code
-    return f" (at {os.path.basename(code.co_filename)}:{tb.tb_lineno} in {code.co_name})"
+    return out
 
 
 class SnapshotLog:
@@ -598,8 +625,11 @@ class SnapshotLog:
 
     ``failed`` writes one WARNING per exception class per
     ``SNAPSHOT_FAILURE_WINDOW_S`` and counts the repeats it holds back; the
-    count is reported when the window rolls, on the next failure of that
-    class or the next good read (``succeeded``), whichever comes first.
+    count is reported when the window rolls, at the next failure (of any
+    class) or the next good read (``succeeded``), whichever comes first.
+    Every call drops the windows that have rolled, and at most
+    ``SNAPSHOT_FAILURE_CLASSES_MAX`` stay live (the oldest is dropped first,
+    its count reported), so the table cannot grow without bound.
     ``took`` writes a WARNING for a read slower than ``SLOW_SNAPSHOT_S``.
     ``clock`` is monotonic so a clock change cannot open or close a window;
     the worker also times its reads with it.
@@ -611,11 +641,13 @@ class SnapshotLog:
         clock=time.monotonic,
         window_s: float = SNAPSHOT_FAILURE_WINDOW_S,
         slow_s: float = SLOW_SNAPSHOT_S,
+        classes_max: int = SNAPSHOT_FAILURE_CLASSES_MAX,
     ) -> None:
         self._logger = logger
         self.clock = clock
         self._window_s = window_s
         self._slow_s = slow_s
+        self._classes_max = classes_max
         self._lock = threading.Lock()
         # exception class name -> [when its last line was written, repeats held back]
         self._windows: dict[str, list] = {}
@@ -632,38 +664,59 @@ class SnapshotLog:
         now = self.clock()
         with self._lock:
             window = self._windows.get(name)
-            if window is not None and now - window[0] < self._window_s:
+            live = window is not None and now - window[0] < self._window_s
+            if live:
                 window[1] += 1
-                return
-            held_back = window[1] if window is not None else 0
-            self._windows[name] = [now, 0]
+            else:
+                held_back = window[1] if window is not None else 0
+                self._windows.pop(name, None)
+            reports = self._drop_rolled(now)
+            if not live:
+                while len(self._windows) >= self._classes_max:
+                    oldest = min(self._windows, key=lambda n: self._windows[n][0])
+                    if self._windows[oldest][1]:
+                        reports.append((oldest, self._windows[oldest][1]))
+                    del self._windows[oldest]
+                self._windows[name] = [now, 0]
+        self._report(reports)
+        if live:
+            return
         repeats = f" [{held_back} more since the last line]" if held_back else ""
+        frames = _frames(exc)
+        site = f" (at {frames[-1]})" if frames else ""
         self._logger.warning(
             "menubar snapshot failed: %s: %s%s%s",
-            name, scrubbed_error_text(exc), _raise_site(exc), repeats,
+            name, scrubbed_error_text(exc), site, repeats,
         )
-        # The frames only, never the exception text: that is what may hold a token.
         self._logger.debug(
-            "menubar snapshot failure stack:\n%s",
-            "".join(traceback.format_tb(exc.__traceback__)),
+            "menubar snapshot failure frames, outermost first: %s", "; ".join(frames)
         )
 
     def succeeded(self) -> None:
         now = self.clock()
         with self._lock:
-            rolled = [
-                (name, window[1])
-                for name, window in self._windows.items()
-                if now - window[0] >= self._window_s
-            ]
-            for name, _held_back in rolled:
-                del self._windows[name]
-        for name, held_back in rolled:
+            reports = self._drop_rolled(now)
+        self._report(reports)
+
+    def _drop_rolled(self, now: float) -> list[tuple[str, int]]:
+        """Drop every rolled window (lock held); return the counts to report."""
+        rolled = [
+            name for name, window in self._windows.items()
+            if now - window[0] >= self._window_s
+        ]
+        reports = []
+        for name in rolled:
+            held_back = self._windows.pop(name)[1]
             if held_back:
-                self._logger.warning(
-                    "menubar snapshot failed %d more %s with %s in the %.0f min after its last line",
-                    held_back, "time" if held_back == 1 else "times", name, self._window_s / 60,
-                )
+                reports.append((name, held_back))
+        return reports
+
+    def _report(self, reports: list[tuple[str, int]]) -> None:
+        for name, held_back in reports:
+            self._logger.warning(
+                "menubar snapshot failed %d more %s with %s in the %.0f min after its last line",
+                held_back, "time" if held_back == 1 else "times", name, self._window_s / 60,
+            )
 
 
 def sentinel_note(sentinel: str) -> str:

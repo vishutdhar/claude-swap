@@ -1676,7 +1676,7 @@ def test_a_failed_read_reaches_the_log_once_without_its_token(app, caplog):
         app.refresh_async()
         _wait_idle(app)
     (line,) = _warnings(caplog)
-    assert "menubar snapshot failed: RuntimeError: usage fetch failed with <token>" in line
+    assert "menubar snapshot failed: RuntimeError: usage fetch failed with <redacted>" in line
     # Nothing at any level carries the token, tracebacks included.
     assert "Ab3_x" not in caplog.text
 

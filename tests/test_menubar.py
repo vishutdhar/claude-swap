@@ -1899,22 +1899,23 @@ def test_snapshot_failure_is_a_warning_with_its_class_and_no_token(caplog):
     warnings = [m for level, m in _lines(caplog, name) if level == logging.WARNING]
     assert len(warnings) == 1
     (line,) = warnings
-    assert "menubar snapshot failed: RuntimeError: refresh failed for <token> on slot 3" in line
+    assert "menubar snapshot failed: RuntimeError: refresh failed for <redacted> on slot 3" in line
     assert "test_menubar.py" in line  # where it was raised, for the diagnosis
     every_line = " ".join(m for _level, m in _lines(caplog, name))
     assert "Ab3_x-Yz9" not in every_line
 
 
 def test_snapshot_failure_text_is_scrubbed_before_it_is_cut(caplog):
-    # A token straddling the 200-character cut: cut first, its head would
-    # be too short to look like a token and would reach the log.
+    # A token straddling the 200-character cut: cut first, only its first
+    # ten characters would survive, too short to look like a token, and
+    # they would reach the log.
     log, name = _snapshot_log()
     caplog.set_level(logging.WARNING, logger=name)
-    log.failed(_raised(ValueError("x" * 150 + " " + _TOKEN)))
+    log.failed(_raised(ValueError("word " * 38 + _TOKEN)))  # the token starts at 190
     (line,) = [m for _level, m in _lines(caplog, name)]
-    assert "Ab3_x" not in line
+    assert "rt-Ab3" not in line
     text = line.split("ValueError: ", 1)[1].split(" (at ", 1)[0]
-    assert len(text) <= 200
+    assert text.endswith("<redacted>") and len(text) <= 200
 
 
 def test_snapshot_failure_text_is_one_line_and_at_most_200_characters(caplog):
@@ -2001,6 +2002,131 @@ def test_a_slow_read_logs_its_duration(caplog):
     assert [level for level, _m in lines] == [logging.WARNING, logging.WARNING]
     assert "menubar snapshot took 452s" in lines[0][1]
     assert "took 75s" in lines[1][1] and "Refresh now" in lines[1][1]
+
+
+# Secrets are redacted by meaning, not only by length: a short value after a
+# key that names a secret, a bearer value, and any 20+ run of token characters.
+
+@pytest.mark.parametrize(
+    "message, secret",
+    [
+        ("refresh failed: refreshToken=short-secret", "short-secret"),
+        ("bad grant accessToken: at-1234", "at-1234"),
+        ('response {"refresh_token": "rt-9876", "x": 1}', "rt-9876"),
+        ("payload {'api_key': 'k-42'}", "k-42"),
+        ('login failed password="my pass phrase"', "pass phrase"),
+        ("passwd: hunter2", "hunter2"),
+        ("x-api-key=ak-77 rejected", "ak-77"),
+        ("client_secret = cs-55", "cs-55"),
+        ("CREDENTIALS=cr-1 invalid", "cr-1"),
+        ("credential: cr-2", "cr-2"),
+        ("apikey=ap-3", "ap-3"),
+        ("Secret: se-4", "se-4"),
+        ("token=tk-5", "tk-5"),
+        ("key: ky-6", "ky-6"),
+        ("bearer: be-7", "be-7"),
+        ("headers Authorization: Bearer abc.def", "abc.def"),
+        ("sent bearer xyz-8 upstream", "xyz-8"),
+        ("Authorization=Basic dXNlcjpw", "dXNlcjpw"),
+        ("cut mid value password=\"unterminated", "unterminated"),
+        ("refresh failed for Q7w_e-R8t.Y9u_i-O0p.", "Q7w_e-R8t.Y9u_i-O0p."),
+    ],
+)
+def test_secret_shapes_are_redacted(message, secret):
+    text = menubar.scrubbed_error_text(RuntimeError(message))
+    assert secret not in text, text
+    assert "<redacted>" in text
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Failed to acquire lock - another instance may be running",
+        "keychain unavailable: locked or in use; try again",
+        "lock busy: try again in 5s",
+        "HTTP 429 Retry-After: 3600",
+        "monkey business at slot 3",
+        "basic check failed: retry later",
+    ],
+)
+def test_ordinary_error_text_is_left_alone(message):
+    assert menubar.scrubbed_error_text(RuntimeError(message)) == message
+
+
+def test_the_debug_stack_never_prints_source_lines(caplog):
+    # A secret written into a failing frame's own source line. Built at run
+    # time, so no constant in this file can stand in for it.
+    import linecache
+    import uuid
+
+    secret = "src-" + uuid.uuid4().hex
+    filename = f"<runtime-frame-{secret[-8:]}>"
+    source = f'def boom():\n    raise RuntimeError("boom")  # {secret}\n'
+    linecache.cache[filename] = (len(source), None, source.splitlines(True), filename)
+    namespace: dict = {}
+    exec(compile(source, filename, "exec"), namespace)
+    try:
+        namespace["boom"]()
+    except RuntimeError as exc:
+        caught = exc
+    log, name = _snapshot_log()
+    caplog.set_level(logging.DEBUG, logger=name)
+    try:
+        log.failed(caught)
+    finally:
+        linecache.cache.pop(filename, None)
+    stack = [m for level, m in _lines(caplog, name) if level == logging.DEBUG]
+    assert len(stack) == 1
+    assert f"{filename}:2 in boom" in stack[0]
+    assert secret not in caplog.text
+
+
+def test_expired_windows_are_dropped_on_every_failure():
+    # Many distinct exception classes, each failing once, 601 s apart, with
+    # no good read in between: nothing but the live window may stay.
+    clock = _Clock()
+    log, _name = _snapshot_log(clock)
+    for i in range(50):
+        log.failed(_raised(type(f"Failure{i}", (Exception,), {})("x")))
+        clock.now += 601
+    assert len(log._windows) <= 1
+
+
+def test_the_window_table_is_capped(caplog):
+    clock = _Clock()
+    log, name = _snapshot_log(clock)
+    caplog.set_level(logging.WARNING, logger=name)
+    for i in range(100):  # all inside one window
+        log.failed(_raised(type(f"Failure{i}", (Exception,), {})("x")))
+    assert len(log._windows) <= 32
+    assert len(_lines(caplog, name)) == 100  # each class still logs its first line
+
+
+def test_a_rolled_window_reports_its_count_on_another_class_failure(caplog):
+    clock = _Clock()
+    log, name = _snapshot_log(clock)
+    caplog.set_level(logging.WARNING, logger=name)
+    log.failed(_raised(RuntimeError("busy")))
+    log.failed(_raised(RuntimeError("busy")))  # held back
+    clock.now += 601
+    log.failed(_raised(TimeoutError("slow")))
+    lines = [m for _level, m in _lines(caplog, name)]
+    assert len(lines) == 3
+    assert any("1 more time with RuntimeError" in m for m in lines)
+
+
+def test_an_evicted_window_reports_what_it_held_back(caplog):
+    clock = _Clock()
+    log, name = _snapshot_log(clock)
+    caplog.set_level(logging.WARNING, logger=name)
+    log.failed(_raised(RuntimeError("busy")))
+    log.failed(_raised(RuntimeError("busy")))  # held back
+    for i in range(32):  # the cap: the oldest window, RuntimeError's, goes
+        clock.now += 1
+        log.failed(_raised(type(f"Failure{i}", (Exception,), {})("x")))
+    assert any(
+        "1 more time with RuntimeError" in m for _level, m in _lines(caplog, name)
+    )
 
 
 def test_an_unprintable_failure_still_logs(caplog):
