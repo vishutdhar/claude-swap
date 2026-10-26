@@ -222,6 +222,60 @@ def test_dead_login_accessibility_label_is_unchanged():
     assert mp.accessibility_label(panel) == f"Account 2, a@x.com. {note}."
 
 
+def test_a_renewed_slot_does_not_keep_painting_its_dead_login(tmp_path):
+    """The menu's own read path, end to end: SnapshotSource, then the adapter,
+    then the panel. Slot 3 showed "re-login needed" over a reading from 14h
+    21m earlier; its credential was replaced, and the next read reported no
+    verdict and had no reading yet. The row must stop being the urgent dead
+    login and must not keep the old reading's age; it reads as an account
+    with no reading yet until the next pass measures it."""
+    from claude_swap.models import AccountSnapshot, AccountsSnapshot
+    from claude_swap.snapshot_source import SnapshotSource
+
+    t0 = _NOW - (14 * 3600 + 21 * 60)
+
+    def account(entry):
+        return AccountSnapshot(
+            number="3", email="c@x.com", org_name="", org_uuid="",
+            is_active=False, kind="oauth", switchable=True, usage=entry,
+        )
+
+    class Switcher:
+        reads = [
+            UsageEntry(
+                sentinel=json_output.USAGE_RELOGIN_REQUIRED,
+                last_good={"seven_day": {"pct": 100.0, "resets_at": _iso(86400)}},
+                fetched_at=t0,
+                age_s=_NOW - t0,
+            ),
+            UsageEntry(),
+        ]
+
+        def accounts_snapshot(self, fetch=None, **_kw):
+            return AccountsSnapshot(
+                active_number=None,
+                accounts=(account(self.reads.pop(0)),),
+                taken_at=_NOW,
+            )
+
+    source = SnapshotSource(Switcher())
+    marker = tmp_path / "no-marker"  # never the daemon's real hold marker
+
+    def panel():
+        snap = menubar._adapt_snapshot(source.take(), marker_path=marker)
+        (entry,) = snap["accounts"]
+        return mp.build_account_panel(entry, _NOW)
+
+    before = panel()
+    assert [r.urgent for r in before.rows] == [True]  # premise: the dead login
+    assert before.age_text == "14h 21m ago"
+
+    after = panel()
+    assert [(r.note, r.urgent) for r in after.rows] == [("usage unavailable", False)]
+    assert after.age_text is None
+    assert "re-login" not in after.text_label
+
+
 def test_none_and_empty_usage_read_usage_unavailable():
     expected = [mp.WindowRow("", 0.0, "", "", "unknown", None, "usage unavailable")]
     assert mp.window_rows(None, _NOW, None) == expected

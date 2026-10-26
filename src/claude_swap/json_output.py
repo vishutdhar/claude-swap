@@ -40,6 +40,12 @@ USAGE_RELOGIN_REQUIRED = "re-login needed"
 # (stash the foreign credential, restore the slot's backup), so autoswitch
 # should treat the active as unknown-headroom and fail over.
 USAGE_FOREIGN_CREDENTIAL = "foreign credential"
+# A dead login: only the user can fix it (a re-login, ``cswap add``/import),
+# so it ends only when the slot's stored credential changes. The menu bar
+# marks these rows urgent, and a snapshot never carries one forward from an
+# earlier read (``snapshot_source``). Token expired retries on its own and a
+# foreign credential is repaired by a switch, so neither is here.
+DEAD_LOGIN_SENTINELS = frozenset({USAGE_RELOGIN_REQUIRED, USAGE_NO_CREDENTIALS})
 
 
 def _window_to_json(entry: dict) -> dict:

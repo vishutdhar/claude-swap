@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from claude_swap import oauth, pace
-from claude_swap.json_output import USAGE_NO_CREDENTIALS, USAGE_RELOGIN_REQUIRED
+from claude_swap.json_output import DEAD_LOGIN_SENTINELS
 from claude_swap.menubar import (
     GuardHold,
     _countdown_until,
@@ -62,12 +62,11 @@ HAIRLINE = 0.5  # the rule under each inactive account
 UNAVAILABLE = "usage unavailable"  # the text row's wording
 STATE_SEP = " · "  # joins the state words ("active · held · 28m")
 
-# A dead login: only the user can fix it (log in again, or add the account),
-# so its row is urgent. The panel is handed the sentinel's display text, not
-# the sentinel, so these are that text, made by the same helper the snapshot
-# uses. Token expired retries on its own and a foreign credential is repaired
-# by a switch; neither is here.
-DEAD_LOGIN_NOTES = frozenset(sentinel_note(s) for s in (USAGE_RELOGIN_REQUIRED, USAGE_NO_CREDENTIALS))
+# A dead login (``json_output.DEAD_LOGIN_SENTINELS``): only the user can fix
+# it, so its row is urgent. The panel is handed the sentinel's display text,
+# not the sentinel, so these are that text, made by the same helper the
+# snapshot uses.
+DEAD_LOGIN_NOTES = frozenset(sentinel_note(s) for s in DEAD_LOGIN_SENTINELS)
 
 STATES = ("ok", "warn", "crit", "over", "unknown")
 

@@ -1367,6 +1367,63 @@ class TestReserve:
         assert set(store.reserve(["2"], other, respect_plans=True)) == {"2"}
 
 
+class TestResetRowIsDueAtOnce:
+    """A row with no reading for its identity (what the store holds after a
+    slot's row is lost or replaced, and what the quarantine-lifting write of
+    a credential change then leaves) is due on the very next pass of every
+    read path: there is no cadence to wait out. The guards still apply."""
+
+    def _reset_row(self, store):
+        store.clear_dead_token(["1"], IDENT)  # the write a credential change makes
+        entry = store.entries(IDENT)["1"]
+        # premise: no reading, no plan, nothing holding it back
+        assert (entry.fetched_at, entry.last_good, entry.next_poll_at) == (None, None, None)
+        assert (entry.backoff_until, entry.auth_dead_strikes) == (None, 0)
+
+    def test_the_display_pass_wins_it_at_once(self, store):
+        # The exact call the menu bar's display refresh and `cswap list` make.
+        self._reset_row(store)
+        assert set(
+            store.reserve(["1"], IDENT, respect_plans=True, repair_overslept=True)
+        ) == {"1"}
+
+    @pytest.mark.parametrize("repair_overslept", [True, False])
+    def test_the_scheduler_wins_it_at_once(self, store, repair_overslept):
+        # The auto engine's baseline nomination (scheduled) and escalation.
+        self._reset_row(store)
+        assert set(
+            store.reserve(
+                ["1"], IDENT, respect_plans=False, repair_overslept=repair_overslept
+            )
+        ) == {"1"}
+
+    def test_due_candidate_nominates_it_first(self, store, clock):
+        # Slot 2 is measured and poll-due; the slot with no reading still
+        # goes first, so the engine's one alternate poll spends itself here.
+        store.record({"2": FetchRecord(usage=USAGE)}, IDENT)
+        clock.advance(poll_policy.EXHAUSTED_INTERVAL_S * 2)
+        self._reset_row(store)
+        assert due_candidate(["2", "1"], store.entries(IDENT), clock.now) == "1"
+
+    def test_it_still_waits_out_a_failure_backoff(self, store, clock):
+        self._reset_row(store)
+        claims = store.reserve(["1"], IDENT, respect_plans=True, repair_overslept=True)
+        store.record({"1": FetchRecord(error="timeout")}, IDENT, claims)
+        assert store.reserve(["1"], IDENT, respect_plans=True, repair_overslept=True) == {}
+        assert due_candidate(["1"], store.entries(IDENT), clock.now) is None
+        clock.advance(BACKOFF_BASE_S + 1)
+        assert set(
+            store.reserve(["1"], IDENT, respect_plans=True, repair_overslept=True)
+        ) == {"1"}
+
+    def test_it_is_still_quarantined_by_a_dead_grant(self, store, clock):
+        self._reset_row(store)
+        claims = store.reserve(["1"], IDENT, respect_plans=True, repair_overslept=True)
+        store.record({"1": FetchRecord(error="invalid_grant")}, IDENT, claims)
+        clock.advance(TRUST_MAX_AGE_S)  # any backoff long gone
+        assert store.reserve(["1"], IDENT, respect_plans=True, repair_overslept=True) == {}
+
+
 class TestReserveFresh:
     """``cswap list --fresh``: re-measure now, past the serve TTL and the poll
     plan, but never past the guards that protect the account or the request

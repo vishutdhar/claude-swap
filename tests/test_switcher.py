@@ -4591,6 +4591,63 @@ class TestDeadTokenQuarantine:
         run.assert_called_once()  # it was fetch-eligible, not pre-quarantined
         assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
 
+    @pytest.mark.parametrize("row", ["healed", "no reading"])
+    def test_renewed_slot_is_measured_on_the_next_display_pass(self, temp_home, row):
+        """A dead login whose credential was replaced is measured by the very
+        next on-demand pass (the menu bar's display refresh, `cswap list`),
+        not after some later cadence. "healed": the struck row keeps its old
+        reading and its plan, both from hours ago, and the pass lifts the
+        quarantine itself. "no reading": the slot's row holds no reading."""
+        from claude_swap import oauth
+        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+        from claude_swap.usage_store import FetchRecord
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        store = switcher._usage_store
+        ident = {"2": ("test@example.com", "")}
+        old = self._dead_creds()
+        renewed = json.dumps({"claudeAiOauth": {
+            "accessToken": "at2", "refreshToken": "rt2",
+            "expiresAt": (time.time() + 86400) * 1000,
+        }})
+        if row == "healed":
+            ago = 14 * 3600 + 21 * 60
+            store.record(
+                {"2": FetchRecord(usage={"seven_day": {"pct": 100.0}})},
+                ident,
+                plans={"2": (time.time() + 600.0, 600.0)},
+            )
+            table = json.loads(store.path.read_text())
+            table["accounts"]["2"]["fetchedAt"] -= ago
+            table["accounts"]["2"]["nextPollAt"] -= ago
+            store.path.write_text(json.dumps(table))
+            store.record(
+                {"2": FetchRecord(
+                    error="invalid_grant",
+                    struck_fp=oauth.credential_fingerprint(old),
+                )},
+                ident,
+            )
+            dead = switcher._collect_usage_entries(
+                [(2, "test@example.com", "Org", "", False, old, "")], fetch=set()
+            )
+            assert dead["2"].sentinel == USAGE_RELOGIN_REQUIRED  # premise
+
+        fresh_usage = {"seven_day": {"pct": 12.0}}
+        with patch.object(
+            switcher, "_run_usage_fetches",
+            return_value={"2": FetchRecord(usage=fresh_usage)},
+        ) as run:
+            entries = switcher._collect_usage_entries(
+                [(2, "test@example.com", "Org", "", False, renewed, "")]
+            )
+
+        run.assert_called_once()
+        assert [info[0] for info in run.call_args.args[0]] == [2]
+        assert entries["2"].sentinel is None
+        assert entries["2"].last_good == fresh_usage
+
     def test_the_collector_hands_the_trust_bound_its_configured_models(
         self, temp_home
     ):

@@ -20,7 +20,12 @@ from pathlib import Path
 import pytest
 
 from claude_swap.autoswitch import NoSwitchEvent, SwitchEvent
-from claude_swap.json_output import USAGE_API_KEY, USAGE_TOKEN_EXPIRED
+from claude_swap.json_output import (
+    USAGE_API_KEY,
+    USAGE_NO_CREDENTIALS,
+    USAGE_RELOGIN_REQUIRED,
+    USAGE_TOKEN_EXPIRED,
+)
 from claude_swap.models import AccountSnapshot, AccountsSnapshot
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui import data as tui_data
@@ -505,6 +510,90 @@ class TestSnapshotSource:
         assert usage.sentinel is None
         assert usage.fetched_at == 200.0
         assert usage.last_good["five_hour"]["pct"] == 80.0
+
+    # A dead login (re-login needed, no credentials) ends only when the
+    # slot's credential changes. A read that no longer reported it but had
+    # no reading of its own used to bring the old verdict back through the
+    # carry-forward, with its old age ("14h 21m ago"), and kept it there
+    # until a fetch of that slot landed.
+
+    @pytest.mark.parametrize("dead", [USAGE_RELOGIN_REQUIRED, USAGE_NO_CREDENTIALS])
+    def test_dead_verdict_is_not_carried_over_a_read_with_no_reading(
+        self, tmp_path, dead
+    ):
+        t0 = time.time() - (14 * 3600 + 21 * 60)
+        verdict = make_account(
+            3, entry=make_usage_at(t0, pct=100.0, sentinel=dead)
+        )
+        no_reading_yet = make_account(3, entry=UsageEntry())
+        fake, source = self._source(tmp_path, [verdict])
+
+        assert source.take().accounts[0].usage.sentinel == dead  # premise
+        fake._accounts = [no_reading_yet]
+        usage = source.take().accounts[0].usage
+
+        assert usage.sentinel is None
+        # The model's own "no reading yet": nothing measured, no age, so
+        # the menu shows "usage unavailable" rather than T0's numbers.
+        assert usage.fetched_at is None
+        assert usage.age_s is None
+        assert usage.last_good is None
+
+    @pytest.mark.parametrize("dead", [USAGE_RELOGIN_REQUIRED, USAGE_NO_CREDENTIALS])
+    def test_dead_verdict_drops_but_newer_numbers_stay_over_an_older_reading(
+        self, tmp_path, dead
+    ):
+        verdict = make_account(
+            1, entry=make_usage_at(200.0, pct=80.0, sentinel=dead)
+        )
+        older = make_account(1, entry=make_usage_at(100.0, pct=10.0))
+        fake, source = self._source(tmp_path, [verdict])
+
+        source.take()
+        fake._accounts = [older]
+        usage = source.take().accounts[0].usage
+
+        assert usage.sentinel is None
+        # The carry-forward's purpose is kept: an older reading never
+        # replaces the newer numbers already on screen.
+        assert usage.fetched_at == 200.0
+        assert usage.last_good["five_hour"]["pct"] == 80.0
+
+    def test_dead_verdict_the_current_read_still_reports_keeps_its_reading(
+        self, tmp_path
+    ):
+        verdict = make_account(
+            1, entry=make_usage_at(100.0, sentinel=USAGE_RELOGIN_REQUIRED)
+        )
+        same_verdict_no_reading = make_account(
+            1, entry=UsageEntry(sentinel=USAGE_RELOGIN_REQUIRED)
+        )
+        fake, source = self._source(tmp_path, [verdict])
+
+        source.take()
+        fake._accounts = [same_verdict_no_reading]
+        usage = source.take().accounts[0].usage
+
+        assert usage.sentinel == USAGE_RELOGIN_REQUIRED
+        assert usage.fetched_at == 100.0
+
+    def test_expired_sentinel_still_rides_a_read_with_no_reading(self, tmp_path):
+        # Token expired is not a dead login: it retries on its own and is
+        # held until a newer reading lands, as before.
+        expired = make_account(
+            1,
+            active=True,
+            entry=make_usage_at(100.0, sentinel=USAGE_TOKEN_EXPIRED),
+        )
+        no_reading_yet = make_account(1, active=True, entry=UsageEntry())
+        fake, source = self._source(tmp_path, [expired])
+
+        source.take()
+        fake._accounts = [no_reading_yet]
+        usage = source.take(store_only=True).accounts[0].usage
+
+        assert usage.sentinel == USAGE_TOKEN_EXPIRED
+        assert usage.fetched_at == 100.0
 
 
 class TestUsageRows:
