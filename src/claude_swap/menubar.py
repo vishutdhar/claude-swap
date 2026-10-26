@@ -560,7 +560,10 @@ def purge_menu_callbacks(registry: dict, nsmenu) -> None:
 # A failure is logged as its class, where it was raised and, when it has
 # one, an integer status. Nothing from the exception's message reaches any
 # level: the usage and credential paths can put a secret in it, and no
-# pattern can be trusted to find every secret's shape.
+# pattern can be trusted to find every secret's shape. For the same reason
+# a class is named only when a trusted module really holds it under that
+# name (a class built at run time can be named anything), and a status is
+# printed only when it is exactly an int.
 
 SNAPSHOT_FAILURE_WINDOW_S = 600.0  # one failure line per window, any class
 SNAPSHOT_FAILURE_NAMES_MAX = 8  # class names a rolled window's line lists
@@ -568,6 +571,14 @@ SLOW_SNAPSHOT_S = 60.0  # a read longer than this logs its duration
 # Integer attributes that say what failed without saying anything secret
 # (HTTPError.status/.code, OSError.errno, CalledProcessError.returncode).
 STATUS_ATTRIBUTES = ("status", "status_code", "code", "errno", "returncode")
+# Modules whose exception classes are named in the log: the builtins (the
+# OSError family included), this package, and the libraries its reads use.
+TRUSTED_EXCEPTION_MODULES = (
+    "builtins", "claude_swap", "requests", "urllib", "urllib3", "http", "ssl",
+    "socket", "subprocess", "json", "keyring",
+)
+UNNAMED_FAILURE = "Exception"  # the name for any class not trusted to name itself
+FALLBACK_FAILURE_LINE = f"menubar snapshot failed: {UNNAMED_FAILURE}"
 _PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -597,40 +608,67 @@ def _raise_site(frames: list[tuple[str, bool]]) -> str | None:
 
 
 def _status(exc: BaseException) -> str | None:
-    """The first integer status-style attribute, as "status 429", or None."""
+    """The first status-style attribute that is exactly an int, as "status
+    429", or None. ``type()`` and ``int.__repr__`` run no code of the value's:
+    an int subclass could print anything, and ``isinstance`` would consult a
+    ``__class__`` the value defines."""
     for attr in STATUS_ATTRIBUTES:
         try:
             value = getattr(exc, attr, None)
         except Exception:
             continue
-        if isinstance(value, int) and not isinstance(value, bool):
-            return f"{attr} {value}"
+        if type(value) is int:
+            return f"{attr} {int.__repr__(value)}"
     return None
 
 
-def failure_line(exc: BaseException, frames: list[tuple[str, bool]] | None = None) -> str:
-    """The WARNING text for a failed read: class, integer status, raise site."""
+def _class_name(cls: type) -> str:
+    """The class's name when a trusted module holds this very class under
+    it, else ``UNNAMED_FAILURE``. A class's own ``__module__`` is not proof:
+    ``type(name, bases, {"__module__": "builtins"})`` claims it freely."""
+    module, qualname = cls.__module__, cls.__qualname__
+    if type(module) is not str or type(qualname) is not str:
+        return UNNAMED_FAILURE
+    if not any(module == m or module.startswith(m + ".") for m in TRUSTED_EXCEPTION_MODULES):
+        return UNNAMED_FAILURE
+    held = sys.modules.get(module)
+    for part in qualname.split("."):
+        held = getattr(held, part, None)
+    return qualname if held is cls else UNNAMED_FAILURE
+
+
+def failure_record(exc: BaseException) -> tuple[str, str, str]:
+    """``(class name, WARNING line, DEBUG frames)`` for a failed read: the
+    class (``_class_name``), its integer status and its raise site. May
+    raise on a hostile exception; ``SnapshotLog.failed`` falls back then."""
+    name = _class_name(type(exc))
     status = _status(exc)
-    site = _raise_site(_frames(exc) if frames is None else frames)
-    return (
-        f"menubar snapshot failed: {type(exc).__name__}"
+    frames = _frames(exc)
+    site = _raise_site(frames)
+    line = (
+        f"menubar snapshot failed: {name}"
         + (f" ({status})" if status else "")
         + (f" at {site}" if site else "")
     )
+    return name, line, "; ".join(frame for frame, _inside in frames)
 
 
 class SnapshotLog:
     """What the menu bar's snapshot worker writes to the log.
 
     One window of ``SNAPSHOT_FAILURE_WINDOW_S`` for every class: the first
-    failure writes its line (``failure_line``) and opens the window; later
+    failure writes its line (``failure_record``) and opens the window; later
     failures inside it are only counted, with up to
     ``SNAPSHOT_FAILURE_NAMES_MAX`` of their class names. When the window has
-    rolled, the next event (a failure, or a good read via ``succeeded``)
-    writes one line with that count and those names, and a failure then
-    opens the next window. ``took`` writes the duration of a read slower
-    than ``SLOW_SNAPSHOT_S``. ``clock`` is monotonic so a clock change
-    cannot open or close a window; the worker also times its reads with it.
+    rolled, the next failure writes its own line with that count and those
+    names appended and opens the next window; a good read (``succeeded``)
+    writes them as a line of its own. The record is built before any window
+    is touched, and a record that cannot be built becomes
+    ``FALLBACK_FAILURE_LINE``: a failure always gets its line, and a broken
+    one can never leave a window open that silences the ones after it.
+    ``took`` writes the duration of a read slower than ``SLOW_SNAPSHOT_S``.
+    ``clock`` is monotonic so a clock change cannot open or close a window;
+    the worker also times its reads with it.
     """
 
     def __init__(
@@ -659,7 +697,10 @@ class SnapshotLog:
             )
 
     def failed(self, exc: BaseException) -> None:
-        name = type(exc).__name__
+        try:
+            name, line, frames = failure_record(exc)
+        except Exception:
+            name, line, frames = UNNAMED_FAILURE, FALLBACK_FAILURE_LINE, None
         now = self.clock()
         with self._lock:
             rolled = self._roll(now)
@@ -670,30 +711,28 @@ class SnapshotLog:
                         self._held_names.add(name)
                     else:
                         self._held_unnamed += 1
-                opened = False
-            else:
-                self._window_start = now
-                opened = True
+                return
+            self._window_start = now
         if rolled:
-            self._logger.warning(rolled)
-        if not opened:
-            return
-        frames = _frames(exc)
-        self._logger.warning(failure_line(exc, frames))
-        self._logger.debug(
-            "menubar snapshot failure frames, outermost first: %s",
-            "; ".join(site for site, _inside in frames),
-        )
+            held_back, listed = rolled
+            line += f"; {held_back} more in the previous {self._window_s / 60:.0f} min: {listed}"
+        self._logger.warning(line)
+        if frames is not None:
+            self._logger.debug("menubar snapshot failure frames, outermost first: %s", frames)
 
     def succeeded(self) -> None:
         with self._lock:
             rolled = self._roll(self.clock())
         if rolled:
-            self._logger.warning(rolled)
+            held_back, listed = rolled
+            self._logger.warning(
+                "menubar snapshot failed %d more %s in the %.0f min after the last line: %s",
+                held_back, "time" if held_back == 1 else "times", self._window_s / 60, listed,
+            )
 
-    def _roll(self, now: float) -> str | None:
-        """Close a window that has rolled (lock held): the line to write for
-        what it held back, if anything."""
+    def _roll(self, now: float) -> tuple[int, str] | None:
+        """Close a window that has rolled (lock held): what it held back, as
+        ``(count, "A, B (+K others)")``, if anything."""
         if self._window_start is None or now - self._window_start < self._window_s:
             return None
         held_back, names, unnamed = self._held_back, sorted(self._held_names), self._held_unnamed
@@ -703,14 +742,7 @@ class SnapshotLog:
         self._held_unnamed = 0
         if not held_back:
             return None
-        listed = ", ".join(names) + (
-            f" (+{unnamed} failures of other classes)" if unnamed else ""
-        )
-        return (
-            f"menubar snapshot failed {held_back} more "
-            f"{'time' if held_back == 1 else 'times'} in the "
-            f"{self._window_s / 60:.0f} min after the last line: {listed}"
-        )
+        return held_back, ", ".join(names) + (f" (+{unnamed} others)" if unnamed else "")
 
 
 def sentinel_note(sentinel: str) -> str:

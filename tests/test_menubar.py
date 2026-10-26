@@ -2019,7 +2019,8 @@ def test_a_hostile_or_unraised_exception_never_breaks_the_worker(caplog):
     log2, name2 = _snapshot_log(clock)
     log2.failed(ValueError("never raised, so no traceback"))
     lines = _lines(caplog, name)
-    assert lines and lines[0].startswith("menubar snapshot failed: Hostile at ")
+    # A class defined outside the trusted modules is named "Exception".
+    assert lines and lines[0].startswith("menubar snapshot failed: Exception at ")
     assert "menubar snapshot failed: ValueError" in _lines(caplog, name2)
 
 
@@ -2066,11 +2067,9 @@ def test_a_failure_after_the_window_reports_it_and_opens_the_next(caplog):
     clock.now += 600
     log.failed(_raised(TimeoutError("b")))
     lines = _lines(caplog, name)
-    assert len(lines) == 3
-    assert lines[1] == (
-        "menubar snapshot failed 1 more time in the 10 min after the last line: RuntimeError"
-    )
-    assert lines[2].startswith("menubar snapshot failed: TimeoutError at ")
+    assert len(lines) == 2  # the rolled count rides on the new failure's own line
+    assert lines[1].startswith("menubar snapshot failed: TimeoutError at ")
+    assert lines[1].endswith("; 1 more in the previous 10 min: RuntimeError")
 
 
 def test_each_window_counts_from_zero(caplog):
@@ -2093,8 +2092,13 @@ def test_the_rolled_line_names_at_most_eight_classes(caplog):
     log, name = _snapshot_log(clock)
     caplog.set_level(logging.WARNING, logger=name)
     log.failed(_raised(RuntimeError("first")))
-    for i in range(20):  # twenty distinct classes, each failing twice
-        cls = type(f"Failure{i:02d}", (Exception,), {})
+    classes = [  # twenty distinct trusted classes, each failing twice
+        ValueError, TypeError, KeyError, IndexError, LookupError, ArithmeticError,
+        ZeroDivisionError, OverflowError, AttributeError, NameError, ImportError,
+        ModuleNotFoundError, EOFError, NotImplementedError, RecursionError,
+        UnicodeError, BufferError, AssertionError, PermissionError, FileNotFoundError,
+    ]
+    for cls in classes:
         log.failed(_raised(cls("x")))
         log.failed(_raised(cls("x")))
     assert len(log._held_names) <= 8
@@ -2102,11 +2106,114 @@ def test_the_rolled_line_names_at_most_eight_classes(caplog):
     log.succeeded()
     summary = _lines(caplog, name)[1]
     assert summary.startswith("menubar snapshot failed 40 more times in the 10 min after the last line: ")
-    names = summary.split(": ", 1)[1]
-    assert names == (
-        "Failure00, Failure01, Failure02, Failure03, Failure04, Failure05, "
-        "Failure06, Failure07 (+24 failures of other classes)"
+    first_eight = sorted(cls.__name__ for cls in classes[:8])
+    assert summary.split(": ", 1)[1] == ", ".join(first_eight) + " (+24 others)"
+
+
+def test_a_class_built_at_run_time_never_names_itself(caplog):
+    # type(name, ...) can carry any text as a class name, a secret included,
+    # and it can claim any module. Only a class its trusted module really
+    # holds under that name is named; anything else is "Exception".
+    first, second, forged = _secret(), _secret(), _secret()
+    clock = _Clock()
+    log, name = _snapshot_log(clock)
+    caplog.set_level(logging.DEBUG, logger=name)
+    log.failed(_raised(type(first, (Exception,), {})("x")))
+    clock.now += 10
+    log.failed(_raised(type(second, (Exception,), {})("x")))
+    log.failed(_raised(type(forged, (Exception,), {"__module__": "builtins"})("x")))
+    clock.now += 600
+    log.succeeded()  # the rolled window's own line
+    log.failed(_raised(type(second, (Exception,), {})("x")))
+    clock.now += 10
+    log.failed(_raised(type(first, (Exception,), {})("x")))  # held in the new window
+    clock.now += 600
+    log.failed(_raised(RuntimeError("x")))  # its line carries the rolled count
+    lines = _lines(caplog, name)
+    assert len(lines) == 4
+    assert lines[0].startswith("menubar snapshot failed: Exception at ")
+    assert lines[1] == (
+        "menubar snapshot failed 2 more times in the 10 min after the last line: Exception"
     )
+    assert lines[2].startswith("menubar snapshot failed: Exception at ")
+    assert lines[3].startswith("menubar snapshot failed: RuntimeError at ")
+    assert lines[3].endswith("; 1 more in the previous 10 min: Exception")
+    for secret in (first, second, forged):
+        assert secret not in caplog.text
+        assert secret[-12:] not in caplog.text
+
+
+def test_a_status_from_an_int_subclass_is_left_out(caplog):
+    class Sneaky(int):
+        def __format__(self, spec):
+            return "mArKeR"
+
+        def __str__(self):
+            return "mArKeR"
+
+        __repr__ = __str__
+
+    exc = RuntimeError("x")
+    exc.status = Sneaky(429)
+    log, name = _snapshot_log()
+    caplog.set_level(logging.DEBUG, logger=name)
+    log.failed(_raised(exc))
+    (line,) = _lines(caplog, name)
+    assert line.startswith("menubar snapshot failed: RuntimeError at ")
+    assert "mArKeR" not in caplog.text
+
+
+def test_a_status_whose_class_raises_cannot_break_the_record(caplog):
+    class Hostile:
+        @property
+        def __class__(self):
+            raise RuntimeError("no class")
+
+    exc = RuntimeError("x")
+    exc.status = Hostile()
+    log, name = _snapshot_log()
+    caplog.set_level(logging.WARNING, logger=name)
+    log.failed(_raised(exc))  # must not raise
+    (line,) = _lines(caplog, name)
+    assert line.startswith("menubar snapshot failed: RuntimeError at ")
+
+
+def test_a_class_that_cannot_say_its_module_falls_back(caplog):
+    class Meta(type):
+        @property
+        def __module__(cls):
+            raise RuntimeError("no module")
+
+    class Shifty(Exception, metaclass=Meta):
+        pass
+
+    log, name = _snapshot_log()
+    caplog.set_level(logging.WARNING, logger=name)
+    log.failed(_raised(Shifty("x")))  # must not raise
+    assert _lines(caplog, name) == ["menubar snapshot failed: Exception"]
+
+
+def test_a_failure_inside_the_helper_still_writes_its_line_first(caplog, monkeypatch):
+    # Whatever breaks while the record is built, the failure still gets a
+    # line, and only then is the window opened: a broken record can never
+    # leave a window open that silences the failures after it.
+    def broken(_exc):
+        raise RuntimeError("helper broke")
+
+    monkeypatch.setattr(menubar, "_frames", broken)
+    clock = _Clock()
+    log, name = _snapshot_log(clock)
+    caplog.set_level(logging.DEBUG, logger=name)
+    log.failed(_raised(RuntimeError("x")))  # must not raise
+    assert _lines(caplog, name) == ["menubar snapshot failed: Exception"]
+    clock.now += 10
+    log.failed(_raised(RuntimeError("x")))  # inside the window that line opened
+    clock.now += 600
+    log.failed(_raised(RuntimeError("x")))
+    assert _lines(caplog, name) == [
+        "menubar snapshot failed: Exception",
+        "menubar snapshot failed: Exception; 1 more in the previous 10 min: Exception",
+    ]
 
 
 def test_a_slow_read_logs_its_duration(caplog):
