@@ -27,6 +27,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
@@ -548,6 +549,121 @@ def purge_menu_callbacks(registry: dict, nsmenu) -> None:
         sub = item.submenu()
         if sub is not None:
             purge_menu_callbacks(registry, sub)
+
+
+# ---- snapshot worker log -------------------------------------------------------
+#
+# The snapshot worker keeps the last good snapshot when a read fails, so a
+# failing or stalled read freezes the menu while its ages keep ticking on
+# every draw. These lines are the only trace of that, so they are WARNINGs;
+# they are rate-limited so a read failing every minute cannot flood the log,
+# and they never carry a token: exception text from the usage and credential
+# paths can hold one.
+
+SNAPSHOT_FAILURE_WINDOW_S = 600.0  # one line per exception class per window
+SLOW_SNAPSHOT_S = 60.0  # a read longer than this logs its duration
+SNAPSHOT_ERROR_TEXT_LIMIT = 200  # characters of exception text kept
+# Token-shaped text: 80 or more token characters in a row. OAuth access and
+# refresh tokens are far longer than that; ordinary error text has no such run.
+TOKEN_SHAPE = re.compile(r"[A-Za-z0-9._~+/=-]{80,}")
+
+
+def scrubbed_error_text(exc: BaseException, limit: int = SNAPSHOT_ERROR_TEXT_LIMIT) -> str:
+    """An exception's text for the log: one line, token-shaped runs replaced
+    by ``<token>``, at most ``limit`` characters.
+
+    Scrubbed before it is cut: cutting first could leave a token's head too
+    short to look like a token.
+    """
+    try:
+        text = str(exc)
+    except Exception:
+        return "<unprintable>"
+    return TOKEN_SHAPE.sub("<token>", " ".join(text.split()))[:limit]
+
+
+def _raise_site(exc: BaseException) -> str:
+    """" (at file.py:123 in func)" for the innermost frame, or ""."""
+    tb = exc.__traceback__
+    if tb is None:
+        return ""
+    while tb.tb_next is not None:
+        tb = tb.tb_next
+    code = tb.tb_frame.f_code
+    return f" (at {os.path.basename(code.co_filename)}:{tb.tb_lineno} in {code.co_name})"
+
+
+class SnapshotLog:
+    """What the menu bar's snapshot worker writes to the log.
+
+    ``failed`` writes one WARNING per exception class per
+    ``SNAPSHOT_FAILURE_WINDOW_S`` and counts the repeats it holds back; the
+    count is reported when the window rolls, on the next failure of that
+    class or the next good read (``succeeded``), whichever comes first.
+    ``took`` writes a WARNING for a read slower than ``SLOW_SNAPSHOT_S``.
+    ``clock`` is monotonic so a clock change cannot open or close a window;
+    the worker also times its reads with it.
+    """
+
+    def __init__(
+        self,
+        logger: logging.Logger,
+        clock=time.monotonic,
+        window_s: float = SNAPSHOT_FAILURE_WINDOW_S,
+        slow_s: float = SLOW_SNAPSHOT_S,
+    ) -> None:
+        self._logger = logger
+        self.clock = clock
+        self._window_s = window_s
+        self._slow_s = slow_s
+        self._lock = threading.Lock()
+        # exception class name -> [when its last line was written, repeats held back]
+        self._windows: dict[str, list] = {}
+
+    def took(self, seconds: float, *, fresh: bool) -> None:
+        if seconds > self._slow_s:
+            self._logger.warning(
+                "menubar snapshot took %.0fs (over %.0fs; the menu kept the previous snapshot meanwhile)%s",
+                seconds, self._slow_s, ", a Refresh now read" if fresh else "",
+            )
+
+    def failed(self, exc: BaseException) -> None:
+        name = type(exc).__name__
+        now = self.clock()
+        with self._lock:
+            window = self._windows.get(name)
+            if window is not None and now - window[0] < self._window_s:
+                window[1] += 1
+                return
+            held_back = window[1] if window is not None else 0
+            self._windows[name] = [now, 0]
+        repeats = f" [{held_back} more since the last line]" if held_back else ""
+        self._logger.warning(
+            "menubar snapshot failed: %s: %s%s%s",
+            name, scrubbed_error_text(exc), _raise_site(exc), repeats,
+        )
+        # The frames only, never the exception text: that is what may hold a token.
+        self._logger.debug(
+            "menubar snapshot failure stack:\n%s",
+            "".join(traceback.format_tb(exc.__traceback__)),
+        )
+
+    def succeeded(self) -> None:
+        now = self.clock()
+        with self._lock:
+            rolled = [
+                (name, window[1])
+                for name, window in self._windows.items()
+                if now - window[0] >= self._window_s
+            ]
+            for name, _held_back in rolled:
+                del self._windows[name]
+        for name, held_back in rolled:
+            if held_back:
+                self._logger.warning(
+                    "menubar snapshot failed %d more %s with %s in the %.0f min after its last line",
+                    held_back, "time" if held_back == 1 else "times", name, self._window_s / 60,
+                )
 
 
 def sentinel_note(sentinel: str) -> str:
@@ -1095,6 +1211,7 @@ def create_app(switcher):
             # of a full pass per tick — which kept every token at its per-account
             # rate-limit edge. Reused across refreshes to hold its pacing state.
             self._snapshot_source = SnapshotSource(switcher)
+            self._snapshot_log = SnapshotLog(switcher._logger)
             self.snapshot = dict(EMPTY_SNAPSHOT)
             self._dirty = False
             self._snapshot_at = 0.0
@@ -1171,17 +1288,23 @@ def create_app(switcher):
             # runs it already paces all fetching, so the display reads store-only;
             # Refresh now (``fresh``) re-measures all the same, as
             # ``cswap list --fresh`` may while ``cswap auto`` runs.
+            log = self._snapshot_log
             try:
+                started = log.clock()
                 try:
                     raw = self._snapshot_source.take(
                         full=full,
                         store_only=self._engine is not None and not fresh,
                         fresh=fresh,
                     )
-                except Exception:
-                    # Keep the last good snapshot rather than blanking the menu.
-                    self.switcher._logger.debug("menubar snapshot failed", exc_info=True)
+                except Exception as exc:
+                    # Keep the last good snapshot rather than blanking the menu,
+                    # and say so in the log (rate-limited, no tokens).
+                    log.took(log.clock() - started, fresh=fresh)
+                    log.failed(exc)
                     return
+                log.took(log.clock() - started, fresh=fresh)
+                log.succeeded()
                 snap = _adapt_snapshot(raw)
                 self._log_usage(snap)
                 with self._snapshot_lock:  # one step: nothing lands between check and publish

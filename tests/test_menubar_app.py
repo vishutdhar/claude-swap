@@ -1636,3 +1636,83 @@ def test_an_owed_read_that_finishes_at_once_is_still_drawn(app, shown, on_screen
     _pump(lambda: False, timeout=0.3)  # let any late report land
     assert _pcts(app) == ["55%", "66%"]
     assert not app._press_pending
+
+
+# --- the snapshot worker's log lines ---------------------------------------------
+#
+# A failed or stalled read keeps the previous snapshot on screen; the log is
+# the only place that says so. WARNING, never a token, rate-limited.
+
+_TOKEN = "rt-" + "Ab3_x-Yz9." * 12  # 123 token characters, a refresh token's shape
+
+
+class _Clock:
+    def __init__(self, now=1000.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+
+def _warnings(caplog):
+    return [
+        r.getMessage() for r in caplog.records
+        if r.name == "claude-swap" and r.levelno == logging.WARNING
+    ]
+
+
+def test_a_failed_read_reaches_the_log_once_without_its_token(app, caplog):
+    caplog.set_level(logging.DEBUG, logger="claude-swap")
+    # A fresh log: the app's own startup read (which fails here, as tests
+    # never fetch) already opened a RuntimeError window.
+    app._snapshot_log = menubar.SnapshotLog(app.switcher._logger, clock=_Clock())
+
+    class _Failing:
+        def take(self, **_kw):
+            raise RuntimeError(f"usage fetch failed with {_TOKEN}")
+
+    app._snapshot_source = _Failing()
+    for _ in range(3):  # three reads a minute apart would be one line too
+        app.refresh_async()
+        _wait_idle(app)
+    (line,) = _warnings(caplog)
+    assert "menubar snapshot failed: RuntimeError: usage fetch failed with <token>" in line
+    # Nothing at any level carries the token, tracebacks included.
+    assert "Ab3_x" not in caplog.text
+
+
+def test_a_slow_read_logs_its_duration(app, caplog, monkeypatch):
+    caplog.set_level(logging.WARNING, logger="claude-swap")
+    monkeypatch.setattr(menubar, "_adapt_snapshot", lambda raw: raw)
+    clock = _Clock()
+    app._snapshot_log = menubar.SnapshotLog(app.switcher._logger, clock=clock)
+
+    class _Slow:
+        def take(self, **_kw):
+            clock.now += 452.0  # a read that waited on a lock for minutes
+            return _snap(_entry("1", "a@x.com", active=True))
+
+    app._snapshot_source = _Slow()
+    app.refresh_async()
+    _wait_idle(app)
+    (line,) = _warnings(caplog)
+    assert "menubar snapshot took 452s" in line
+
+
+def test_a_slow_failed_read_logs_both_its_duration_and_its_failure(app, caplog):
+    caplog.set_level(logging.WARNING, logger="claude-swap")
+    clock = _Clock()
+    app._snapshot_log = menubar.SnapshotLog(app.switcher._logger, clock=clock)
+
+    class _SlowFailing:
+        def take(self, **_kw):
+            clock.now += 75.0
+            raise TimeoutError("lock stayed busy")
+
+    app._snapshot_source = _SlowFailing()
+    app.refresh_async()
+    _wait_idle(app)
+    lines = _warnings(caplog)
+    assert len(lines) == 2
+    assert any("took 75s" in m for m in lines)
+    assert any("TimeoutError: lock stayed busy" in m for m in lines)

@@ -1857,3 +1857,159 @@ def test_adapt_snapshot_records_each_accounts_organization():
     b.org_uuid = ""
     snap = menubar._adapt_snapshot(_FakeSnap([a, b]))
     assert snap["orgs"] == {"1": "org-a", "2": ""}
+
+
+# --- snapshot worker logging --------------------------------------------------------
+#
+# The worker keeps the last good snapshot when a read fails, so a failing or
+# stalled read freezes the menu while its ages keep ticking. These lines must
+# reach the log (WARNING), never carry a token, and not flood it.
+
+_TOKEN = "rt-" + "Ab3_x-Yz9." * 12  # 123 token characters, a refresh token's shape
+
+
+class _Clock:
+    def __init__(self, now=1000.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+
+def _snapshot_log(clock=None):
+    logger = logging.getLogger("claude-swap.test-snapshot-log")
+    return menubar.SnapshotLog(logger, clock=clock or _Clock()), logger.name
+
+
+def _lines(caplog, name):
+    return [(r.levelno, r.getMessage()) for r in caplog.records if r.name == name]
+
+
+def _raised(exc):
+    try:
+        raise exc
+    except Exception as caught:  # a real traceback, as the worker sees it
+        return caught
+
+
+def test_snapshot_failure_is_a_warning_with_its_class_and_no_token(caplog):
+    log, name = _snapshot_log()
+    caplog.set_level(logging.DEBUG, logger=name)
+    log.failed(_raised(RuntimeError(f"refresh failed for {_TOKEN} on slot 3")))
+    warnings = [m for level, m in _lines(caplog, name) if level == logging.WARNING]
+    assert len(warnings) == 1
+    (line,) = warnings
+    assert "menubar snapshot failed: RuntimeError: refresh failed for <token> on slot 3" in line
+    assert "test_menubar.py" in line  # where it was raised, for the diagnosis
+    every_line = " ".join(m for _level, m in _lines(caplog, name))
+    assert "Ab3_x-Yz9" not in every_line
+
+
+def test_snapshot_failure_text_is_scrubbed_before_it_is_cut(caplog):
+    # A token straddling the 200-character cut: cut first, its head would
+    # be too short to look like a token and would reach the log.
+    log, name = _snapshot_log()
+    caplog.set_level(logging.WARNING, logger=name)
+    log.failed(_raised(ValueError("x" * 150 + " " + _TOKEN)))
+    (line,) = [m for _level, m in _lines(caplog, name)]
+    assert "Ab3_x" not in line
+    text = line.split("ValueError: ", 1)[1].split(" (at ", 1)[0]
+    assert len(text) <= 200
+
+
+def test_snapshot_failure_text_is_one_line_and_at_most_200_characters(caplog):
+    log, name = _snapshot_log()
+    caplog.set_level(logging.WARNING, logger=name)
+    log.failed(_raised(OSError("line one\nline two " + "y " * 300)))
+    (line,) = [m for _level, m in _lines(caplog, name)]
+    assert "\n" not in line
+    text = line.split("OSError: ", 1)[1].split(" (at ", 1)[0]
+    assert text.startswith("line one line two ") and len(text) <= 200
+
+
+def test_repeats_of_a_failure_are_suppressed_for_ten_minutes_per_class(caplog):
+    clock = _Clock()
+    log, name = _snapshot_log(clock)
+    caplog.set_level(logging.WARNING, logger=name)
+    log.failed(_raised(RuntimeError("first")))
+    clock.now += 60
+    log.failed(_raised(RuntimeError("second")))
+    clock.now += 470  # 9m 30s after the first line: still inside its window
+    log.failed(_raised(RuntimeError("third")))
+    log.failed(_raised(TimeoutError("another class")))  # its own window
+    lines = [m for _level, m in _lines(caplog, name)]
+    assert len(lines) == 2
+    assert "RuntimeError: first" in lines[0]
+    assert "TimeoutError: another class" in lines[1]
+
+
+def test_the_next_failure_after_the_window_carries_the_suppressed_count(caplog):
+    clock = _Clock()
+    log, name = _snapshot_log(clock)
+    caplog.set_level(logging.WARNING, logger=name)
+    for _ in range(4):  # one line, then three repeats inside the window
+        log.failed(_raised(RuntimeError("busy")))
+        clock.now += 60
+    clock.now += 600  # the window has rolled
+    log.failed(_raised(RuntimeError("busy again")))
+    lines = [m for _level, m in _lines(caplog, name)]
+    assert len(lines) == 2
+    assert "RuntimeError: busy again" in lines[1]
+    assert "3 more since the last line" in lines[1]
+    assert "more since" not in lines[0]
+
+
+def test_a_rolled_window_reports_its_count_on_the_next_good_read(caplog):
+    clock = _Clock()
+    log, name = _snapshot_log(clock)
+    caplog.set_level(logging.WARNING, logger=name)
+    log.failed(_raised(RuntimeError("busy")))
+    clock.now += 30
+    log.failed(_raised(RuntimeError("busy")))
+    log.failed(_raised(RuntimeError("busy")))
+    clock.now += 60
+    log.succeeded()  # the window has not rolled: nothing yet
+    assert len(_lines(caplog, name)) == 1
+    clock.now += 600
+    log.succeeded()
+    lines = [m for _level, m in _lines(caplog, name)]
+    assert len(lines) == 2
+    assert "2 more" in lines[1] and "RuntimeError" in lines[1]
+    log.succeeded()  # reported once
+    log.failed(_raised(RuntimeError("busy")))  # a new window logs at once
+    assert len(_lines(caplog, name)) == 3
+
+
+def test_a_rolled_window_with_no_repeats_reports_nothing(caplog):
+    clock = _Clock()
+    log, name = _snapshot_log(clock)
+    caplog.set_level(logging.WARNING, logger=name)
+    log.failed(_raised(RuntimeError("once")))
+    clock.now += 700
+    log.succeeded()
+    assert len(_lines(caplog, name)) == 1
+
+
+def test_a_slow_read_logs_its_duration(caplog):
+    log, name = _snapshot_log()
+    caplog.set_level(logging.WARNING, logger=name)
+    log.took(60.0, fresh=False)  # at the limit: not slow
+    assert _lines(caplog, name) == []
+    log.took(452.4, fresh=False)
+    log.took(75.0, fresh=True)
+    lines = [(level, m) for level, m in _lines(caplog, name)]
+    assert [level for level, _m in lines] == [logging.WARNING, logging.WARNING]
+    assert "menubar snapshot took 452s" in lines[0][1]
+    assert "took 75s" in lines[1][1] and "Refresh now" in lines[1][1]
+
+
+def test_an_unprintable_failure_still_logs(caplog):
+    class Unprintable(Exception):
+        def __str__(self):
+            raise RuntimeError("no text")
+
+    log, name = _snapshot_log()
+    caplog.set_level(logging.WARNING, logger=name)
+    log.failed(_raised(Unprintable()))
+    (line,) = [m for _level, m in _lines(caplog, name)]
+    assert "Unprintable: <unprintable>" in line
