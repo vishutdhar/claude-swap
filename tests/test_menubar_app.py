@@ -1641,9 +1641,8 @@ def test_an_owed_read_that_finishes_at_once_is_still_drawn(app, shown, on_screen
 # --- the snapshot worker's log lines ---------------------------------------------
 #
 # A failed or stalled read keeps the previous snapshot on screen; the log is
-# the only place that says so. WARNING, never a token, rate-limited.
-
-_TOKEN = "rt-" + "Ab3_x-Yz9." * 12  # 123 token characters, a refresh token's shape
+# the only place that says so. WARNING, rate-limited, and nothing from the
+# exception's message: its class, where it was raised, an integer status.
 
 
 class _Clock:
@@ -1661,24 +1660,35 @@ def _warnings(caplog):
     ]
 
 
-def test_a_failed_read_reaches_the_log_once_without_its_token(app, caplog):
+def test_a_failed_read_reaches_the_log_once_without_its_message(app, caplog):
+    import uuid
+
+    secret = "s3cr3t-" + uuid.uuid4().hex  # built at run time
     caplog.set_level(logging.DEBUG, logger="claude-swap")
     # A fresh log: the app's own startup read (which fails here, as tests
-    # never fetch) already opened a RuntimeError window.
+    # never fetch) already opened a window.
     app._snapshot_log = menubar.SnapshotLog(app.switcher._logger, clock=_Clock())
 
     class _Failing:
         def take(self, **_kw):
-            raise RuntimeError(f"usage fetch failed with {_TOKEN}")
+            raise RuntimeError(f"usage fetch failed with refreshToken={secret}")
 
     app._snapshot_source = _Failing()
-    for _ in range(3):  # three reads a minute apart would be one line too
+    for _ in range(3):  # three reads inside one window are one line
         app.refresh_async()
         _wait_idle(app)
     (line,) = _warnings(caplog)
-    assert "menubar snapshot failed: RuntimeError: usage fetch failed with <redacted>" in line
-    # Nothing at any level carries the token, tracebacks included.
-    assert "Ab3_x" not in caplog.text
+    # The innermost frame inside the package: this fake source lives outside
+    # it, so that is the worker's own call; the frames go all the way down.
+    assert line.startswith("menubar snapshot failed: RuntimeError at menubar.py:")
+    assert line.endswith(" in _worker")
+    (frames,) = [
+        r.getMessage() for r in caplog.records
+        if r.name == "claude-swap" and r.levelno == logging.DEBUG
+        and r.getMessage().startswith("menubar snapshot failure frames")
+    ]
+    assert frames.endswith(" in take")
+    assert secret not in caplog.text and "usage fetch failed" not in caplog.text
 
 
 def test_a_slow_read_logs_its_duration(app, caplog, monkeypatch):
@@ -1695,8 +1705,7 @@ def test_a_slow_read_logs_its_duration(app, caplog, monkeypatch):
     app._snapshot_source = _Slow()
     app.refresh_async()
     _wait_idle(app)
-    (line,) = _warnings(caplog)
-    assert "menubar snapshot took 452s" in line
+    assert _warnings(caplog) == ["menubar snapshot took 452s (over 60s)"]
 
 
 def test_a_slow_failed_read_logs_both_its_duration_and_its_failure(app, caplog):
@@ -1714,5 +1723,6 @@ def test_a_slow_failed_read_logs_both_its_duration_and_its_failure(app, caplog):
     _wait_idle(app)
     lines = _warnings(caplog)
     assert len(lines) == 2
-    assert any("took 75s" in m for m in lines)
-    assert any("TimeoutError: lock stayed busy" in m for m in lines)
+    assert "menubar snapshot took 75s (over 60s)" in lines
+    assert any(m.startswith("menubar snapshot failed: TimeoutError at ") for m in lines)
+    assert "lock stayed busy" not in " ".join(lines)

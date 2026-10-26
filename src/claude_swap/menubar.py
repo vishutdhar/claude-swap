@@ -554,85 +554,83 @@ def purge_menu_callbacks(registry: dict, nsmenu) -> None:
 #
 # The snapshot worker keeps the last good snapshot when a read fails, so a
 # failing or stalled read freezes the menu while its ages keep ticking on
-# every draw. These lines are the only trace of that, so they are WARNINGs;
-# they are rate-limited so a read failing every minute cannot flood the log,
-# and they never carry a secret: exception text from the usage and
-# credential paths can hold one.
+# every draw. These lines are the only trace of that, so they are WARNINGs,
+# rate-limited so a read failing every minute cannot flood the log.
+#
+# A failure is logged as its class, where it was raised and, when it has
+# one, an integer status. Nothing from the exception's message reaches any
+# level: the usage and credential paths can put a secret in it, and no
+# pattern can be trusted to find every secret's shape.
 
-SNAPSHOT_FAILURE_WINDOW_S = 600.0  # one line per exception class per window
-SNAPSHOT_FAILURE_CLASSES_MAX = 32  # live windows kept; the oldest goes first
+SNAPSHOT_FAILURE_WINDOW_S = 600.0  # one failure line per window, any class
+SNAPSHOT_FAILURE_NAMES_MAX = 8  # class names a rolled window's line lists
 SLOW_SNAPSHOT_S = 60.0  # a read longer than this logs its duration
-SNAPSHOT_ERROR_TEXT_LIMIT = 200  # characters of exception text kept
-REDACTED = "<redacted>"
-# Secrets are redacted by meaning as well as by length. A value after a key
-# that names a secret (refreshToken=..., "access_token": "...", password:
-# ..., x-api-key=...): the key is matched case-insensitively as the end of
-# the name, with = or : and optional quotes; a quoted value is taken whole,
-# up to its closing quote or the end of the text, and an auth scheme's value
-# ("Authorization: Bearer abc") takes the credential after the scheme too.
-_SECRET_KEY = (
-    r"(?:refreshtoken|accesstoken|api_key|apikey|token|secret|password|passwd"
-    r"|key|bearer|authorization|credentials?)"
-)
-SECRET_VALUE = re.compile(
-    r"(?i)(" + _SECRET_KEY + r"[\"']?\s*[:=]\s*)"
-    r"((?:bearer|basic|digest)\s+[^\s\"',;)}\]]+|\"[^\"]*\"?|'[^']*'?|[^\s\"',;)}\]]+)"
-)
-# A bearer credential with no key before it ("sent bearer abc").
-BEARER_VALUE = re.compile(r"(?i)\b(bearer\s+)[^\s\"',;)}\]]+")
-# Any run of 20 or more token characters, keyed or not. Every OAuth token and
-# API key is longer than that (the 80+ runs the first version caught are a
-# subset); ordinary words are shorter, though long paths and identifiers in
-# an error's text are redacted too, which the raise site makes up for.
-SECRET_RUN = re.compile(r"[A-Za-z0-9._~+/=-]{20,}")
+# Integer attributes that say what failed without saying anything secret
+# (HTTPError.status/.code, OSError.errno, CalledProcessError.returncode).
+STATUS_ATTRIBUTES = ("status", "status_code", "code", "errno", "returncode")
+_PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-def scrubbed_error_text(exc: BaseException, limit: int = SNAPSHOT_ERROR_TEXT_LIMIT) -> str:
-    """An exception's text for the log: one line, secrets replaced by
-    ``<redacted>``, at most ``limit`` characters.
-
-    Scrubbed before it is cut: cutting first could leave a secret's head too
-    short to be recognised.
-    """
-    try:
-        text = str(exc)
-    except Exception:
-        return "<unprintable>"
-    text = " ".join(text.split())
-    text = SECRET_VALUE.sub(lambda m: m.group(1) + REDACTED, text)
-    text = BEARER_VALUE.sub(lambda m: m.group(1) + REDACTED, text)
-    text = SECRET_RUN.sub(REDACTED, text)
-    return text[:limit]
-
-
-def _frames(exc: BaseException) -> list[str]:
-    """Each traceback frame as "file.py:123 in func", outermost first.
-
-    Never the source lines ``traceback.format_tb`` adds: a failing frame's
-    own source could hold a secret, and the log does not need it.
-    """
+def _frames(exc: BaseException) -> list[tuple[str, bool]]:
+    """Each traceback frame as ("file.py:123 in func", inside this package),
+    outermost first. Never source lines: a frame's own source could hold a
+    secret, and the log does not need it."""
     out = []
     tb = exc.__traceback__
     while tb is not None:
         code = tb.tb_frame.f_code
-        out.append(f"{os.path.basename(code.co_filename)}:{tb.tb_lineno} in {code.co_name}")
+        path = os.path.abspath(code.co_filename)
+        out.append((
+            f"{os.path.basename(path)}:{tb.tb_lineno} in {code.co_name}",
+            path.startswith(_PACKAGE_DIR + os.sep),
+        ))
         tb = tb.tb_next
     return out
+
+
+def _raise_site(frames: list[tuple[str, bool]]) -> str | None:
+    """The innermost frame inside this package, else the innermost frame."""
+    ours = [site for site, inside in frames if inside]
+    if ours:
+        return ours[-1]
+    return frames[-1][0] if frames else None
+
+
+def _status(exc: BaseException) -> str | None:
+    """The first integer status-style attribute, as "status 429", or None."""
+    for attr in STATUS_ATTRIBUTES:
+        try:
+            value = getattr(exc, attr, None)
+        except Exception:
+            continue
+        if isinstance(value, int) and not isinstance(value, bool):
+            return f"{attr} {value}"
+    return None
+
+
+def failure_line(exc: BaseException, frames: list[tuple[str, bool]] | None = None) -> str:
+    """The WARNING text for a failed read: class, integer status, raise site."""
+    status = _status(exc)
+    site = _raise_site(_frames(exc) if frames is None else frames)
+    return (
+        f"menubar snapshot failed: {type(exc).__name__}"
+        + (f" ({status})" if status else "")
+        + (f" at {site}" if site else "")
+    )
 
 
 class SnapshotLog:
     """What the menu bar's snapshot worker writes to the log.
 
-    ``failed`` writes one WARNING per exception class per
-    ``SNAPSHOT_FAILURE_WINDOW_S`` and counts the repeats it holds back; the
-    count is reported when the window rolls, at the next failure (of any
-    class) or the next good read (``succeeded``), whichever comes first.
-    Every call drops the windows that have rolled, and at most
-    ``SNAPSHOT_FAILURE_CLASSES_MAX`` stay live (the oldest is dropped first,
-    its count reported), so the table cannot grow without bound.
-    ``took`` writes a WARNING for a read slower than ``SLOW_SNAPSHOT_S``.
-    ``clock`` is monotonic so a clock change cannot open or close a window;
-    the worker also times its reads with it.
+    One window of ``SNAPSHOT_FAILURE_WINDOW_S`` for every class: the first
+    failure writes its line (``failure_line``) and opens the window; later
+    failures inside it are only counted, with up to
+    ``SNAPSHOT_FAILURE_NAMES_MAX`` of their class names. When the window has
+    rolled, the next event (a failure, or a good read via ``succeeded``)
+    writes one line with that count and those names, and a failure then
+    opens the next window. ``took`` writes the duration of a read slower
+    than ``SLOW_SNAPSHOT_S``. ``clock`` is monotonic so a clock change
+    cannot open or close a window; the worker also times its reads with it.
     """
 
     def __init__(
@@ -641,82 +639,78 @@ class SnapshotLog:
         clock=time.monotonic,
         window_s: float = SNAPSHOT_FAILURE_WINDOW_S,
         slow_s: float = SLOW_SNAPSHOT_S,
-        classes_max: int = SNAPSHOT_FAILURE_CLASSES_MAX,
+        names_max: int = SNAPSHOT_FAILURE_NAMES_MAX,
     ) -> None:
         self._logger = logger
         self.clock = clock
         self._window_s = window_s
         self._slow_s = slow_s
-        self._classes_max = classes_max
+        self._names_max = names_max
         self._lock = threading.Lock()
-        # exception class name -> [when its last line was written, repeats held back]
-        self._windows: dict[str, list] = {}
+        self._window_start: float | None = None
+        self._held_back = 0  # failures inside the window after its line
+        self._held_names: set[str] = set()  # at most names_max of their classes
+        self._held_unnamed = 0  # held-back failures whose class is not in the set
 
-    def took(self, seconds: float, *, fresh: bool) -> None:
+    def took(self, seconds: float) -> None:
         if seconds > self._slow_s:
             self._logger.warning(
-                "menubar snapshot took %.0fs (over %.0fs; the menu kept the previous snapshot meanwhile)%s",
-                seconds, self._slow_s, ", a Refresh now read" if fresh else "",
+                "menubar snapshot took %.0fs (over %.0fs)", seconds, self._slow_s
             )
 
     def failed(self, exc: BaseException) -> None:
         name = type(exc).__name__
         now = self.clock()
         with self._lock:
-            window = self._windows.get(name)
-            live = window is not None and now - window[0] < self._window_s
-            if live:
-                window[1] += 1
+            rolled = self._roll(now)
+            if self._window_start is not None:
+                self._held_back += 1
+                if name not in self._held_names:
+                    if len(self._held_names) < self._names_max:
+                        self._held_names.add(name)
+                    else:
+                        self._held_unnamed += 1
+                opened = False
             else:
-                held_back = window[1] if window is not None else 0
-                self._windows.pop(name, None)
-            reports = self._drop_rolled(now)
-            if not live:
-                while len(self._windows) >= self._classes_max:
-                    oldest = min(self._windows, key=lambda n: self._windows[n][0])
-                    if self._windows[oldest][1]:
-                        reports.append((oldest, self._windows[oldest][1]))
-                    del self._windows[oldest]
-                self._windows[name] = [now, 0]
-        self._report(reports)
-        if live:
+                self._window_start = now
+                opened = True
+        if rolled:
+            self._logger.warning(rolled)
+        if not opened:
             return
-        repeats = f" [{held_back} more since the last line]" if held_back else ""
         frames = _frames(exc)
-        site = f" (at {frames[-1]})" if frames else ""
-        self._logger.warning(
-            "menubar snapshot failed: %s: %s%s%s",
-            name, scrubbed_error_text(exc), site, repeats,
-        )
+        self._logger.warning(failure_line(exc, frames))
         self._logger.debug(
-            "menubar snapshot failure frames, outermost first: %s", "; ".join(frames)
+            "menubar snapshot failure frames, outermost first: %s",
+            "; ".join(site for site, _inside in frames),
         )
 
     def succeeded(self) -> None:
-        now = self.clock()
         with self._lock:
-            reports = self._drop_rolled(now)
-        self._report(reports)
+            rolled = self._roll(self.clock())
+        if rolled:
+            self._logger.warning(rolled)
 
-    def _drop_rolled(self, now: float) -> list[tuple[str, int]]:
-        """Drop every rolled window (lock held); return the counts to report."""
-        rolled = [
-            name for name, window in self._windows.items()
-            if now - window[0] >= self._window_s
-        ]
-        reports = []
-        for name in rolled:
-            held_back = self._windows.pop(name)[1]
-            if held_back:
-                reports.append((name, held_back))
-        return reports
-
-    def _report(self, reports: list[tuple[str, int]]) -> None:
-        for name, held_back in reports:
-            self._logger.warning(
-                "menubar snapshot failed %d more %s with %s in the %.0f min after its last line",
-                held_back, "time" if held_back == 1 else "times", name, self._window_s / 60,
-            )
+    def _roll(self, now: float) -> str | None:
+        """Close a window that has rolled (lock held): the line to write for
+        what it held back, if anything."""
+        if self._window_start is None or now - self._window_start < self._window_s:
+            return None
+        held_back, names, unnamed = self._held_back, sorted(self._held_names), self._held_unnamed
+        self._window_start = None
+        self._held_back = 0
+        self._held_names = set()
+        self._held_unnamed = 0
+        if not held_back:
+            return None
+        listed = ", ".join(names) + (
+            f" (+{unnamed} failures of other classes)" if unnamed else ""
+        )
+        return (
+            f"menubar snapshot failed {held_back} more "
+            f"{'time' if held_back == 1 else 'times'} in the "
+            f"{self._window_s / 60:.0f} min after the last line: {listed}"
+        )
 
 
 def sentinel_note(sentinel: str) -> str:
@@ -1352,11 +1346,11 @@ def create_app(switcher):
                     )
                 except Exception as exc:
                     # Keep the last good snapshot rather than blanking the menu,
-                    # and say so in the log (rate-limited, no tokens).
-                    log.took(log.clock() - started, fresh=fresh)
+                    # and say so in the log (rate-limited, never the message).
+                    log.took(log.clock() - started)
                     log.failed(exc)
                     return
-                log.took(log.clock() - started, fresh=fresh)
+                log.took(log.clock() - started)
                 log.succeeded()
                 snap = _adapt_snapshot(raw)
                 self._log_usage(snap)

@@ -1863,9 +1863,9 @@ def test_adapt_snapshot_records_each_accounts_organization():
 #
 # The worker keeps the last good snapshot when a read fails, so a failing or
 # stalled read freezes the menu while its ages keep ticking. These lines must
-# reach the log (WARNING), never carry a token, and not flood it.
-
-_TOKEN = "rt-" + "Ab3_x-Yz9." * 12  # 123 token characters, a refresh token's shape
+# reach the log (WARNING) and must not flood it, and nothing from an
+# exception's message may reach any level: it can hold a secret. A failure is
+# its class, where it was raised, and an integer status when it has one.
 
 
 class _Clock:
@@ -1881,261 +1881,238 @@ def _snapshot_log(clock=None):
     return menubar.SnapshotLog(logger, clock=clock or _Clock()), logger.name
 
 
-def _lines(caplog, name):
-    return [(r.levelno, r.getMessage()) for r in caplog.records if r.name == name]
+def _lines(caplog, name, level=logging.WARNING):
+    return [r.getMessage() for r in caplog.records if r.name == name and r.levelno == level]
 
 
 def _raised(exc):
     try:
         raise exc
-    except Exception as caught:  # a real traceback, as the worker sees it
+    except BaseException as caught:  # a real traceback, as the worker sees it
         return caught
 
 
-def test_snapshot_failure_is_a_warning_with_its_class_and_no_token(caplog):
+def _secret():
+    # Built at run time, so no constant in this file can stand in for it.
+    import uuid
+
+    return "s3cr3t-" + uuid.uuid4().hex
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        lambda s: '{"password": "prefix\\"' + s + '", "note": "mArKeR"}',
+        lambda s: 'mArKeR Authorization: Bearer "' + s + '"',
+        lambda s: "mArKeR refresh failed\nrefreshToken=" + s + "\n",
+        lambda s: "mArKeR short words then " + s,
+        lambda s: "mArKeR " + "x" * (10 * 1024 * 1024) + " " + s,
+    ],
+    ids=["json-escaped-quote", "quoted-bearer", "newlines", "plain", "10-MB"],
+)
+def test_no_message_text_reaches_any_level(caplog, shape):
+    secret = _secret()
     log, name = _snapshot_log()
     caplog.set_level(logging.DEBUG, logger=name)
-    log.failed(_raised(RuntimeError(f"refresh failed for {_TOKEN} on slot 3")))
-    warnings = [m for level, m in _lines(caplog, name) if level == logging.WARNING]
-    assert len(warnings) == 1
-    (line,) = warnings
-    assert "menubar snapshot failed: RuntimeError: refresh failed for <redacted> on slot 3" in line
-    assert "test_menubar.py" in line  # where it was raised, for the diagnosis
-    every_line = " ".join(m for _level, m in _lines(caplog, name))
-    assert "Ab3_x-Yz9" not in every_line
+    log.failed(_raised(RuntimeError(shape(secret))))
+    assert len(_lines(caplog, name)) == 1
+    assert secret not in caplog.text
+    assert "mArKeR" not in caplog.text
+    assert "xxxxxxxx" not in caplog.text
 
 
-def test_snapshot_failure_text_is_scrubbed_before_it_is_cut(caplog):
-    # A token straddling the 200-character cut: cut first, only its first
-    # ten characters would survive, too short to look like a token, and
-    # they would reach the log.
+def test_a_failure_line_is_its_class_and_raise_site(caplog):
+    log, name = _snapshot_log()
+    caplog.set_level(logging.DEBUG, logger=name)
+    log.failed(_raised(RuntimeError("mArKeR")))
+    (line,) = _lines(caplog, name)
+    assert line.startswith("menubar snapshot failed: RuntimeError at test_menubar.py:")
+    assert line.endswith(" in _raised")
+    (frames,) = _lines(caplog, name, logging.DEBUG)
+    assert "test_menubar.py:" in frames and " in _raised" in frames
+    assert "mArKeR" not in caplog.text
+
+
+def test_the_raise_site_is_the_innermost_frame_inside_the_package(caplog):
+    # Our frame (a module compiled at run time under the package's own
+    # directory) calls json.loads, which raises from inside the standard
+    # library: the site names our frame, where the failing call was made.
+    pkg = os.path.dirname(menubar.__file__)
+    filename = os.path.join(pkg, "runtime_frame_probe.py")
+    source = "import json\ndef call():\n    return json.loads('{not json')\n"
+    namespace: dict = {}
+    exec(compile(source, filename, "exec"), namespace)
+    try:
+        namespace["call"]()
+    except ValueError as exc:
+        caught = exc
+    log, name = _snapshot_log()
+    caplog.set_level(logging.DEBUG, logger=name)
+    log.failed(caught)
+    (line,) = _lines(caplog, name)
+    assert line == "menubar snapshot failed: JSONDecodeError at runtime_frame_probe.py:3 in call"
+    (frames,) = _lines(caplog, name, logging.DEBUG)
+    assert "decoder.py:" in frames  # the frames still go all the way down
+
+
+@pytest.mark.parametrize(
+    "attr, value, shown",
+    [
+        ("status", 429, "status 429"),
+        ("status_code", 503, "status_code 503"),
+        ("code", 7, "code 7"),
+        ("errno", 61, "errno 61"),
+        ("returncode", 44, "returncode 44"),
+    ],
+)
+def test_an_integer_status_is_carried(caplog, attr, value, shown):
+    exc = RuntimeError("mArKeR")
+    setattr(exc, attr, value)
     log, name = _snapshot_log()
     caplog.set_level(logging.WARNING, logger=name)
-    log.failed(_raised(ValueError("word " * 38 + _TOKEN)))  # the token starts at 190
-    (line,) = [m for _level, m in _lines(caplog, name)]
-    assert "rt-Ab3" not in line
-    text = line.split("ValueError: ", 1)[1].split(" (at ", 1)[0]
-    assert text.endswith("<redacted>") and len(text) <= 200
+    log.failed(_raised(exc))
+    (line,) = _lines(caplog, name)
+    assert line.startswith(f"menubar snapshot failed: RuntimeError ({shown}) at ")
 
 
-def test_snapshot_failure_text_is_one_line_and_at_most_200_characters(caplog):
+def test_real_status_bearing_errors_carry_only_their_number(caplog):
+    import urllib.error
+
+    http = urllib.error.HTTPError("https://x.invalid/u", 429, "Too Many mArKeR", {}, None)
+    log, name = _snapshot_log(_Clock())
+    caplog.set_level(logging.WARNING, logger=name)
+    log.failed(_raised(http))
+    (line,) = _lines(caplog, name)
+    assert line.startswith("menubar snapshot failed: HTTPError (status 429) at ")
+    log2, name2 = _snapshot_log()
+    # OSError(61, ...) constructs the errno's own subclass.
+    log2.failed(_raised(OSError(61, "Connection refused mArKeR")))
+    line2 = _lines(caplog, name2)[-1]  # both logs write under one logger name
+    assert line2.startswith("menubar snapshot failed: ConnectionRefusedError (errno 61) at ")
+    assert "mArKeR" not in caplog.text
+
+
+@pytest.mark.parametrize("value", ["429", 4.29, True, None])
+def test_a_status_that_is_not_an_integer_is_left_out(caplog, value):
+    exc = RuntimeError("x")
+    exc.status = value
     log, name = _snapshot_log()
     caplog.set_level(logging.WARNING, logger=name)
-    log.failed(_raised(OSError("line one\nline two " + "y " * 300)))
-    (line,) = [m for _level, m in _lines(caplog, name)]
-    assert "\n" not in line
-    text = line.split("OSError: ", 1)[1].split(" (at ", 1)[0]
-    assert text.startswith("line one line two ") and len(text) <= 200
+    log.failed(_raised(exc))
+    (line,) = _lines(caplog, name)
+    assert line.startswith("menubar snapshot failed: RuntimeError at ")
 
 
-def test_repeats_of_a_failure_are_suppressed_for_ten_minutes_per_class(caplog):
+def test_a_hostile_or_unraised_exception_never_breaks_the_worker(caplog):
+    class Hostile(Exception):
+        def __str__(self):
+            raise RuntimeError("no text")
+
+        @property
+        def status(self):
+            raise RuntimeError("no status")
+
+    log, name = _snapshot_log()
+    caplog.set_level(logging.DEBUG, logger=name)
+    log.failed(_raised(Hostile()))
+    clock = _Clock()
+    log2, name2 = _snapshot_log(clock)
+    log2.failed(ValueError("never raised, so no traceback"))
+    lines = _lines(caplog, name)
+    assert lines and lines[0].startswith("menubar snapshot failed: Hostile at ")
+    assert "menubar snapshot failed: ValueError" in _lines(caplog, name2)
+
+
+def test_one_window_for_every_class(caplog):
+    clock = _Clock()
+    log, name = _snapshot_log(clock)
+    caplog.set_level(logging.WARNING, logger=name)
+    log.failed(_raised(RuntimeError("a")))
+    for i, cls in enumerate([TimeoutError, OSError, RuntimeError, KeyError]):
+        clock.now += 100  # all inside the first line's ten minutes
+        log.failed(_raised(cls("b")))
+    log.succeeded()  # a good read inside the window ends nothing
+    clock.now += 50
+    log.failed(_raised(ValueError("c")))
+    assert len(_lines(caplog, name)) == 1
+
+
+def test_the_rolled_window_reports_its_count_and_class_names(caplog):
+    clock = _Clock()
+    log, name = _snapshot_log(clock)
+    caplog.set_level(logging.WARNING, logger=name)
+    log.failed(_raised(RuntimeError("a")))
+    for cls in (TimeoutError, OSError, TimeoutError, KeyError):
+        clock.now += 60
+        log.failed(_raised(cls("b")))
+    clock.now += 600
+    log.succeeded()
+    lines = _lines(caplog, name)
+    assert lines[1] == (
+        "menubar snapshot failed 4 more times in the 10 min after the last line: "
+        "KeyError, OSError, TimeoutError"
+    )
+    log.succeeded()  # reported once
+    assert len(_lines(caplog, name)) == 2
+
+
+def test_a_failure_after_the_window_reports_it_and_opens_the_next(caplog):
+    clock = _Clock()
+    log, name = _snapshot_log(clock)
+    caplog.set_level(logging.WARNING, logger=name)
+    log.failed(_raised(RuntimeError("a")))
+    clock.now += 30
+    log.failed(_raised(RuntimeError("a")))
+    clock.now += 600
+    log.failed(_raised(TimeoutError("b")))
+    lines = _lines(caplog, name)
+    assert len(lines) == 3
+    assert lines[1] == (
+        "menubar snapshot failed 1 more time in the 10 min after the last line: RuntimeError"
+    )
+    assert lines[2].startswith("menubar snapshot failed: TimeoutError at ")
+
+
+def test_each_window_counts_from_zero(caplog):
+    clock = _Clock()
+    log, name = _snapshot_log(clock)
+    caplog.set_level(logging.WARNING, logger=name)
+    for repeats in (3, 2):
+        log.failed(_raised(RuntimeError("a")))
+        for _ in range(repeats):
+            clock.now += 10
+            log.failed(_raised(RuntimeError("a")))
+        clock.now += 600
+        log.succeeded()
+    summaries = [m for m in _lines(caplog, name) if "more time" in m]
+    assert [m.split(" more ")[0].rsplit(" ", 1)[1] for m in summaries] == ["3", "2"]
+
+
+def test_the_rolled_line_names_at_most_eight_classes(caplog):
     clock = _Clock()
     log, name = _snapshot_log(clock)
     caplog.set_level(logging.WARNING, logger=name)
     log.failed(_raised(RuntimeError("first")))
-    clock.now += 60
-    log.failed(_raised(RuntimeError("second")))
-    clock.now += 470  # 9m 30s after the first line: still inside its window
-    log.failed(_raised(RuntimeError("third")))
-    log.failed(_raised(TimeoutError("another class")))  # its own window
-    lines = [m for _level, m in _lines(caplog, name)]
-    assert len(lines) == 2
-    assert "RuntimeError: first" in lines[0]
-    assert "TimeoutError: another class" in lines[1]
-
-
-def test_the_next_failure_after_the_window_carries_the_suppressed_count(caplog):
-    clock = _Clock()
-    log, name = _snapshot_log(clock)
-    caplog.set_level(logging.WARNING, logger=name)
-    for _ in range(4):  # one line, then three repeats inside the window
-        log.failed(_raised(RuntimeError("busy")))
-        clock.now += 60
-    clock.now += 600  # the window has rolled
-    log.failed(_raised(RuntimeError("busy again")))
-    lines = [m for _level, m in _lines(caplog, name)]
-    assert len(lines) == 2
-    assert "RuntimeError: busy again" in lines[1]
-    assert "3 more since the last line" in lines[1]
-    assert "more since" not in lines[0]
-
-
-def test_a_rolled_window_reports_its_count_on_the_next_good_read(caplog):
-    clock = _Clock()
-    log, name = _snapshot_log(clock)
-    caplog.set_level(logging.WARNING, logger=name)
-    log.failed(_raised(RuntimeError("busy")))
-    clock.now += 30
-    log.failed(_raised(RuntimeError("busy")))
-    log.failed(_raised(RuntimeError("busy")))
-    clock.now += 60
-    log.succeeded()  # the window has not rolled: nothing yet
-    assert len(_lines(caplog, name)) == 1
+    for i in range(20):  # twenty distinct classes, each failing twice
+        cls = type(f"Failure{i:02d}", (Exception,), {})
+        log.failed(_raised(cls("x")))
+        log.failed(_raised(cls("x")))
+    assert len(log._held_names) <= 8
     clock.now += 600
     log.succeeded()
-    lines = [m for _level, m in _lines(caplog, name)]
-    assert len(lines) == 2
-    assert "2 more" in lines[1] and "RuntimeError" in lines[1]
-    log.succeeded()  # reported once
-    log.failed(_raised(RuntimeError("busy")))  # a new window logs at once
-    assert len(_lines(caplog, name)) == 3
-
-
-def test_a_rolled_window_with_no_repeats_reports_nothing(caplog):
-    clock = _Clock()
-    log, name = _snapshot_log(clock)
-    caplog.set_level(logging.WARNING, logger=name)
-    log.failed(_raised(RuntimeError("once")))
-    clock.now += 700
-    log.succeeded()
-    assert len(_lines(caplog, name)) == 1
+    summary = _lines(caplog, name)[1]
+    assert summary.startswith("menubar snapshot failed 40 more times in the 10 min after the last line: ")
+    names = summary.split(": ", 1)[1]
+    assert names == (
+        "Failure00, Failure01, Failure02, Failure03, Failure04, Failure05, "
+        "Failure06, Failure07 (+24 failures of other classes)"
+    )
 
 
 def test_a_slow_read_logs_its_duration(caplog):
     log, name = _snapshot_log()
     caplog.set_level(logging.WARNING, logger=name)
-    log.took(60.0, fresh=False)  # at the limit: not slow
+    log.took(60.0)  # at the limit: not slow
     assert _lines(caplog, name) == []
-    log.took(452.4, fresh=False)
-    log.took(75.0, fresh=True)
-    lines = [(level, m) for level, m in _lines(caplog, name)]
-    assert [level for level, _m in lines] == [logging.WARNING, logging.WARNING]
-    assert "menubar snapshot took 452s" in lines[0][1]
-    assert "took 75s" in lines[1][1] and "Refresh now" in lines[1][1]
-
-
-# Secrets are redacted by meaning, not only by length: a short value after a
-# key that names a secret, a bearer value, and any 20+ run of token characters.
-
-@pytest.mark.parametrize(
-    "message, secret",
-    [
-        ("refresh failed: refreshToken=short-secret", "short-secret"),
-        ("bad grant accessToken: at-1234", "at-1234"),
-        ('response {"refresh_token": "rt-9876", "x": 1}', "rt-9876"),
-        ("payload {'api_key': 'k-42'}", "k-42"),
-        ('login failed password="my pass phrase"', "pass phrase"),
-        ("passwd: hunter2", "hunter2"),
-        ("x-api-key=ak-77 rejected", "ak-77"),
-        ("client_secret = cs-55", "cs-55"),
-        ("CREDENTIALS=cr-1 invalid", "cr-1"),
-        ("credential: cr-2", "cr-2"),
-        ("apikey=ap-3", "ap-3"),
-        ("Secret: se-4", "se-4"),
-        ("token=tk-5", "tk-5"),
-        ("key: ky-6", "ky-6"),
-        ("bearer: be-7", "be-7"),
-        ("headers Authorization: Bearer abc.def", "abc.def"),
-        ("sent bearer xyz-8 upstream", "xyz-8"),
-        ("Authorization=Basic dXNlcjpw", "dXNlcjpw"),
-        ("cut mid value password=\"unterminated", "unterminated"),
-        ("refresh failed for Q7w_e-R8t.Y9u_i-O0p.", "Q7w_e-R8t.Y9u_i-O0p."),
-    ],
-)
-def test_secret_shapes_are_redacted(message, secret):
-    text = menubar.scrubbed_error_text(RuntimeError(message))
-    assert secret not in text, text
-    assert "<redacted>" in text
-
-
-@pytest.mark.parametrize(
-    "message",
-    [
-        "Failed to acquire lock - another instance may be running",
-        "keychain unavailable: locked or in use; try again",
-        "lock busy: try again in 5s",
-        "HTTP 429 Retry-After: 3600",
-        "monkey business at slot 3",
-        "basic check failed: retry later",
-    ],
-)
-def test_ordinary_error_text_is_left_alone(message):
-    assert menubar.scrubbed_error_text(RuntimeError(message)) == message
-
-
-def test_the_debug_stack_never_prints_source_lines(caplog):
-    # A secret written into a failing frame's own source line. Built at run
-    # time, so no constant in this file can stand in for it.
-    import linecache
-    import uuid
-
-    secret = "src-" + uuid.uuid4().hex
-    filename = f"<runtime-frame-{secret[-8:]}>"
-    source = f'def boom():\n    raise RuntimeError("boom")  # {secret}\n'
-    linecache.cache[filename] = (len(source), None, source.splitlines(True), filename)
-    namespace: dict = {}
-    exec(compile(source, filename, "exec"), namespace)
-    try:
-        namespace["boom"]()
-    except RuntimeError as exc:
-        caught = exc
-    log, name = _snapshot_log()
-    caplog.set_level(logging.DEBUG, logger=name)
-    try:
-        log.failed(caught)
-    finally:
-        linecache.cache.pop(filename, None)
-    stack = [m for level, m in _lines(caplog, name) if level == logging.DEBUG]
-    assert len(stack) == 1
-    assert f"{filename}:2 in boom" in stack[0]
-    assert secret not in caplog.text
-
-
-def test_expired_windows_are_dropped_on_every_failure():
-    # Many distinct exception classes, each failing once, 601 s apart, with
-    # no good read in between: nothing but the live window may stay.
-    clock = _Clock()
-    log, _name = _snapshot_log(clock)
-    for i in range(50):
-        log.failed(_raised(type(f"Failure{i}", (Exception,), {})("x")))
-        clock.now += 601
-    assert len(log._windows) <= 1
-
-
-def test_the_window_table_is_capped(caplog):
-    clock = _Clock()
-    log, name = _snapshot_log(clock)
-    caplog.set_level(logging.WARNING, logger=name)
-    for i in range(100):  # all inside one window
-        log.failed(_raised(type(f"Failure{i}", (Exception,), {})("x")))
-    assert len(log._windows) <= 32
-    assert len(_lines(caplog, name)) == 100  # each class still logs its first line
-
-
-def test_a_rolled_window_reports_its_count_on_another_class_failure(caplog):
-    clock = _Clock()
-    log, name = _snapshot_log(clock)
-    caplog.set_level(logging.WARNING, logger=name)
-    log.failed(_raised(RuntimeError("busy")))
-    log.failed(_raised(RuntimeError("busy")))  # held back
-    clock.now += 601
-    log.failed(_raised(TimeoutError("slow")))
-    lines = [m for _level, m in _lines(caplog, name)]
-    assert len(lines) == 3
-    assert any("1 more time with RuntimeError" in m for m in lines)
-
-
-def test_an_evicted_window_reports_what_it_held_back(caplog):
-    clock = _Clock()
-    log, name = _snapshot_log(clock)
-    caplog.set_level(logging.WARNING, logger=name)
-    log.failed(_raised(RuntimeError("busy")))
-    log.failed(_raised(RuntimeError("busy")))  # held back
-    for i in range(32):  # the cap: the oldest window, RuntimeError's, goes
-        clock.now += 1
-        log.failed(_raised(type(f"Failure{i}", (Exception,), {})("x")))
-    assert any(
-        "1 more time with RuntimeError" in m for _level, m in _lines(caplog, name)
-    )
-
-
-def test_an_unprintable_failure_still_logs(caplog):
-    class Unprintable(Exception):
-        def __str__(self):
-            raise RuntimeError("no text")
-
-    log, name = _snapshot_log()
-    caplog.set_level(logging.WARNING, logger=name)
-    log.failed(_raised(Unprintable()))
-    (line,) = [m for _level, m in _lines(caplog, name)]
-    assert "Unprintable: <unprintable>" in line
+    log.took(452.4)
+    assert _lines(caplog, name) == ["menubar snapshot took 452s (over 60s)"]
