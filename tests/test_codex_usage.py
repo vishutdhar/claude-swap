@@ -1275,3 +1275,16 @@ def test_one_rule_for_dated_ahead():
     assert cu.dated_ahead(NOW + cu.FUTURE_SLACK_S + 1, NOW)
     assert not cu.dated_ahead(NOW + cu.FUTURE_SLACK_S, NOW)
     assert not cu.dated_ahead(NOW - 86400, NOW)
+
+
+
+# --- what the server started dies with it ----------------------------------------------
+
+@posix_only
+def test_cleanup_kills_descendants_after_leader_exits(tmp_path):
+    server, log = _server(tmp_path, "spawn-descendant")
+    reply = cu.read_rate_limits(server, timeout=10, now=NOW)
+    assert reply.error is None and reply.reset_credits == 2
+    (descendant,) = [int(line.split()[1]) for line in _log(log) if line.startswith("DESCENDANT ")]
+    assert _gone(_pid(log))  # the server left on its own when its input closed
+    assert _wait_for(lambda: _gone(descendant), 3.0)  # and what it started did not outlive it

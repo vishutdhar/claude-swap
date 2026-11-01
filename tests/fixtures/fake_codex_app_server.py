@@ -18,6 +18,10 @@ Modes:
   hang         reads the first message and never answers
   exit         exits with status 3 before reading anything
   flood        writes two MiB of one JSON line instead of answering
+  spawn-descendant
+               starts a sleeping child in its own process group (logged as
+               DESCENDANT), answers like ok, and exits when its input closes,
+               leaving the child behind
   answer-then-hang-ignore-term
                answers like ok and logs ANSWERED, then ignores SIGTERM
                and stays alive after its input closes (only SIGKILL ends it)
@@ -26,6 +30,7 @@ Modes:
 import json
 import os
 import signal
+import subprocess
 import sys
 import time
 
@@ -58,6 +63,10 @@ if mode == "exit":
     sys.exit(3)
 if mode == "answer-then-hang-ignore-term":
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
+if mode == "spawn-descendant":
+    descendant = subprocess.Popen(["/bin/sleep", "60"])  # same process group as this server
+    log.write("DESCENDANT " + str(descendant.pid) + "\n")
+    log.flush()
 
 for line in sys.stdin:
     msg = json.loads(line)
