@@ -37,6 +37,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from claude_swap.locking import FileLock
+
 # ---- the readings ----------------------------------------------------------------
 
 ROLLOUT_TAIL_BYTES = 256 * 1024  # bytes read from the end of each rollout file
@@ -661,18 +663,25 @@ def _converse(binary: Path, timeout: float, now: float | None, env: dict | None)
 
 DAY_S = 24 * 3600.0
 _LOG_KEEP = 64  # entries read from the log at most; it holds a day's launches
+LOCK_WAIT_S = 2.0  # how long a reservation waits for another menu bar's lock
 
 
 class LaunchBudget:
     """When ``codex app-server`` may be launched, from a log of recent launches.
 
     The log (``{"launches": [epoch, ...], "reset_credits": 2, "credits_at":
-    epoch}``) is read on every question, so two menu bars sharing a backup
-    folder share one budget, and every launch is also kept in memory, so a
-    log that cannot be written never lifts the limits. A launch dated ahead
-    of the clock (the clock was set back) counts as just made. The reset
-    count is written only together with its time, and a count or time that
-    does not read back as valid is dropped.
+    epoch}``) is shared by every menu bar using the backup folder. A launch
+    is taken with ``reserve``: under an exclusive lock on a sidecar file
+    (``<log>.lock``; the log itself is replaced on every write, so a lock on
+    it would not hold), the log is read, the rules decide, and the launch is
+    written down, in one step. There is no launch without a written
+    reservation: a log that cannot be written, or a lock that cannot be had,
+    admits nothing, so neither two menu bars nor a run of restarts can get
+    past the limits. A launch dated ahead of the clock (the clock was set
+    back) counts as just made. The reset count is written only together
+    with its time, and a count or time that does not read back as valid is
+    dropped. ``last_failure`` says why the last reservation or record could
+    not be written ("launch log unwritable", "launch log busy").
     """
 
     def __init__(
@@ -681,12 +690,16 @@ class LaunchBudget:
         daily_cap: int = 8,
         scheduled_every: float = 6 * 3600.0,
         manual_every: float = 1800.0,
+        lock_timeout: float = LOCK_WAIT_S,
     ):
         self.path = Path(path)
+        self.lock_path = self.path.with_name(self.path.name + ".lock")
         self.daily_cap = daily_cap
         self.scheduled_every = scheduled_every
         self.manual_every = manual_every
-        self._memory: list[float] = []
+        self.lock_timeout = lock_timeout
+        self.last_failure: str | None = None
+        self._memory: list[float] = []  # launches this process wrote down
         self._credits: tuple[int | None, float | None] = (None, None)  # the last count saved here
 
     def _read_raw(self) -> dict:
@@ -709,9 +722,31 @@ class LaunchBudget:
         return (count, at) if count is not None and at is not None else (None, None)
 
     def save_credits(self, credits: int, at: float) -> None:
-        """Keep a reported reset count with its time, beside the launches. Never raises."""
+        """Keep a reported reset count with its time, beside the launches. Never raises.
+
+        Written under the lock, so it cannot undo a reservation another menu
+        bar is writing; when the lock cannot be had the count is not saved
+        this time (the menu still shows it).
+        """
         self._credits = (credits, at)
-        self._write(at)
+        lock = self._acquire()
+        if lock is None:
+            return
+        try:
+            self._write(at)
+        finally:
+            lock.release()
+
+    def _acquire(self) -> FileLock | None:
+        """The budget's lock, held; None, with ``last_failure`` set, when it cannot be had."""
+        lock = FileLock(self.lock_path, timeout=self.lock_timeout)
+        try:
+            if lock.acquire():
+                return lock
+            self.last_failure = "launch log busy"
+        except OSError:  # the lock file cannot even be created
+            self.last_failure = "launch log unwritable"
+        return None
 
     def _recent(self, now: float) -> list[float]:
         """Launches inside the rolling day, oldest first, the log and memory merged."""
@@ -732,14 +767,44 @@ class LaunchBudget:
         since = now - recent[-1]
         return since >= (self.manual_every if manual else self.scheduled_every)
 
-    def record(self, now: float) -> None:
-        """Count a launch: in memory first, then in the log (atomically). Never raises."""
-        self._memory = [t for t in self._memory if now - t < DAY_S] + [now]
-        self._write(now)
+    def reserve(self, now: float, manual: bool, first_of_process: bool) -> bool:
+        """Decide and write down a launch in one locked step. Never raises.
 
-    def _write(self, now: float) -> None:
-        """The log as of ``now``: the day's launches and the newest known reset count."""
-        data: dict = {"launches": self._recent(now)}
+        True only when the rules allow it and the reservation is in the log;
+        the caller launches only then.
+        """
+        self.last_failure = None
+        lock = self._acquire()
+        if lock is None:
+            return False
+        try:
+            return self.may_launch(now, manual, first_of_process) and self._append(now)
+        finally:
+            lock.release()
+
+    def record(self, now: float) -> bool:
+        """Write down a launch without asking the rules (locked). True when written. Never raises."""
+        self.last_failure = None
+        lock = self._acquire()
+        if lock is None:
+            return False
+        try:
+            return self._append(now)
+        finally:
+            lock.release()
+
+    def _append(self, now: float) -> bool:
+        """Add ``now`` to the log (lock held); counted in memory only once written."""
+        if not self._write(now, extra=(now,)):
+            self.last_failure = "launch log unwritable"
+            return False
+        self._memory = [t for t in self._memory if now - t < DAY_S] + [now]
+        return True
+
+    def _write(self, now: float, extra=()) -> bool:
+        """The log as of ``now``: the day's launches (and ``extra``) and the newest
+        known reset count, replaced atomically. False when it could not be written."""
+        data: dict = {"launches": sorted(set(self._recent(now)) | set(extra))}
         saved, mine = self.load_credits(), self._credits
         if mine[0] is not None and (saved[0] is None or mine[1] >= saved[1]):
             saved = mine
@@ -753,8 +818,9 @@ class LaunchBudget:
                 json.dump(data, f)
             os.replace(tmp, self.path)
             tmp = None
+            return True
         except OSError:
-            pass
+            return False
         finally:
             if tmp is not None:
                 try:
@@ -843,6 +909,7 @@ class CodexMonitor:
             lambda target: threading.Thread(target=target, daemon=True, name="codex-monitor").start()
         )
         self._first_of_process = True  # the launch at start is still owed
+        self._logged_failure: str | None = None  # the reservation failure last logged
         self._app_reading: CodexReading | None = None
         self._lock = threading.Lock()
         self._running = False
@@ -893,8 +960,11 @@ class CodexMonitor:
         except Exception as exc:
             self._logger.debug("Codex rollout read failed: %s", type(exc).__name__)
         credits, credits_at, error = previous.reset_credits, previous.credits_at, previous.error
-        if self.binary is not None and self.budget.may_launch(now, manual, self._first_of_process):
-            self.budget.record(now)  # counted before it runs: a launch litters even when it fails
+        launch, failure = self._reserve(now, manual) if self.binary is not None else (False, None)
+        if failure:
+            error = failure  # no launch; the badge keeps what it had
+        if launch:
+            # Written down before it runs: a launch litters even when it fails.
             self._first_of_process = False
             try:
                 reply = self._read_app_server(self.binary)
@@ -913,6 +983,19 @@ class CodexMonitor:
         )
         self._state = state
         return state
+
+    def _reserve(self, now: float, manual: bool) -> tuple[bool, str | None]:
+        """``(True, None)`` with a written reservation for a launch now; else
+        ``(False, why)``, why being None when the rules simply say not yet.
+        A failure is logged at debug once, not on every tick it repeats."""
+        if self.budget.reserve(now, manual, self._first_of_process):
+            self._logged_failure = None
+            return True, None
+        failure = self.budget.last_failure
+        if failure and failure != self._logged_failure:
+            self._logger.debug("Codex app-server not started: %s", failure)
+            self._logged_failure = failure
+        return False, failure
 
     def request(self, manual: bool = False, on_done=None) -> None:
         """Run ``tick`` on the worker thread; ``on_done(state)`` runs there after each run."""

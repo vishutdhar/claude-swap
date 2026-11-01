@@ -20,7 +20,7 @@ from claude_swap import codex_usage as cu
 RESETS_AT = 1793774344
 # Links, the executable bit and the fake server (a shell script) are POSIX;
 # the menu bar that uses all this is macOS only.
-posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX links, modes and shell scripts")
+posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX links, modes, locks and shell scripts")
 NOW = datetime(2026, 11, 1, 12, 0, 0, tzinfo=timezone.utc).timestamp()
 
 
@@ -506,14 +506,86 @@ def test_budget_unreadable_file_is_empty(tmp_path, text):
     assert json.loads((tmp_path / "launches.json").read_text()) == {"launches": [NOW]}
 
 
-def test_budget_holds_in_memory_when_the_file_cannot_be_written(tmp_path):
+def test_budget_refuses_a_launch_it_cannot_write_down(tmp_path):
+    # No launch without a written reservation: a log that cannot be written
+    # admits nothing, so no restart can start with a clean slate.
     blocked = tmp_path / "launches.json"
     blocked.mkdir()  # a folder where the file should be: every write fails
     budget = cu.LaunchBudget(blocked)
-    budget.record(NOW)  # never raises
-    assert budget.launches_in_last_day(NOW + 1) == 1
-    assert not budget.may_launch(NOW + 60, manual=False, first_of_process=False)
-    assert [p.name for p in tmp_path.iterdir()] == ["launches.json"]  # no temp file left
+    assert budget.reserve(NOW, manual=False, first_of_process=True) is False  # never raises
+    assert budget.last_failure == "launch log unwritable"
+    assert budget.record(NOW) is False
+    assert budget.launches_in_last_day(NOW + 1) == 0
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["launches.json", "launches.json.lock"]  # no temp file
+
+
+@posix_only
+def test_concurrent_budget_reservations_enforce_limits(tmp_path, monkeypatch):
+    import threading
+    import time
+
+    real_recent = cu.LaunchBudget._recent
+
+    def slow_recent(self, now):
+        found = real_recent(self, now)
+        time.sleep(0.02)  # widen the gap between reading the log and writing it
+        return found
+
+    monkeypatch.setattr(cu.LaunchBudget, "_recent", slow_recent)
+
+    def race(attempts):
+        barrier, results = threading.Barrier(len(attempts)), []
+
+        def go(budget, now, manual, first):
+            barrier.wait()
+            results.append(budget.reserve(now, manual=manual, first_of_process=first))
+
+        threads = [threading.Thread(target=go, args=a) for a in attempts]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        return results
+
+    path = tmp_path / "launches.json"
+    a, b = cu.LaunchBudget(path), cu.LaunchBudget(path)  # two menu bars on one file
+    results = race([((a, b)[i % 2], NOW + i, True, True) for i in range(10)])
+    assert results.count(True) == 8  # the daily cap, whoever asks
+    assert cu.LaunchBudget(path).launches_in_last_day(NOW + 20) == 8
+
+    spaced = tmp_path / "manual.json"
+    assert cu.LaunchBudget(spaced).reserve(NOW - 31 * 60, manual=False, first_of_process=True)
+    c, d = cu.LaunchBudget(spaced), cu.LaunchBudget(spaced)
+    assert sorted(race([(c, NOW, True, False), (d, NOW + 30, True, False)])) == [False, True]
+
+
+@posix_only
+@pytest.mark.parametrize("how", ["folder-in-the-way", "read-only-folder"])
+def test_unwritable_budget_survives_restart_without_extra_launches(tmp_path, how):
+    home = tmp_path / "backup"
+    home.mkdir()
+    log = home / "launches.json"
+    if how == "folder-in-the-way":
+        log.mkdir()
+    else:
+        home.chmod(0o500)
+    try:
+        app = _AppServer(cu.AppServerReply(_reading(56.0, NOW, "app-server"), 2, None))
+        clock = _Clock()
+        states = []
+        for _restart in range(12):  # twelve starts in twelve seconds
+            sessions = tmp_path / "sessions"
+            sessions.mkdir(exist_ok=True)
+            monitor = cu.CodexMonitor(
+                sessions, cu.LaunchBudget(log), Path("codex"), logging.getLogger("claude-swap"),
+                read_rollouts=lambda folder, now: None, read_app_server=app, clock=clock,
+            )
+            states.append(monitor.tick())
+            clock.now += 1
+        assert app.calls == []
+        assert {s.error for s in states} == {"launch log unwritable"}
+    finally:
+        home.chmod(0o700)
 
 
 # --- Task 4: the monitor ------------------------------------------------------------
