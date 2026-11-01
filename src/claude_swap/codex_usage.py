@@ -486,20 +486,56 @@ def _signal_group(pid: int, sig: int) -> None:
         pass  # gone, or only the unreaped leader is left (EPERM on macOS)
 
 
-def _kill_now(proc: subprocess.Popen) -> None:
+class ChildGroup:
+    """The running app-server's process group, so another thread can end it.
+
+    The client calls ``spawned`` right after the launch and ``reaping``
+    right before it reaps the leader. Between the two the leader is not
+    reaped, so its process group id cannot belong to anyone else, and
+    ``kill`` signals it under the same lock that ``reaping`` takes: it can
+    never reach a group id that has been freed.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._pid: int | None = None
+        self.launched = 0  # how many children this group has seen started
+
+    def spawned(self, pid: int) -> None:
+        with self._lock:
+            self._pid = pid
+            self.launched += 1
+
+    def reaping(self) -> None:
+        with self._lock:
+            self._pid = None
+
+    def kill(self) -> bool:
+        """SIGKILL the live child's whole group; False when there is none."""
+        with self._lock:
+            if self._pid is None:
+                return False
+            _signal_group(self._pid, signal.SIGKILL)
+            return True
+
+
+def _kill_now(proc: subprocess.Popen, child: ChildGroup | None = None) -> None:
     """End the child's whole group at once and reap it."""
     _signal_group(proc.pid, signal.SIGKILL)
+    if child is not None:
+        child.reaping()  # before the reap: the group id is about to be freed
     try:
         proc.wait(timeout=REAP_WAIT_S)
     except subprocess.TimeoutExpired:
         pass
 
 
-def _exited_within(pid: int, seconds: float) -> bool:
+def _exited_within(pid: int, seconds: float, abort=None) -> bool:
     """Whether ``pid`` exits within ``seconds``, without reaping it.
 
     The leader stays unreaped until the end, so its process group id cannot
-    be reused by another process while the group is being signalled.
+    be reused by another process while the group is being signalled. False
+    at once when ``abort`` is set: nothing waits once Quit has asked.
     """
     deadline = time.monotonic() + seconds
     while True:
@@ -508,7 +544,7 @@ def _exited_within(pid: int, seconds: float) -> bool:
                 return True
         except ChildProcessError:
             return True
-        if time.monotonic() >= deadline:
+        if (abort is not None and abort.is_set()) or time.monotonic() >= deadline:
             return False
         time.sleep(0.02)
 
@@ -516,10 +552,11 @@ def _exited_within(pid: int, seconds: float) -> bool:
 class _Session:
     """One running app-server: line framing on its stdout, the deadline, the cap."""
 
-    def __init__(self, proc: subprocess.Popen, deadline: float, abort=None):
+    def __init__(self, proc: subprocess.Popen, deadline: float, abort=None, child: ChildGroup | None = None):
         self.proc = proc
         self.deadline = deadline
         self.abort = abort  # a threading.Event: set, the conversation ends at once
+        self.child = child
         self.buffer = b""
         self.total = 0
         self.eof = False
@@ -584,17 +621,20 @@ class _Session:
 
         After a timeout, closed output or a flood, the group is signalled at
         once. SIGKILL always goes to the whole group last, so nothing the
-        server started is left running; then the leader is reaped.
+        server started is left running; then the leader is reaped. With the
+        abort set (Quit, or Show Codex off), at any point here, every wait is
+        cut short and SIGKILL goes at once.
         """
         try:
             self.proc.stdin.close()
         except (OSError, ValueError):
             pass
         pid = self.proc.pid
-        if not (graceful and _exited_within(pid, EXIT_GRACE_S)):
-            _signal_group(pid, signal.SIGTERM)
-            _exited_within(pid, TERM_GRACE_S)
-        _kill_now(self.proc)
+        if not (graceful and _exited_within(pid, EXIT_GRACE_S, self.abort)):
+            if not (self.abort is not None and self.abort.is_set()):
+                _signal_group(pid, signal.SIGTERM)
+                _exited_within(pid, TERM_GRACE_S, self.abort)
+        _kill_now(self.proc, self.child)
         try:
             self.selector.close()
             self.proc.stdout.close()
@@ -608,6 +648,7 @@ def read_rate_limits(
     now: float | None = None,
     env: dict | None = None,
     abort=None,
+    child: ChildGroup | None = None,
 ) -> AppServerReply:
     """Ask ``codex app-server`` for the rate limits and the banked reset count. Never raises.
 
@@ -620,15 +661,18 @@ def read_rate_limits(
     the reading; it defaults to the time of the reply. ``abort`` (a
     ``threading.Event``) ends the conversation within a quarter second of
     being set, the child's group killed and reaped, error "aborted"; set
-    before the launch, nothing is launched.
+    before the launch, nothing is launched. ``child`` (a ``ChildGroup``) is
+    told about the child from its launch to its reap.
     """
     try:
-        return _converse(Path(binary), float(timeout), now, env, abort)
+        return _converse(Path(binary), float(timeout), now, env, abort, child)
     except Exception as exc:  # a backstop: the conversation reports its own failures
         return AppServerReply(None, None, f"failed: {type(exc).__name__}")
 
 
-def _converse(binary: Path, timeout: float, now: float | None, env: dict | None, abort=None) -> AppServerReply:
+def _converse(
+    binary: Path, timeout: float, now: float | None, env: dict | None, abort=None, child: ChildGroup | None = None
+) -> AppServerReply:
     try:
         hello = rpc_request(1, "initialize", {"clientInfo": {"name": CLIENT_NAME, "version": _client_version()}})
         ready = rpc_notification("initialized")
@@ -650,10 +694,12 @@ def _converse(binary: Path, timeout: float, now: float | None, env: dict | None,
         )
     except (OSError, ValueError) as exc:
         return AppServerReply(None, None, f"could not start: {getattr(exc, 'strerror', None) or type(exc).__name__}")
+    if child is not None:
+        child.spawned(proc.pid)
     try:
-        session = _Session(proc, deadline, abort)
+        session = _Session(proc, deadline, abort, child)
     except Exception:
-        _kill_now(proc)  # nothing could talk to it: never leave it running
+        _kill_now(proc, child)  # nothing could talk to it: never leave it running
         raise
     graceful = False
     try:
@@ -877,6 +923,7 @@ class LaunchBudget:
 # attribute for the main thread to read.
 
 CREDITS_FRESH_S = DAY_S  # a reset count older than this is shown as unknown
+CLOSE_REAP_S = 0.5  # after close kills the child itself, for the worker to reap it
 
 
 @dataclass(frozen=True)
@@ -963,6 +1010,7 @@ class CodexMonitor:
         self._closed = False
         self._enabled = True
         self._abort = threading.Event()  # set by close: a read in flight ends now
+        self._child = ChildGroup()  # the app-server child while one runs
         # The count saved before a restart shows at once; the launch at
         # start replaces it, and the day rule dims it if it is too old.
         try:
@@ -1030,7 +1078,7 @@ class CodexMonitor:
             # Written down before it runs: a launch litters even when it fails.
             self._first_of_process = False
             try:
-                reply = self._read_app_server(self.binary, abort=self._abort)
+                reply = self._read_app_server(self.binary, abort=self._abort, child=self._child)
             except Exception as exc:  # the client never raises; a backstop
                 reply = AppServerReply(None, None, f"failed: {type(exc).__name__}")
             error = reply.error
@@ -1063,8 +1111,11 @@ class CodexMonitor:
     def close(self, timeout: float = 2.0) -> bool:
         """End any read in flight (its child's group killed and reaped) and every read after.
 
-        Waits up to ``timeout`` seconds for the worker; True when it has
-        stopped. Called by Quit before the app goes.
+        Waits up to ``timeout`` seconds for the worker, whose cleanup cuts
+        every wait short once asked. If the worker is still not done, the
+        child's group is killed from here (``kill_child``) and the worker
+        gets a moment more to reap it. True when the worker has stopped.
+        Called by Quit before the app goes.
         """
         with self._lock:
             self._closed = True
@@ -1073,7 +1124,16 @@ class CodexMonitor:
         deadline = time.monotonic() + timeout
         while self._running and time.monotonic() < deadline:
             time.sleep(0.02)
+        if self._running:
+            self.kill_child()
+            deadline = time.monotonic() + CLOSE_REAP_S
+            while self._running and time.monotonic() < deadline:
+                time.sleep(0.02)
         return not self._running
+
+    def kill_child(self) -> bool:
+        """SIGKILL the running app-server's group from any thread; False when none runs."""
+        return self._child.kill()
 
     def request(self, manual: bool = False, on_done=None) -> None:
         """Run ``tick`` on the worker thread; ``on_done(state)`` runs there after each run."""

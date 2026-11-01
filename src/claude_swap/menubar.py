@@ -2399,9 +2399,13 @@ def create_app(switcher, codex_monitor=None):
             # shown now; after quit nothing would.
             self._drain_rename_outcomes(quitting=True)
             # A Codex read in flight runs a child in its own session, which
-            # would outlive the app: end it (bounded) before going.
+            # would outlive the app: end it (bounded) before going. If the
+            # monitor's worker did not stop in time, its child's group is
+            # killed from here, so nothing is left running either way.
             try:
-                self._codex.close(timeout=2.0)
+                if not self._codex.close(timeout=2.0):
+                    self._codex.kill_child()
+                    self.switcher._logger.debug("Codex monitor did not stop in time; its child was killed")
             except Exception:
                 self.switcher._logger.debug("could not close the Codex monitor", exc_info=True)
             self._stop_engine()

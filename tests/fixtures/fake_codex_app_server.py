@@ -18,10 +18,14 @@ Modes:
   hang         reads the first message and never answers
   exit         exits with status 3 before reading anything
   flood        writes two MiB of one JSON line instead of answering
+  answer-then-hang-ignore-term
+               answers like ok and logs ANSWERED, then ignores SIGTERM
+               and stays alive after its input closes (only SIGKILL ends it)
 """
 
 import json
 import os
+import signal
 import sys
 import time
 
@@ -52,6 +56,8 @@ def reply_for(msg_id):
 
 if mode == "exit":
     sys.exit(3)
+if mode == "answer-then-hang-ignore-term":
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
 for line in sys.stdin:
     msg = json.loads(line)
@@ -74,3 +80,8 @@ for line in sys.stdin:
             send({"id": msg["id"], "error": {"code": -32600, "message": "not logged in as sam@example.com"}})
         else:
             send({"id": msg["id"], "result": reply_for(msg["id"])})
+            log.write("ANSWERED\n")
+            log.flush()
+
+if mode == "answer-then-hang-ignore-term":
+    time.sleep(60)  # input closed; stays until killed

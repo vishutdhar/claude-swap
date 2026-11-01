@@ -639,7 +639,7 @@ class _AppServer:
         self.replies = list(replies)
         self.calls = []
 
-    def __call__(self, binary, abort=None):
+    def __call__(self, binary, abort=None, child=None):
         self.calls.append(binary)
         reply = self.replies[min(len(self.calls), len(self.replies)) - 1]
         if isinstance(reply, Exception):
@@ -1004,3 +1004,49 @@ def test_disable_codex_cancels_queued_and_not_yet_started_reads(tmp_path):
     monitor.request()
     _wait_idle(monitor)
     assert len(app.calls) == 1
+
+
+# --- Quit during the cleanup after a reply ----------------------------------------------
+
+def _wait_for(predicate, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while not predicate() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    return predicate()
+
+
+@posix_only
+def test_close_during_post_reply_cleanup_kills_at_once(tmp_path):
+    server, log = _server(tmp_path, "answer-then-hang-ignore-term")
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    monitor = cu.CodexMonitor(
+        sessions, cu.LaunchBudget(tmp_path / "launches.json"), server, logging.getLogger("claude-swap"),
+        read_rollouts=lambda folder, now: None,
+    )
+    monitor.request()
+    assert _wait_for(lambda: "ANSWERED" in _log(log))  # answered; the cleanup now waits on it
+    pid = _pid(log)
+    started = time.monotonic()
+    assert monitor.close(timeout=2.0) is True
+    assert time.monotonic() - started < 1.0  # no grace periods once Quit has asked
+    assert _gone(pid)
+
+
+def test_close_kills_the_childs_group_itself_when_the_worker_is_stuck(tmp_path, monkeypatch):
+    # The worker cannot get to its own cleanup in time: close ends the
+    # child's group from outside, through the group the monitor holds.
+    killed = []
+    monkeypatch.setattr(cu, "_signal_group", lambda pid, sig: killed.append((pid, sig)))
+    monitor, _reads = _monitor(tmp_path, binary=None)
+    group = cu.ChildGroup()
+    monitor._child = group
+    group.spawned(4242)
+    monitor._running = True  # a worker that never finishes
+    try:
+        assert monitor.close(timeout=0.2) is False
+    finally:
+        monitor._running = False
+    assert killed == [(4242, cu.signal.SIGKILL)]
+    group.reaping()
+    assert group.kill() is False  # reaped: its group id is no longer ours to signal

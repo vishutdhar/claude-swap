@@ -1766,6 +1766,9 @@ class _FakeCodex:
         self.closed = self.closed + [timeout]
         return True
 
+    def kill_child(self):
+        return False
+
 
 @pytest.fixture
 def codex():
@@ -2149,3 +2152,58 @@ def test_codex_finishing_with_the_menu_closed_does_not_hop(capp, codex, monkeypa
     capp.rebuild_menu()
     codex.finish(_codex_state(credits=3))
     assert hops == [] and capp._dirty  # the sync tick rebuilds, as before
+
+
+@pytest.fixture
+def answering_server(tmp_path):
+    """The fake app-server in the mode that answers, then ignores SIGTERM and hangs."""
+    import sys as _sys
+    from pathlib import Path
+
+    fake = Path(__file__).parent / "fixtures" / "fake_codex_app_server.py"
+    log = tmp_path / "server.log"
+    script = tmp_path / "codex-fake"
+    script.write_text(
+        f'#!/bin/sh\nexec "{_sys.executable}" "{fake}" answer-then-hang-ignore-term "{log}" "$@"\n',
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    return script, log
+
+
+def test_quit_during_post_reply_cleanup_kills_before_exit(tmp_path, monkeypatch, answering_server):
+    import os
+
+    server, log = answering_server
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    monitor = cu.CodexMonitor(
+        sessions, cu.LaunchBudget(tmp_path / "launches.json"), server, logging.getLogger("claude-swap"),
+        read_rollouts=lambda folder, now: None,
+    )
+    monkeypatch.setattr(rumps.rumps, "application_support", lambda _name: str(tmp_path))
+    monkeypatch.setattr("claude_swap.snapshot_source.SnapshotSource", _NoFetch)
+    monkeypatch.setattr(rumps, "notification", lambda *a, **k: None)
+    built = menubar.create_app(_FakeSwitcher(tmp_path), codex_monitor=monitor)  # starts the read
+    try:
+        deadline = time.monotonic() + 5
+        while (not log.exists() or "ANSWERED" not in log.read_text()) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        (pid,) = [int(line[4:]) for line in log.read_text().splitlines() if line.startswith("PID ")]
+
+        def alive():
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return False
+            return True
+
+        at_quit = []
+        monkeypatch.setattr(rumps, "quit_application", lambda: at_quit.append(alive()))
+        started = time.monotonic()
+        built.on_quit(None)
+        assert at_quit == [False]  # gone before the app would have gone
+        assert time.monotonic() - started < 2.5
+    finally:
+        built.refresh_timer.stop()
+        built.sync_timer.stop()
