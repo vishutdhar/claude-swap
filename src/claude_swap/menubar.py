@@ -450,6 +450,20 @@ def _local_part(email: str, limit: int = 12) -> str:
 
 
 CODEX_NAME = "Codex"
+TITLE_NAME_MAX = 12  # the title's longest name, as ``_local_part`` cuts an email
+
+
+def _title_name(name: str, limit: int = TITLE_NAME_MAX) -> str:
+    """``name`` cut in the middle to ``limit`` characters for the menu bar title.
+
+    The status item takes whatever width its title asks for, so a long
+    (valid) alias would push other menu bar items aside. The dropdown and
+    the alias itself keep the full name.
+    """
+    if len(name) <= limit:
+        return name
+    head = limit // 2
+    return name[:head] + "\u2026" + name[-(limit - 1 - head):]
 
 
 def codex_alias_name(text: str) -> str | None:
@@ -477,7 +491,7 @@ def codex_title_segments(
     """
     if not (settings.show_codex and settings.title_codex) or codex is None or codex.reading is None:
         return []
-    name = alias or CODEX_NAME
+    name = _title_name(alias or CODEX_NAME)
     windows = codex.reading.windows
     window = max(windows, key=lambda w: w.window_minutes) if windows else None
     passed = window is not None and window.resets_at is not None and _countdown_until(window.resets_at, now) is None

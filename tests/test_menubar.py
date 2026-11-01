@@ -2316,3 +2316,17 @@ def test_codex_alias_name_uses_the_account_alias_rule(stored, shown):
     # A name hand-edited into the settings file is shown only when the
     # rename prompt would have accepted it.
     assert menubar.codex_alias_name(stored) == shown
+
+
+def test_long_codex_alias_bounds_status_title_width():
+    s = menubar.MenuBarSettings(show_account_name=False, title_pct="off")
+    alias = "review-" + "x" * 60 + "-end"
+    assert menubar.codex_alias_name(alias) == alias  # the alias rule is left alone
+    title = menubar.format_title("a@x.com", None, s, now=_CODEX_NOW, codex=_codex(), codex_alias=alias)
+    assert title == "⇄ review…x-end 56% · UR 2"  # 12 characters, cut in the middle
+    passed = menubar.format_title(
+        "a@x.com", None, s, now=_CODEX_NOW, codex=_codex(resets_in=-30), codex_alias=alias
+    )
+    assert passed == "⇄ review…x-end · UR 2"
+    whole = menubar.format_title("a@x.com", None, s, now=_CODEX_NOW, codex=_codex(), codex_alias="a-twelve-chr")
+    assert whole == "⇄ a-twelve-chr 56% · UR 2"
