@@ -25,7 +25,12 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
+import selectors
+import signal
 import stat
+import subprocess
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -306,3 +311,325 @@ def newest_rollout_reading(
         if reading is not None and (best is None or reading.fetched_at > best.fetched_at):
             best = reading
     return best
+
+
+# ---- the app-server, read only ----------------------------------------------------
+#
+# The conversation is the Usage Widget's: ``initialize`` (id 1), its reply,
+# the ``initialized`` notification, ``account/rateLimits/read`` (id 2), its
+# reply, then stdin is closed and the child reaped. Nothing else is ever
+# sent. In particular ``account/rateLimitResetCredit/consume``, which would
+# spend a banked reset, cannot be built: every outgoing line comes from the
+# two encoders below, and they refuse anything off the allowlist.
+
+ALLOWED_REQUESTS = frozenset({"initialize", "account/rateLimits/read"})
+ALLOWED_NOTIFICATIONS = frozenset({"initialized"})
+APP_SERVER_TIMEOUT_S = 20.0
+CLIENT_NAME = "cswap-menubar"
+OUTPUT_CAP = 1024 * 1024  # bytes of server output read before giving up
+EXIT_GRACE_S = 2.0  # after stdin closes, for the server to leave on its own
+TERM_GRACE_S = 1.0  # after SIGTERM, before SIGKILL
+REAP_WAIT_S = 2.0
+MAX_RESET_CREDITS = 999_999
+REASON_MAX = 200
+_EMAIL_RE = re.compile(r"[^\s@<>\"']+@[^\s@<>\"']+")
+
+
+class RPCRefused(ValueError):
+    """A message off the allowlist: it is never built, so it can never be sent."""
+
+
+def _method_name(method) -> str:
+    """A refused method as text: a str's own characters, never a subclass's say."""
+    return str.__str__(method) if isinstance(method, str) else repr(method)
+
+
+def _line(message: dict) -> bytes:
+    return (json.dumps(message, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def rpc_request(id: int, method: str, params: dict | None = None) -> bytes:
+    """One JSON line for a request; ``RPCRefused`` for any method not allowed.
+
+    The name must be exactly a ``str``: a subclass can compare equal to an
+    allowed name while serialising as another.
+    """
+    if type(method) is not str or method not in ALLOWED_REQUESTS:
+        raise RPCRefused(f"refused: {_method_name(method)}")
+    if type(id) is not int:
+        raise RPCRefused("refused: a request id that is not an int")
+    message: dict = {"id": id, "method": method}
+    if params is not None:
+        message["params"] = params
+    return _line(message)
+
+
+def rpc_notification(method: str) -> bytes:
+    """One JSON line for a notification; ``RPCRefused`` for any method not allowed."""
+    if type(method) is not str or method not in ALLOWED_NOTIFICATIONS:
+        raise RPCRefused(f"refused: {_method_name(method)}")
+    return _line({"method": method})
+
+
+@dataclass(frozen=True)
+class AppServerReply:
+    """What one app-server conversation gave: a reading, the reset count, or why not."""
+
+    reading: CodexReading | None
+    reset_credits: int | None
+    error: str | None
+
+
+def _reset_count(value) -> int | None:
+    number = _number(value)
+    if number is None or not number.is_integer() or not 0 <= number <= MAX_RESET_CREDITS:
+        return None
+    return int(number)
+
+
+def parse_rate_limits_result(result, now: float) -> tuple[CodexReading | None, int | None]:
+    """The reading and the banked reset count in an ``account/rateLimits/read`` result.
+
+    Windows come from ``rateLimits.primary``/``secondary``; the plan type
+    from ``rateLimits.planType`` or, failing that, the result's own
+    ``planType``. A result with no usable window is no reading (it must not
+    wipe a good one) but its reset count still counts. The count is
+    ``rateLimitResetCredits.availableCount`` when it is a whole number in
+    0..``MAX_RESET_CREDITS``; anything else, a missing field included, is
+    None, and the caller keeps the count it had.
+    """
+    if not isinstance(result, dict):
+        return None, None
+    reading = None
+    limits = result.get("rateLimits")
+    if isinstance(limits, dict):
+        windows = _windows(limits, "usedPercent", "windowDurationMins", "resetsAt")
+        if windows:
+            plan = _plan(limits.get("planType")) or _plan(result.get("planType"))
+            reading = CodexReading(windows, plan, now, "app-server")
+    credits = result.get("rateLimitResetCredits")
+    count = _reset_count(credits.get("availableCount")) if isinstance(credits, dict) else None
+    return reading, count
+
+
+def default_codex_dirs() -> list[Path]:
+    """Where the CLI is looked for, in order; its child needs them on PATH (node is in Homebrew)."""
+    dirs = [Path("/opt/homebrew/bin"), Path("/usr/local/bin")]
+    try:
+        dirs.append(Path.home() / ".local" / "bin")
+    except RuntimeError:  # no home directory
+        pass
+    return dirs
+
+
+def find_codex_binary(dirs: list[Path] | None = None) -> Path | None:
+    """The first executable ``codex`` in ``dirs`` (default ``default_codex_dirs()``)."""
+    for folder in default_codex_dirs() if dirs is None else dirs:
+        candidate = Path(folder) / "codex"
+        try:
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def _reason(text) -> str:
+    """A server's error message fit for the log: one line, emails masked, capped."""
+    if not isinstance(text, str) or not text.strip():
+        return "error"
+    text = " ".join(_EMAIL_RE.sub("<email>", text).split())
+    return text[:REASON_MAX]
+
+
+def _client_version() -> str:
+    try:
+        from claude_swap import __version__
+    except Exception:
+        return "0"
+    return str(__version__)
+
+
+def _child_env(env: dict | None) -> dict:
+    child = dict(os.environ if env is None else env)
+    inherited = child.get("PATH") or "/usr/bin:/bin:/usr/sbin:/sbin"
+    child["PATH"] = os.pathsep.join([str(d) for d in default_codex_dirs()] + [inherited])
+    return child
+
+
+class _Failed(Exception):
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _signal_group(pid: int, sig: int) -> None:
+    try:
+        os.killpg(pid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass  # gone, or only the unreaped leader is left (EPERM on macOS)
+
+
+def _exited_within(pid: int, seconds: float) -> bool:
+    """Whether ``pid`` exits within ``seconds``, without reaping it.
+
+    The leader stays unreaped until the end, so its process group id cannot
+    be reused by another process while the group is being signalled.
+    """
+    deadline = time.monotonic() + seconds
+    while True:
+        try:
+            if os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT | os.WNOHANG) is not None:
+                return True
+        except ChildProcessError:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.02)
+
+
+class _Session:
+    """One running app-server: line framing on its stdout, the deadline, the cap."""
+
+    def __init__(self, proc: subprocess.Popen, deadline: float):
+        self.proc = proc
+        self.deadline = deadline
+        self.buffer = b""
+        self.total = 0
+        self.eof = False
+        self.fd = proc.stdout.fileno()
+        os.set_blocking(self.fd, False)
+        self.selector = selectors.DefaultSelector()
+        self.selector.register(self.fd, selectors.EVENT_READ)
+
+    def send(self, line: bytes) -> None:
+        try:
+            self.proc.stdin.write(line)
+            self.proc.stdin.flush()
+        except (OSError, ValueError):  # BrokenPipeError: the server has gone
+            raise _Failed("exited before answering") from None
+
+    def await_result(self, want: int) -> dict:
+        """The ``result`` of the reply to request ``want``; every other line is skipped."""
+        while True:
+            while b"\n" in self.buffer:
+                raw, self.buffer = self.buffer.split(b"\n", 1)
+                try:
+                    message = json.loads(raw)
+                except ValueError:
+                    continue  # a log line
+                if not (
+                    isinstance(message, dict)
+                    and type(message.get("id")) is int
+                    and message["id"] == want
+                    and "method" not in message  # a server request reusing the id
+                ):
+                    continue
+                if isinstance(message.get("result"), dict):
+                    return message["result"]
+                if isinstance(message.get("error"), dict):
+                    raise _Failed(_reason(message["error"].get("message")))
+                raise _Failed("reply could not be read")
+            if self.eof:
+                raise _Failed("exited before answering")
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0:
+                raise _Failed("timeout")
+            if not self.selector.select(min(remaining, 0.25)):
+                continue
+            try:
+                chunk = os.read(self.fd, 65536)
+            except BlockingIOError:
+                continue
+            except OSError:
+                chunk = b""
+            if not chunk:
+                self.eof = True
+                continue
+            self.total += len(chunk)
+            if self.total > OUTPUT_CAP:
+                raise _Failed("output too large")
+            self.buffer += chunk
+
+    def finish(self, graceful: bool) -> None:
+        """Close stdin, give a server that answered a moment to leave, then end its group.
+
+        After a timeout, closed output or a flood, the group is signalled at
+        once. SIGKILL always goes to the whole group last, so nothing the
+        server started is left running; then the leader is reaped.
+        """
+        try:
+            self.proc.stdin.close()
+        except (OSError, ValueError):
+            pass
+        pid = self.proc.pid
+        if not (graceful and _exited_within(pid, EXIT_GRACE_S)):
+            _signal_group(pid, signal.SIGTERM)
+            _exited_within(pid, TERM_GRACE_S)
+        _signal_group(pid, signal.SIGKILL)
+        try:
+            self.proc.wait(timeout=REAP_WAIT_S)
+        except subprocess.TimeoutExpired:
+            pass  # Popen reaps it on a later poll
+        try:
+            self.selector.close()
+            self.proc.stdout.close()
+        except (OSError, ValueError):
+            pass
+
+
+def read_rate_limits(
+    binary: Path, timeout: float = APP_SERVER_TIMEOUT_S, now: float | None = None, env: dict | None = None
+) -> AppServerReply:
+    """Ask ``codex app-server`` for the rate limits and the banked reset count. Never raises.
+
+    The three outgoing lines are built before anything is launched, so a
+    refused method starts nothing. The child runs in its own process group
+    with ``default_codex_dirs()`` first on its PATH; its stderr is not read.
+    Non-JSON lines, notifications and server requests are skipped while the
+    reply is awaited. On a timeout (the whole conversation, ``timeout``
+    seconds) the group is killed and the error is "timeout". ``now`` stamps
+    the reading; it defaults to the time of the reply.
+    """
+    try:
+        return _converse(Path(binary), float(timeout), now, env)
+    except Exception as exc:  # a backstop: the conversation reports its own failures
+        return AppServerReply(None, None, f"failed: {type(exc).__name__}")
+
+
+def _converse(binary: Path, timeout: float, now: float | None, env: dict | None) -> AppServerReply:
+    try:
+        hello = rpc_request(1, "initialize", {"clientInfo": {"name": CLIENT_NAME, "version": _client_version()}})
+        ready = rpc_notification("initialized")
+        ask = rpc_request(2, "account/rateLimits/read")
+    except RPCRefused as exc:
+        return AppServerReply(None, None, str(exc))
+    deadline = time.monotonic() + timeout
+    try:
+        proc = subprocess.Popen(
+            [str(binary), "app-server"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+            env=_child_env(env),
+        )
+    except (OSError, ValueError) as exc:
+        return AppServerReply(None, None, f"could not start: {getattr(exc, 'strerror', None) or type(exc).__name__}")
+    session = _Session(proc, deadline)
+    graceful = False
+    try:
+        session.send(hello)
+        session.await_result(1)
+        session.send(ready)
+        session.send(ask)
+        result = session.await_result(2)
+        graceful = True
+    except _Failed as exc:
+        graceful = exc.reason not in ("timeout", "exited before answering", "output too large")
+        return AppServerReply(None, None, exc.reason)
+    finally:
+        session.finish(graceful)
+    reading, credits = parse_rate_limits_result(result, time.time() if now is None else now)
+    return AppServerReply(reading, credits, None)

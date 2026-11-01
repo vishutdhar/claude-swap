@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -190,3 +191,197 @@ def test_newest_rollout_reading_missing_dir(tmp_path):
     assert cu.newest_rollout_reading(tmp_path / "no-such-sessions", NOW) is None
     (tmp_path / "empty").mkdir()
     assert cu.newest_rollout_reading(tmp_path / "empty", NOW) is None
+
+
+# --- Task 2: the app-server client, read only ---------------------------------------
+
+FAKE_SERVER = Path(__file__).parent / "fixtures" / "fake_codex_app_server.py"
+
+
+def test_rpc_allowlist_refuses_consume():
+    with pytest.raises(cu.RPCRefused):
+        cu.rpc_request(3, "account/rateLimitResetCredit/consume")
+    with pytest.raises(cu.RPCRefused):
+        cu.rpc_notification("initialize")  # a request name is not a notification
+    with pytest.raises(cu.RPCRefused):
+        cu.rpc_request(1, "initialized")  # nor the other way round
+    assert cu.ALLOWED_REQUESTS == frozenset({"initialize", "account/rateLimits/read"})
+    assert cu.ALLOWED_NOTIFICATIONS == frozenset({"initialized"})
+
+
+def test_rpc_allowlist_cannot_be_fooled_by_a_lookalike_string():
+    class Lookalike(str):
+        # Compares and hashes like an allowed name, serialises as itself.
+        def __eq__(self, other):
+            return True
+
+        def __hash__(self):
+            return hash("initialize")
+
+    with pytest.raises(cu.RPCRefused):
+        cu.rpc_request(1, Lookalike("account/rateLimitResetCredit/consume"))
+    with pytest.raises(cu.RPCRefused):
+        cu.rpc_notification(Lookalike("account/rateLimitResetCredit/consume"))
+
+
+def test_rpc_lines_are_sorted_json_with_newline():
+    line = cu.rpc_request(1, "initialize", {"clientInfo": {"version": "1", "name": "x"}})
+    assert line.endswith(b"\n") and line.count(b"\n") == 1
+    message = json.loads(line)
+    assert message == {"id": 1, "method": "initialize", "params": {"clientInfo": {"version": "1", "name": "x"}}}
+    assert line == (json.dumps(message, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    assert json.loads(cu.rpc_request(2, "account/rateLimits/read")) == {"id": 2, "method": "account/rateLimits/read"}
+    assert cu.rpc_notification("initialized") == b'{"method":"initialized"}\n'
+
+
+def test_parse_rate_limits_result():
+    ok = {"rateLimits": {"primary": {"usedPercent": 56, "windowDurationMins": 10080, "resetsAt": RESETS_AT}},
+          "rateLimitResetCredits": {"availableCount": 2}, "planType": "pro"}
+    reading, credits = cu.parse_rate_limits_result(ok, NOW)
+    assert credits == 2
+    assert reading == cu.CodexReading(
+        (cu.CodexWindow("7d", 56.0, 10080, float(RESETS_AT)),), "pro", NOW, "app-server"
+    )
+    # The plan type as the CLI sends it today: inside rateLimits.
+    inside = {"rateLimits": {"planType": "plus", "primary": ok["rateLimits"]["primary"], "secondary": None}}
+    assert cu.parse_rate_limits_result(inside, NOW)[0].plan_type == "plus"
+    assert cu.parse_rate_limits_result({"rateLimits": {}, "rateLimitResetCredits": {"availableCount": 2}}, NOW) == (None, 2)
+    assert cu.parse_rate_limits_result({}, NOW) == (None, None)
+    for bad in (-1, 1e7, "2", True, None, 2.5):
+        assert cu.parse_rate_limits_result({"rateLimitResetCredits": {"availableCount": bad}}, NOW) == (None, None)
+    assert cu.parse_rate_limits_result({"rateLimitResetCredits": {"availableCount": 0}}, NOW) == (None, 0)
+
+
+def _server(tmp_path, mode):
+    """A launcher script for the fake server, as the real binary is launched."""
+    log = tmp_path / f"{mode}.log"
+    script = tmp_path / f"codex-{mode}"
+    script.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{FAKE_SERVER}" {mode} "{log}" "$@"\n', encoding="utf-8")
+    script.chmod(0o755)
+    return script, log
+
+
+def _log(log):
+    return log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+
+
+def _methods(log):
+    return [line[len("METHOD "):] for line in _log(log) if line.startswith("METHOD ")]
+
+
+def _pid(log):
+    (line,) = [line for line in _log(log) if line.startswith("PID ")]
+    return int(line[len("PID "):])
+
+
+def _gone(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
+def test_read_rate_limits_ok_sends_only_allowed_methods(tmp_path):
+    server, log = _server(tmp_path, "ok")
+    reply = cu.read_rate_limits(server, timeout=10, now=NOW)
+    assert reply.error is None
+    assert reply.reset_credits == 2
+    assert reply.reading.plan_type == "pro"
+    assert [(w.label, w.pct) for w in reply.reading.windows] == [("7d", 56.0)]
+    assert reply.reading.fetched_at == NOW
+    assert _methods(log) == ["initialize", "initialized", "account/rateLimits/read"]
+    assert "ARGS app-server" in _log(log)
+    assert _gone(_pid(log))  # reaped, not left behind
+
+
+def test_read_rate_limits_today_shape(tmp_path):
+    server, _log_path = _server(tmp_path, "realshape")
+    reply = cu.read_rate_limits(server, timeout=10, now=NOW)
+    assert (reply.reading.plan_type, reply.reset_credits, reply.error) == ("pro", 2, None)
+
+
+def test_read_rate_limits_without_credits(tmp_path):
+    server, _log_path = _server(tmp_path, "nocredits")
+    reply = cu.read_rate_limits(server, timeout=10, now=NOW)
+    assert reply.reading is not None and reply.reset_credits is None and reply.error is None
+
+
+def test_read_rate_limits_noisy_still_finds_reply(tmp_path):
+    server, log = _server(tmp_path, "noisy")
+    reply = cu.read_rate_limits(server, timeout=10, now=NOW)
+    assert reply.error is None and reply.reset_credits == 2
+    assert _methods(log) == ["initialize", "initialized", "account/rateLimits/read"]
+
+
+def test_read_rate_limits_rpcerror(tmp_path):
+    server, _log_path = _server(tmp_path, "rpcerror")
+    reply = cu.read_rate_limits(server, timeout=10, now=NOW)
+    assert reply.reading is None and reply.reset_credits is None
+    # The server's own message, with any email address masked: it goes to the log.
+    assert reply.error == "not logged in as <email>"
+
+
+def test_read_rate_limits_hang_times_out_and_kills(tmp_path):
+    import time
+
+    server, log = _server(tmp_path, "hang")
+    started = time.monotonic()
+    reply = cu.read_rate_limits(server, timeout=1, now=NOW)
+    assert time.monotonic() - started < 3
+    assert reply == cu.AppServerReply(None, None, "timeout")
+    assert _gone(_pid(log))
+
+
+def test_read_rate_limits_server_that_exits(tmp_path):
+    server, log = _server(tmp_path, "exit")
+    reply = cu.read_rate_limits(server, timeout=10, now=NOW)
+    assert reply.reading is None and reply.error == "exited before answering"
+    assert _methods(log) == []
+
+
+def test_read_rate_limits_caps_its_output(tmp_path):
+    server, log = _server(tmp_path, "flood")
+    reply = cu.read_rate_limits(server, timeout=10, now=NOW)
+    assert reply.error == "output too large"
+    assert _gone(_pid(log))
+
+
+def test_read_rate_limits_never_raises(tmp_path):
+    assert cu.read_rate_limits(tmp_path / "no-such-codex", timeout=1).error.startswith("could not start")
+
+
+def test_the_client_sends_nothing_the_encoder_refuses(tmp_path, monkeypatch):
+    # Every line the client writes comes from the encoder, built before the
+    # launch: with the read taken off the allowlist, nothing is even started.
+    monkeypatch.setattr(cu, "ALLOWED_REQUESTS", frozenset({"initialize"}))
+    server, log = _server(tmp_path, "ok")
+    reply = cu.read_rate_limits(server, timeout=10, now=NOW)
+    assert reply == cu.AppServerReply(None, None, "refused: account/rateLimits/read")
+    assert not log.exists()
+
+
+def test_read_rate_limits_puts_the_install_dirs_first_on_path(tmp_path, monkeypatch):
+    dirs = [tmp_path / "brew", tmp_path / "local"]
+    monkeypatch.setattr(cu, "default_codex_dirs", lambda: dirs)
+    server, log = _server(tmp_path, "ok")
+    cu.read_rate_limits(server, timeout=10, now=NOW, env={"PATH": "/usr/bin:/bin"})
+    (path,) = [line for line in _log(log) if line.startswith("PATH ")]
+    assert path == f"PATH {dirs[0]}:{dirs[1]}:/usr/bin:/bin"
+
+
+def test_find_codex_binary(tmp_path):
+    empty, plain, good = tmp_path / "empty", tmp_path / "plain", tmp_path / "good"
+    for folder in (empty, plain, good):
+        folder.mkdir()
+    (plain / "codex").write_text("not executable")
+    (good / "codex").write_text("#!/bin/sh\n")
+    (good / "codex").chmod(0o755)
+    assert cu.find_codex_binary([empty, plain, good]) == good / "codex"
+    assert cu.find_codex_binary([empty, plain]) is None
+
+
+def test_tests_never_find_the_real_codex():
+    # conftest's guard: whatever this Mac has installed, no test finds it.
+    assert cu.default_codex_dirs() == []
+    assert cu.find_codex_binary() is None

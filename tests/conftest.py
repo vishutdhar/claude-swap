@@ -573,6 +573,21 @@ def block_real_oauth_profile_fetch(request, monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _no_real_codex(monkeypatch):
+    """Safety net: no test may find or start the real ``codex`` CLI.
+
+    The menu bar looks for ``codex`` in Homebrew, /usr/local/bin and
+    ~/.local/bin (``codex_usage.default_codex_dirs``) and launches what it
+    finds as ``codex app-server``, which talks to the real ChatGPT account
+    and leaves a folder in ~/.codex/.tmp each time. Every test gets an empty
+    search list, so an app built by a test finds no binary; a test that needs
+    one passes the fake server's path itself. ``~/.codex/sessions`` is the
+    throwaway home's (``_isolate_real_home``).
+    """
+    monkeypatch.setattr("claude_swap.codex_usage.default_codex_dirs", lambda: [])
+
+
 @pytest.fixture
 def temp_home(tmp_path: Path):
     """Create a temporary home directory for testing."""
