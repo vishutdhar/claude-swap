@@ -475,6 +475,15 @@ def _signal_group(pid: int, sig: int) -> None:
         pass  # gone, or only the unreaped leader is left (EPERM on macOS)
 
 
+def _kill_now(proc: subprocess.Popen) -> None:
+    """End the child's whole group at once and reap it."""
+    _signal_group(proc.pid, signal.SIGKILL)
+    try:
+        proc.wait(timeout=REAP_WAIT_S)
+    except subprocess.TimeoutExpired:
+        pass
+
+
 def _exited_within(pid: int, seconds: float) -> bool:
     """Whether ``pid`` exits within ``seconds``, without reaping it.
 
@@ -571,11 +580,7 @@ class _Session:
         if not (graceful and _exited_within(pid, EXIT_GRACE_S)):
             _signal_group(pid, signal.SIGTERM)
             _exited_within(pid, TERM_GRACE_S)
-        _signal_group(pid, signal.SIGKILL)
-        try:
-            self.proc.wait(timeout=REAP_WAIT_S)
-        except subprocess.TimeoutExpired:
-            pass  # Popen reaps it on a later poll
+        _kill_now(self.proc)
         try:
             self.selector.close()
             self.proc.stdout.close()
@@ -622,7 +627,11 @@ def _converse(binary: Path, timeout: float, now: float | None, env: dict | None)
         )
     except (OSError, ValueError) as exc:
         return AppServerReply(None, None, f"could not start: {getattr(exc, 'strerror', None) or type(exc).__name__}")
-    session = _Session(proc, deadline)
+    try:
+        session = _Session(proc, deadline)
+    except Exception:
+        _kill_now(proc)  # nothing could talk to it: never leave it running
+        raise
     graceful = False
     try:
         session.send(hello)

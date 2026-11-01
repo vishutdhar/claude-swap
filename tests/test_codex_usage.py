@@ -377,6 +377,27 @@ def test_the_client_sends_nothing_the_encoder_refuses(tmp_path, monkeypatch):
 
 
 @posix_only
+def test_a_client_that_fails_after_the_launch_still_ends_the_child(tmp_path, monkeypatch):
+    started = []
+    real_popen = cu.subprocess.Popen
+
+    def popen(*args, **kwargs):
+        started.append(real_popen(*args, **kwargs))
+        return started[-1]
+
+    def broken_selector():
+        raise RuntimeError("no selector")
+
+    monkeypatch.setattr(cu.subprocess, "Popen", popen)
+    monkeypatch.setattr(cu.selectors, "DefaultSelector", broken_selector)
+    server, _log_path = _server(tmp_path, "ok")
+    reply = cu.read_rate_limits(server, timeout=10, now=NOW)
+    assert reply == cu.AppServerReply(None, None, "failed: RuntimeError")
+    (proc,) = started
+    assert proc.returncode is not None  # killed and reaped before returning
+
+
+@posix_only
 def test_read_rate_limits_puts_the_install_dirs_first_on_path(tmp_path, monkeypatch):
     dirs = [tmp_path / "brew", tmp_path / "local"]
     monkeypatch.setattr(cu, "default_codex_dirs", lambda: dirs)
