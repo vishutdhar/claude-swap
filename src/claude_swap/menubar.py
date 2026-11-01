@@ -1589,51 +1589,73 @@ def create_app(switcher, codex_monitor=None):
                 self.switcher._logger.debug("could not update the Refresh now row", exc_info=True)
 
         def apply_snapshot_in_place(self, snap) -> bool:
-            """Redraw the open menu from ``snap`` without rebuilding it; False to wait.
+            """Redraw the open menu from ``snap`` without rebuilding it; False when a rebuild is owed.
 
             A rebuild swaps every row under the pointer, so it waits for the
-            menu to close (``rebuild_menu``). While the account rows still
-            stand for the same accounts at the same heights, they take the new
-            reading where they are: each panel view its new model, or each
-            text row its new title, and the menu bar title follows.
-            ``snapshot`` and ``_dirty`` are left as they are, so the rebuild
-            after the menu closes draws this same snapshot, submenus included.
+            menu to close (``rebuild_menu``). The account rows and the Codex
+            row are matched apart: a part whose rows still stand for the same
+            accounts (or the same block) at the same heights takes the new
+            reading where it is, each panel view its new model or each text
+            row its new title; a part that changed (an account added, the
+            Codex block gaining a window or going away) keeps its drawing
+            until the rebuild, and False says one is owed. Every panel drawn
+            shares one layout, so the columns still line up. The menu bar
+            title follows the account rows. ``snapshot`` and ``_dirty`` are
+            left as they are, so the rebuild after the menu closes draws this
+            same snapshot, submenus included.
             """
             from claude_swap import menubar_panel_view as pv
             from claude_swap.menubar_panel import CODEX_KEY, fits_in_place
 
             codex = self._codex_shown()  # read once, as the snapshot is
             rows = self._shown_rows
-            entries = list(snap["accounts"])
             views = [item._menuitem.view() for _num, item in rows]
             holds = snap.get("holds")
+            applied = {}  # part (is_codex) -> whether it took the new reading
+
+            def part(pairs, is_codex):
+                return [pair for pair in pairs if (pair[0] == CODEX_KEY) == is_codex]
+
             if views and all(isinstance(view, pv.CswapUsagePanelView) for view in views):
-                panels = [panel for _key, panel in self._panels_for(snap, codex, time.time())]
-                layout = pv.PanelLayout(panels)
-                if not fits_in_place(
-                    [(view.panel.num, view.frame().size.height) for view in views],
-                    [(panel.num, layout.height(panel)) for panel in panels],
-                ):
-                    return False
-                for view, panel in zip(views, panels):
+                keyed = self._panels_for(snap, codex, time.time())
+                probe = pv.PanelLayout([panel for _key, panel in keyed])  # heights need only the fonts
+                shown = [(num, view) for (num, _item), view in zip(rows, views)]
+                drawn = []  # (view, panel): the new model where its part fits, else its own
+                for is_codex in (False, True):
+                    part_views = [view for _num, view in part(shown, is_codex)]
+                    part_panels = [panel for _k, panel in part(keyed, is_codex)]
+                    applied[is_codex] = fits_in_place(
+                        [(view.panel.num, view.frame().size.height) for view in part_views],
+                        [(panel.num, probe.height(panel)) for panel in part_panels],
+                    )
+                    if applied[is_codex]:
+                        drawn.extend(zip(part_views, part_panels))
+                    else:
+                        drawn.extend((view, view.panel) for view in part_views)
+                layout = pv.PanelLayout([panel for _view, panel in drawn])
+                for view, panel in drawn:
                     pv.update_panel_view(view, panel, layout)
             elif all(view is None for view in views):
-                sources = [(entry[0], entry) for entry in entries]
+                sources = [(entry[0], entry) for entry in snap["accounts"]]
                 if codex is not None:
                     sources.append((CODEX_KEY, codex))
-                if not fits_in_place(
-                    [(num, None) for num, _item in rows], [(key, None) for key, _source in sources]
-                ):
-                    return False
-                for (_num, item), (key, source) in zip(rows, sources):
-                    if key == CODEX_KEY:
-                        self._label_codex_row(item, source)
-                    else:
-                        self._label_text_row(item, source, holds)
+                for is_codex in (False, True):
+                    part_rows, part_sources = part(rows, is_codex), part(sources, is_codex)
+                    applied[is_codex] = fits_in_place(
+                        [(num, None) for num, _item in part_rows], [(key, None) for key, _s in part_sources]
+                    )
+                    if not applied[is_codex]:
+                        continue
+                    for (_num, item), (key, source) in zip(part_rows, part_sources):
+                        if key == CODEX_KEY:
+                            self._label_codex_row(item, source)
+                        else:
+                            self._label_text_row(item, source, holds)
             else:
                 return False
-            self._set_title(snap, codex)
-            return True
+            if applied[False]:
+                self._set_title(snap, codex)
+            return applied[False] and applied[True]
 
         def _log_usage(self, snap):
             """Log each account's session/weekly limits when they change.

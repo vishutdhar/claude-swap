@@ -2064,3 +2064,38 @@ def test_quit_with_the_real_monitor_returns_promptly(app, monkeypatch):
     quits, _alerts, took = _quit(app, monkeypatch)
     assert quits == [1] and took < 1.0
     assert app._codex._closed
+
+
+def test_codex_height_change_preserves_claude_in_place_refresh(capp, codex, cshown, on_screen):
+    cshown(_Source(_AFTER))
+    items = list(capp.menu._menu.itemArray())
+    views = [i.view() for i in _account_items(capp)]
+    two = (cu.CodexWindow("5h", 10.0, 300, time.time() + 3600), cu.CodexWindow("7d", 56.0, 10080, time.time() + 86400))
+    codex.state = _codex_state(windows=two)  # the Codex block now needs a second row
+    assert _row(capp).accessibilityPerformPress()
+    assert _pump(lambda: not _row(capp).busy)
+    assert list(capp.menu._menu.itemArray()) == items
+    assert [i.view() for i in _account_items(capp)] == views
+    assert _pcts(capp)[:2] == ["55%", "66%"]  # the accounts took their new reading in place
+    assert len(views[-1].panel.rows) == 1  # Codex keeps its drawing until the close
+    assert capp._rebuild_pending
+    assert len({id(v.layout) for v in views}) == 1  # one layout: the columns still line up
+    assert capp.title == menubar.format_title(
+        "a@x.com", _AFTER["active_usage"], capp.settings, codex=codex.state
+    )
+    _close(capp)
+    capp.on_sync_tick(None)
+    assert [r.label for r in _account_items(capp)[-1].view().panel.rows] == ["5h", "7d"]
+
+
+def test_codex_row_leaving_preserves_the_in_place_text_refresh(capp, codex, cshown, on_screen):
+    capp.settings.show_usage_bars = False
+    capp.rebuild_menu()
+    cshown(_Source(_AFTER))
+    codex.state = cu.ABSENT  # Codex went away while the menu was open
+    assert _row(capp).accessibilityPerformPress()
+    assert _pump(lambda: not _row(capp).busy)
+    titles = [i.title() for i in _account_items(capp)]
+    assert titles[0].startswith("1  a@x.com  5h 55%") and titles[1].startswith("2  b@x.com  5h 66%")
+    assert titles[2].startswith("Codex")  # its row stays until the rebuild
+    assert capp._rebuild_pending
