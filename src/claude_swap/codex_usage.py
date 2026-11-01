@@ -83,17 +83,26 @@ def window_label(minutes: int) -> str:
     return f"{minutes}m"
 
 
-def _number(value) -> float | None:
-    """A finite JSON number as a float; None for anything else (bools included)."""
+def finite_float(value) -> float | None:
+    """A finite JSON number as a float; None for anything else.
+
+    The one reader of every number in a rollout record, an app-server reply
+    and the launch log. Bools, strings, NaN and the infinities are None, and
+    so is an integer too large for a float (valid JSON, ``10**400``), which
+    would otherwise raise and lose every other reading read with it.
+    """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    value = float(value)
+    try:
+        value = float(value)
+    except OverflowError:
+        return None
     return value if math.isfinite(value) else None
 
 
 def _whole_minutes(value) -> int | None:
     """A window length: a positive whole number of minutes, else None."""
-    number = _number(value)
+    number = finite_float(value)
     if number is None or not number.is_integer() or not 0 < number < _MAX_WINDOW_MINUTES:
         return None
     return int(number)
@@ -101,7 +110,7 @@ def _whole_minutes(value) -> int | None:
 
 def _epoch(value) -> float | None:
     """Epoch seconds from a JSON number, else None."""
-    number = _number(value)
+    number = finite_float(value)
     return number if number is not None and 0 < number < _MAX_EPOCH else None
 
 
@@ -109,7 +118,7 @@ def _window(raw, pct_key: str, minutes_key: str, reset_key: str) -> CodexWindow 
     """One window from its raw dict, or None when it has no usable pct or length."""
     if not isinstance(raw, dict):
         return None
-    pct = _number(raw.get(pct_key))
+    pct = finite_float(raw.get(pct_key))
     minutes = _whole_minutes(raw.get(minutes_key))
     if pct is None or minutes is None:
         return None
@@ -388,7 +397,7 @@ class AppServerReply:
 
 
 def _reset_count(value) -> int | None:
-    number = _number(value)
+    number = finite_float(value)
     if number is None or not number.is_integer() or not 0 <= number <= MAX_RESET_CREDITS:
         return None
     return int(number)
@@ -731,7 +740,7 @@ class LaunchBudget:
         launches = self._read_raw().get("launches")
         if not isinstance(launches, list):
             return []
-        return [t for t in (_number(v) for v in launches[-_LOG_KEEP:]) if t is not None]
+        return [t for t in (finite_float(v) for v in launches[-_LOG_KEEP:]) if t is not None]
 
     def load_credits(self, now: float | None = None) -> tuple[int | None, float | None]:
         """The saved reset count and when it was reported, or ``(None, None)``.
@@ -740,7 +749,7 @@ class LaunchBudget:
         is a wrong clock's and is not trusted.
         """
         raw = self._read_raw()
-        count, at = _reset_count(raw.get("reset_credits")), _number(raw.get("credits_at"))
+        count, at = _reset_count(raw.get("reset_credits")), finite_float(raw.get("credits_at"))
         if count is None or at is None or (now is not None and at - now > FUTURE_SLACK_S):
             return None, None
         return count, at

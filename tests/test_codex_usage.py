@@ -916,3 +916,62 @@ def test_close_before_any_read_launches_nothing(tmp_path):
     monitor.request()
     assert monitor.tick().reset_credits is None
     assert app.calls == []
+
+
+# --- numbers too large for a float -----------------------------------------------------
+
+HUGE = "1" + "0" * 400  # a valid JSON integer that no float can hold
+
+
+def test_oversized_rollout_number_does_not_hide_valid_readings(tmp_path):
+    bad_line = _line(_record(pct=1.0, stamp="2026-11-01T11:59:00Z")).replace(
+        '"used_percent": 1.0', f'"used_percent": {HUGE}'
+    )
+    assert HUGE in bad_line
+    assert cu.parse_rollout_line(bad_line) is None
+    sessions = tmp_path / "sessions"
+    today = _day_folder(sessions, NOW)
+    good = _rollout(today, "rollout-good.jsonl", _line(_record(pct=44.0, stamp="2026-11-01T11:00:00Z")))
+    bad = _rollout(today, "rollout-bad.jsonl", _line(_record(pct=12.0, stamp="2026-11-01T10:00:00Z")), bad_line)
+    os.utime(good, (NOW - 600, NOW - 600))
+    os.utime(bad, (NOW - 60, NOW - 60))
+    assert cu.read_rollout_tail(bad).windows[0].pct == 12.0  # the line before it still counts
+    assert cu.newest_rollout_reading(sessions, NOW).windows[0].pct == 44.0  # the scan survives
+
+
+@pytest.mark.parametrize("field", ["window_minutes", "resets_at", "timestamp"])
+def test_oversized_numbers_in_any_rollout_field(field):
+    record = _record()
+    if field == "timestamp":
+        record["timestamp"] = 1
+        text = _line(record).replace('"timestamp": 1', f'"timestamp": {HUGE}')
+    else:
+        record["payload"]["rate_limits"]["primary"][field] = 1
+        text = _line(record).replace(f'"{field}": 1', f'"{field}": {HUGE}')
+    reading = cu.parse_rollout_line(text)
+    if field == "resets_at":
+        assert reading.windows[0].resets_at is None  # only that field is lost
+    else:
+        assert reading is None
+
+
+def test_oversized_numbers_in_a_reply_and_the_launch_log(tmp_path):
+    reply = json.loads(
+        '{"rateLimits": {"primary": {"usedPercent": %s, "windowDurationMins": 10080}},'
+        ' "rateLimitResetCredits": {"availableCount": %s}}' % (HUGE, HUGE)
+    )
+    assert cu.parse_rate_limits_result(reply, NOW) == (None, None)
+    path = tmp_path / "launches.json"
+    path.write_text('{"launches": [%s, %s], "reset_credits": 2, "credits_at": %s}' % (HUGE, NOW, HUGE))
+    budget = cu.LaunchBudget(path)
+    assert budget.launches_in_last_day(NOW) == 1
+    assert budget.load_credits() == (None, None)
+    assert budget.reserve(NOW + 7 * HOUR, manual=False, first_of_process=False)
+
+
+@pytest.mark.parametrize("value, expected", [
+    (2, 2.0), (2.5, 2.5), (10 ** 400, None), (float("nan"), None), (float("inf"), None),
+    (True, None), ("2", None), (None, None),
+])
+def test_finite_float(value, expected):
+    assert cu.finite_float(value) == expected
