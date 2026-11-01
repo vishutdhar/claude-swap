@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import math
+from collections import Counter
 import os
 import re
 import selectors
@@ -842,11 +843,15 @@ class LaunchBudget:
     def _recent(self, now: float) -> list[float]:
         """Launches inside the rolling day, oldest first, the log and memory merged.
 
-        Entries more than ``FUTURE_SLACK_S`` ahead of ``now`` are left out.
+        Two launches in the same second are two launches: nothing is
+        deduplicated. Memory only holds this process's own written launches,
+        which the log holds too, so per time the larger of the two counts is
+        kept (a ``Counter`` union), never their sum. Entries more than
+        ``FUTURE_SLACK_S`` ahead of ``now`` are left out.
         """
+        merged = Counter(self._read()) | Counter(self._memory)
         return sorted(
-            t for t in set(self._read()) | set(self._memory)
-            if now - t < DAY_S and t - now <= FUTURE_SLACK_S
+            t for t in merged.elements() if now - t < DAY_S and t - now <= FUTURE_SLACK_S
         )
 
     def launches_in_last_day(self, now: float) -> int:
@@ -938,7 +943,7 @@ class LaunchBudget:
         as given, and the newest known reset count, replaced atomically. False
         when it could not be written."""
         if launches is None:
-            launches = sorted(set(self._recent(now)) | set(extra))
+            launches = sorted(self._recent(now) + list(extra))
         data: dict = {"launches": launches}
         saved, mine = self.load_credits(now), self._credits
         if mine[0] is not None and mine[1] - now <= FUTURE_SLACK_S and (saved[0] is None or mine[1] >= saved[1]):

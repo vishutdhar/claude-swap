@@ -1151,3 +1151,17 @@ def test_forward_clock_jump_during_scan_preserves_newer_log_entries(tmp_path):
     saved = json.loads(path.read_text())
     assert saved["launches"] == [NOW + 599, NOW + 600, NOW + 1199]  # the other's two kept
     assert (saved["reset_credits"], saved["credits_at"]) == (3, NOW + 600)  # the newer count wins
+
+
+# --- launches at the same second are still separate launches ----------------------------
+
+def test_equal_timestamp_reservations_count_as_distinct_launches(tmp_path):
+    path = tmp_path / "launches.json"
+    a, b = cu.LaunchBudget(path), cu.LaunchBudget(path)
+    results = [(a, b)[i % 2].reserve(NOW, manual=True, first_of_process=True) for i in range(10)]
+    assert results.count(True) == 8
+    assert json.loads(path.read_text())["launches"] == [NOW] * 8
+    assert cu.LaunchBudget(path).launches_in_last_day(NOW) == 8
+    assert a.launches_in_last_day(NOW) == 8  # its own, in the log and in memory, count once
+    a.release(NOW)  # one unused reservation taken back: one entry, not all
+    assert json.loads(path.read_text())["launches"] == [NOW] * 7
