@@ -676,6 +676,10 @@ def _converse(binary: Path, timeout: float, now: float | None, env: dict | None,
 DAY_S = 24 * 3600.0
 _LOG_KEEP = 64  # entries read from the log at most; it holds a day's launches
 LOCK_WAIT_S = 2.0  # how long a reservation waits for another menu bar's lock
+# A launch or a reset count dated further ahead of the clock than this was
+# written under a wrong clock: dropped, never waited out (a clock fast by
+# days would otherwise hold the budget full for days after it is put right).
+FUTURE_SLACK_S = 300.0
 
 
 class LaunchBudget:
@@ -689,8 +693,10 @@ class LaunchBudget:
     written down, in one step. There is no launch without a written
     reservation: a log that cannot be written, or a lock that cannot be had,
     admits nothing, so neither two menu bars nor a run of restarts can get
-    past the limits. A launch dated ahead of the clock (the clock was set
-    back) counts as just made. The reset count is written only together
+    past the limits. A launch dated a few minutes ahead of the clock counts
+    as just made; one further ahead (``FUTURE_SLACK_S``) is a wrong clock's
+    and is dropped, and left out when the log is next written. The same
+    goes for the reset count's time. The reset count is written only together
     with its time, and a count or time that does not read back as valid is
     dropped. ``last_failure`` says why the last reservation or record could
     not be written ("launch log unwritable", "launch log busy").
@@ -727,11 +733,17 @@ class LaunchBudget:
             return []
         return [t for t in (_number(v) for v in launches[-_LOG_KEEP:]) if t is not None]
 
-    def load_credits(self) -> tuple[int | None, float | None]:
-        """The saved reset count and when it was reported, or ``(None, None)``."""
+    def load_credits(self, now: float | None = None) -> tuple[int | None, float | None]:
+        """The saved reset count and when it was reported, or ``(None, None)``.
+
+        With ``now``, a count dated more than ``FUTURE_SLACK_S`` ahead of it
+        is a wrong clock's and is not trusted.
+        """
         raw = self._read_raw()
         count, at = _reset_count(raw.get("reset_credits")), _number(raw.get("credits_at"))
-        return (count, at) if count is not None and at is not None else (None, None)
+        if count is None or at is None or (now is not None and at - now > FUTURE_SLACK_S):
+            return None, None
+        return count, at
 
     def save_credits(self, credits: int, at: float) -> None:
         """Keep a reported reset count with its time, beside the launches. Never raises.
@@ -761,8 +773,14 @@ class LaunchBudget:
         return None
 
     def _recent(self, now: float) -> list[float]:
-        """Launches inside the rolling day, oldest first, the log and memory merged."""
-        return sorted(t for t in set(self._read()) | set(self._memory) if now - t < DAY_S)
+        """Launches inside the rolling day, oldest first, the log and memory merged.
+
+        Entries more than ``FUTURE_SLACK_S`` ahead of ``now`` are left out.
+        """
+        return sorted(
+            t for t in set(self._read()) | set(self._memory)
+            if now - t < DAY_S and t - now <= FUTURE_SLACK_S
+        )
 
     def launches_in_last_day(self, now: float) -> int:
         return len(self._recent(now))
@@ -817,8 +835,8 @@ class LaunchBudget:
         """The log as of ``now``: the day's launches (and ``extra``) and the newest
         known reset count, replaced atomically. False when it could not be written."""
         data: dict = {"launches": sorted(set(self._recent(now)) | set(extra))}
-        saved, mine = self.load_credits(), self._credits
-        if mine[0] is not None and (saved[0] is None or mine[1] >= saved[1]):
+        saved, mine = self.load_credits(now), self._credits
+        if mine[0] is not None and mine[1] - now <= FUTURE_SLACK_S and (saved[0] is None or mine[1] >= saved[1]):
             saved = mine
         if saved[0] is not None:
             data["reset_credits"], data["credits_at"] = saved
@@ -936,7 +954,7 @@ class CodexMonitor:
         # The count saved before a restart shows at once; the launch at
         # start replaces it, and the day rule dims it if it is too old.
         try:
-            credits, credits_at = budget.load_credits()
+            credits, credits_at = budget.load_credits(self._clock())
         except Exception:
             credits, credits_at = None, None
         self._state = CodexState(self._present(), None, credits, credits_at, None)

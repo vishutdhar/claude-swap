@@ -474,11 +474,36 @@ def test_budget_daily_cap_eight(tmp_path):
     assert budget.may_launch(NOW + 24 * HOUR, manual=True, first_of_process=False)
 
 
-def test_budget_counts_a_launch_dated_ahead_as_just_made(tmp_path):
+def test_budget_counts_a_launch_dated_a_little_ahead_as_just_made(tmp_path):
     budget = _budget(tmp_path)
-    budget.record(NOW + HOUR)  # the clock was set back since
+    budget.record(NOW + 200)  # the clock was set back a little since
     assert budget.launches_in_last_day(NOW) == 1
     assert not budget.may_launch(NOW, manual=True, first_of_process=False)
+
+
+def test_full_budget_recovers_after_clock_rollback(tmp_path):
+    path = tmp_path / "launches.json"
+    wrong = cu.LaunchBudget(path)
+    ahead = NOW + 2 * 86400  # a clock wrongly two days fast
+    for i in range(8):
+        assert wrong.record(ahead + i * HOUR)
+    assert not wrong.reserve(ahead + 8 * HOUR, manual=True, first_of_process=True)  # full, then
+    # The clock is put right: those entries are a wrong clock's, not launches
+    # to wait out, in this process and the next.
+    assert wrong.launches_in_last_day(NOW) == 0
+    fresh = cu.LaunchBudget(path)
+    assert fresh.launches_in_last_day(NOW) == 0
+    assert fresh.reserve(NOW, manual=False, first_of_process=True)
+    assert json.loads(path.read_text())["launches"] == [NOW]  # written back without them
+
+
+def test_a_reset_count_dated_ahead_is_not_trusted(tmp_path):
+    path = tmp_path / "launches.json"
+    cu.LaunchBudget(path).save_credits(2, NOW + 3 * 86400)
+    assert cu.LaunchBudget(path).load_credits(NOW) == (None, None)
+    assert cu.LaunchBudget(path).load_credits(NOW + 3 * 86400) == (2, NOW + 3 * 86400)
+    monitor, _reads = _monitor(tmp_path)  # starts on the fake clock, NOW
+    assert monitor.state.reset_credits is None
 
 
 def test_budget_persists_across_instances(tmp_path):
