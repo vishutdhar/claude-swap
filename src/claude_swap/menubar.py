@@ -1691,11 +1691,33 @@ def create_app(switcher, codex_monitor=None):
             """A Codex read ended (the Codex worker thread): log it, and redraw on a change.
 
             Only plain attributes are written here; the sync tick rebuilds.
+            While the menu is open the sync tick cannot run, so the change
+            is also carried to the main thread (``_codex_repaint``), as the
+            end of a reading is in ``_report_refresh``.
             """
             self._log_codex_usage(state)
             if state != self._codex_seen:
                 self._codex_seen = state
                 self._dirty = True
+                if self._menu_open:
+                    try:
+                        from claude_swap import menubar_panel_view as pv
+
+                        pv.call_on_main(self._codex_repaint)
+                    except Exception:
+                        # The rebuild after the close still shows it.
+                        self.switcher._logger.debug("could not report a Codex read to the main thread", exc_info=True)
+
+        def _codex_repaint(self):
+            """A Codex reading came in while the menu was open (main thread): show it in place."""
+            if not self._menu_open:
+                return  # closed meanwhile: the sync tick rebuilds (_dirty)
+            try:
+                if not self.apply_snapshot_in_place(self.snapshot):
+                    self._rebuild_pending = True
+            except Exception:
+                self.switcher._logger.debug("Codex could not repaint in place", exc_info=True)
+                self._rebuild_pending = True
 
         def _log_codex_usage(self, state):
             now = time.time()

@@ -2121,3 +2121,31 @@ def test_an_app_started_with_codex_off_disables_the_monitor(tmp_path, monkeypatc
     finally:
         built.refresh_timer.stop()
         built.sync_timer.stop()
+
+
+def test_codex_finishes_after_claude_repaints_open_menu(capp, codex, cshown, on_screen):
+    cshown(_Source(_AFTER))
+    items = list(capp.menu._menu.itemArray())
+    views = [i.view() for i in _account_items(capp)]
+    assert _row(capp).accessibilityPerformPress()
+    assert _pump(lambda: not _row(capp).busy)  # the account reading is drawn; Codex has not answered
+    assert views[-1].panel.badge_text == "UR 2"
+    worker = threading.Thread(target=codex.finish, args=(_codex_state(pct=61.0, credits=3),))
+    worker.start()  # the Codex worker reports while the menu tracks
+    worker.join(5)
+    assert _pump(lambda: views[-1].panel.badge_text == "UR 3")
+    assert views[-1].panel.rows[0].pct_text == "61%"
+    assert list(capp.menu._menu.itemArray()) == items  # in place, nothing swapped
+    assert [i.view() for i in _account_items(capp)] == views
+    assert _pcts(capp)[:2] == ["55%", "66%"]
+    assert capp.title.endswith(" · Codex 61% · UR 3")
+    assert capp._dirty  # the rebuild after the close still runs
+
+
+def test_codex_finishing_with_the_menu_closed_does_not_hop(capp, codex, monkeypatch):
+    hops = []
+    monkeypatch.setattr(pv, "call_on_main", lambda fn: hops.append(fn))
+    capp.snapshot = _snap(_entry("1", "a@x.com", active=True))
+    capp.rebuild_menu()
+    codex.finish(_codex_state(credits=3))
+    assert hops == [] and capp._dirty  # the sync tick rebuilds, as before
