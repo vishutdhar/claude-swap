@@ -718,3 +718,68 @@ def test_monitor_request_survives_a_failing_callback(tmp_path):
     _wait_idle(monitor)
     monitor.request()
     _wait_idle(monitor)  # still accepts work
+
+
+# --- the reset count survives a restart (kept in the launch budget's file) -----------
+
+def test_budget_saves_and_loads_the_reset_count(tmp_path):
+    path = tmp_path / "launches.json"
+    budget = cu.LaunchBudget(path)
+    assert budget.load_credits() == (None, None)
+    budget.record(NOW)
+    budget.save_credits(2, NOW + 5)
+    assert json.loads(path.read_text()) == {"launches": [NOW], "reset_credits": 2, "credits_at": NOW + 5}
+    again = cu.LaunchBudget(path)
+    assert again.load_credits() == (2, NOW + 5)
+    again.record(NOW + 7 * HOUR)  # a later launch keeps the count
+    assert json.loads(path.read_text()) == {
+        "launches": [NOW, NOW + 7 * HOUR], "reset_credits": 2, "credits_at": NOW + 5,
+    }
+
+
+@pytest.mark.parametrize("count, at", [(-1, NOW), ("2", NOW), (True, NOW), (10_000_000, NOW), (2, "x"), (2, None)])
+def test_budget_ignores_a_bad_saved_count(tmp_path, count, at):
+    path = tmp_path / "launches.json"
+    path.write_text(json.dumps({"launches": [], "reset_credits": count, "credits_at": at}))
+    budget = cu.LaunchBudget(path)
+    assert budget.load_credits() == (None, None)
+    budget.record(NOW)
+    assert json.loads(path.read_text()) == {"launches": [NOW]}  # not carried forward either
+
+
+def test_monitor_seeds_the_count_from_disk(tmp_path):
+    cu.LaunchBudget(tmp_path / "launches.json").save_credits(2, NOW - 3 * HOUR)
+    monitor, reads = _monitor(tmp_path)
+    state = monitor.state  # before any read: what the menu shows at start
+    assert (state.present, state.reading, state.reset_credits, state.credits_at) == (True, None, 2, NOW - 3 * HOUR)
+    assert cu.ur_badge(state.reset_credits, state.credits_known(NOW)) == ("UR 2", "ok")
+    assert reads == []
+
+
+def test_monitor_stale_seed_shows_unknown(tmp_path):
+    cu.LaunchBudget(tmp_path / "launches.json").save_credits(3, NOW - 25 * HOUR)
+    monitor, _reads = _monitor(tmp_path, binary=None)
+    state = monitor.tick()
+    assert state.reset_credits == 3  # kept, only too old to show
+    assert cu.ur_badge(state.reset_credits, state.credits_known(NOW)) == ("UR ?", "unknown")
+
+
+def test_monitor_reply_updates_the_file(tmp_path):
+    path = tmp_path / "launches.json"
+    cu.LaunchBudget(path).save_credits(2, NOW - 3 * HOUR)
+    clock = _Clock()
+    app = _AppServer(
+        cu.AppServerReply(_reading(56.0, NOW, "app-server"), 4, None),
+        cu.AppServerReply(_reading(57.0, NOW + 7 * HOUR, "app-server"), None, None),
+    )
+    monitor, _reads = _monitor(tmp_path, app=app, clock=clock)
+    assert monitor.tick().reset_credits == 4
+    saved = json.loads(path.read_text())
+    assert (saved["reset_credits"], saved["credits_at"]) == (4, NOW)
+    clock.now += 7 * HOUR
+    monitor.tick()  # a reply without the count leaves the saved one alone
+    saved = json.loads(path.read_text())
+    assert (saved["reset_credits"], saved["credits_at"]) == (4, NOW)
+    assert saved["launches"] == [NOW, NOW + 7 * HOUR]
+    fresh, _ = _monitor(tmp_path, app=app, clock=clock)  # a restart
+    assert (fresh.state.reset_credits, fresh.state.credits_at) == (4, NOW)

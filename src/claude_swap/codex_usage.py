@@ -655,7 +655,9 @@ def _converse(binary: Path, timeout: float, now: float | None, env: dict | None)
 # launches are few: one when the menu bar starts, then one every six hours
 # for the reset count (it changes over days), and Refresh now may add one
 # at most every half hour. Never more than eight in any 24 hours, counted
-# from a small log on disk so a restart cannot reset the count.
+# from a small log on disk so a restart cannot reset the count. The same
+# file keeps the last reset count the app-server reported, so the badge has
+# it at once after a restart instead of waiting for the next launch.
 
 DAY_S = 24 * 3600.0
 _LOG_KEEP = 64  # entries read from the log at most; it holds a day's launches
@@ -664,11 +666,13 @@ _LOG_KEEP = 64  # entries read from the log at most; it holds a day's launches
 class LaunchBudget:
     """When ``codex app-server`` may be launched, from a log of recent launches.
 
-    The log (``{"launches": [epoch, ...]}``) is read on every question, so
-    two menu bars sharing a backup folder share one budget, and every
-    launch is also kept in memory, so a log that cannot be written never
-    lifts the limits. A launch dated ahead of the clock (the clock was set
-    back) counts as just made.
+    The log (``{"launches": [epoch, ...], "reset_credits": 2, "credits_at":
+    epoch}``) is read on every question, so two menu bars sharing a backup
+    folder share one budget, and every launch is also kept in memory, so a
+    log that cannot be written never lifts the limits. A launch dated ahead
+    of the clock (the clock was set back) counts as just made. The reset
+    count is written only together with its time, and a count or time that
+    does not read back as valid is dropped.
     """
 
     def __init__(
@@ -683,16 +687,31 @@ class LaunchBudget:
         self.scheduled_every = scheduled_every
         self.manual_every = manual_every
         self._memory: list[float] = []
+        self._credits: tuple[int | None, float | None] = (None, None)  # the last count saved here
 
-    def _read(self) -> list[float]:
+    def _read_raw(self) -> dict:
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            return []
-        launches = raw.get("launches") if isinstance(raw, dict) else None
+            return {}
+        return raw if isinstance(raw, dict) else {}
+
+    def _read(self) -> list[float]:
+        launches = self._read_raw().get("launches")
         if not isinstance(launches, list):
             return []
         return [t for t in (_number(v) for v in launches[-_LOG_KEEP:]) if t is not None]
+
+    def load_credits(self) -> tuple[int | None, float | None]:
+        """The saved reset count and when it was reported, or ``(None, None)``."""
+        raw = self._read_raw()
+        count, at = _reset_count(raw.get("reset_credits")), _number(raw.get("credits_at"))
+        return (count, at) if count is not None and at is not None else (None, None)
+
+    def save_credits(self, credits: int, at: float) -> None:
+        """Keep a reported reset count with its time, beside the launches. Never raises."""
+        self._credits = (credits, at)
+        self._write(at)
 
     def _recent(self, now: float) -> list[float]:
         """Launches inside the rolling day, oldest first, the log and memory merged."""
@@ -716,13 +735,22 @@ class LaunchBudget:
     def record(self, now: float) -> None:
         """Count a launch: in memory first, then in the log (atomically). Never raises."""
         self._memory = [t for t in self._memory if now - t < DAY_S] + [now]
-        launches = self._recent(now)
+        self._write(now)
+
+    def _write(self, now: float) -> None:
+        """The log as of ``now``: the day's launches and the newest known reset count."""
+        data: dict = {"launches": self._recent(now)}
+        saved, mine = self.load_credits(), self._credits
+        if mine[0] is not None and (saved[0] is None or mine[1] >= saved[1]):
+            saved = mine
+        if saved[0] is not None:
+            data["reset_credits"], data["credits_at"] = saved
         tmp = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=self.path.name + ".", suffix=".tmp")
             with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump({"launches": launches}, f)
+                json.dump(data, f)
             os.replace(tmp, self.path)
             tmp = None
         except OSError:
@@ -821,7 +849,13 @@ class CodexMonitor:
         self._again = False
         self._again_manual = False
         self._on_done = None
-        self._state = CodexState(self._present(), None, None, None, None)
+        # The count saved before a restart shows at once; the launch at
+        # start replaces it, and the day rule dims it if it is too old.
+        try:
+            credits, credits_at = budget.load_credits()
+        except Exception:
+            credits, credits_at = None, None
+        self._state = CodexState(self._present(), None, credits, credits_at, None)
 
     @property
     def state(self) -> CodexState:
@@ -873,6 +907,7 @@ class CodexMonitor:
                 self._app_reading = reply.reading
             if reply.reset_credits is not None:
                 credits, credits_at = reply.reset_credits, self._clock()
+                self.budget.save_credits(credits, credits_at)
         state = CodexState(
             True, _newest(self._app_reading, rollout, previous.reading), credits, credits_at, error
         )
