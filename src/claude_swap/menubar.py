@@ -500,15 +500,15 @@ def format_title(
         now = time.time()
     segments: list[str] = []
     if active_email is not None:
-        segments.extend(_claude_title_segments(active_email, active_usage, settings, now, alias))
+        segments.extend(_account_title_segments(active_email, active_usage, settings, now, alias))
     segments.extend(codex_title_segments(settings, codex, codex_alias, now))
     if not segments:
         return ICON
     return f"{ICON} " + " · ".join(segments)
 
 
-def _claude_title_segments(active_email, active_usage, settings, now, alias) -> list[str]:
-    """The active Claude account's title segments: name, windows, model limits."""
+def _account_title_segments(active_email, active_usage, settings, now, alias) -> list[str]:
+    """The active account's title segments: name, windows, model limits."""
     segments: list[str] = []
     if settings.show_account_name:
         segments.append(alias if alias else _local_part(active_email))
@@ -551,7 +551,7 @@ def default_codex_monitor(backup_dir: Path, logger):
 def codex_usage_log_key(state: CodexState | None, now: float):
     """De-dupe key for the Codex usage line: each window's pct and the badge.
 
-    Like the Claude key, it leaves out the reading's age and reset times, so
+    Like the account rows' key, it leaves out the reading's age and reset times, so
     an idle account is not logged again on every read.
     """
     if state is None or state.reading is None:

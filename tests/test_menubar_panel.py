@@ -911,7 +911,7 @@ def _codex_state(*windows, credits=2, credits_age=60.0, fetched_age=9.0, plan="p
 
 def test_codex_row_no_roll_forward_past_reset():
     # Codex has no proven fixed cycle: a passed reset is shown as reset, never
-    # moved on by a week the way a Claude weekly window is.
+    # moved on by a week the way an account's weekly window is.
     row = mp.codex_window_row(_codex_window(pct=93.0, resets_in=-60), _NOW)
     assert (row.label, row.fraction, row.pct_text, row.reset_text, row.state) == ("7d", 0.0, "0%", "reset", "ok")
     assert row.pace_fraction is None and row.note == ""
@@ -953,9 +953,9 @@ def test_build_codex_panel_rows_badge_and_label():
 
 
 def test_build_codex_panel_with_an_alias():
-    panel = mp.build_codex_panel(_codex_state(_codex_window()), _NOW, alias="GPT", names_only=False)
-    assert (panel.name_text, panel.title, panel.email, panel.show_email) == ("GPT", "GPT  (Codex)", "pro", True)
-    assert panel.text_label.startswith("GPT · 7d 56% · UR 2")
+    panel = mp.build_codex_panel(_codex_state(_codex_window()), _NOW, alias="Review", names_only=False)
+    assert (panel.name_text, panel.title, panel.email, panel.show_email) == ("Review", "Review  (Codex)", "pro", True)
+    assert panel.text_label.startswith("Review · 7d 56% · UR 2")
 
 
 def test_build_codex_panel_no_reading():
@@ -975,8 +975,8 @@ def test_build_codex_panel_old_count_is_unknown_and_zero_is_over():
 
 
 def test_build_codex_panel_names_only_hides_plan():
-    named = mp.build_codex_panel(_codex_state(_codex_window()), _NOW, alias="GPT", names_only=True)
-    assert (named.title, named.show_email) == ("GPT", False)
+    named = mp.build_codex_panel(_codex_state(_codex_window()), _NOW, alias="Review", names_only=True)
+    assert (named.title, named.show_email) == ("Review", False)
     plain = mp.build_codex_panel(_codex_state(_codex_window()), _NOW, alias=None, names_only=True)
     assert plain.show_email is True  # no alias: nothing to hide behind, as for an account
 
@@ -992,9 +992,9 @@ def test_codex_accessibility_label():
     assert mp.accessibility_label(panel) == (
         "Codex, pro, 9 seconds ago. 7 day, 56 percent, resets in 2 days 3 hours. 2 usage resets."
     )
-    named = mp.build_codex_panel(_codex_state(_codex_window(resets_in=-5), credits=1), _NOW, alias="GPT", names_only=True)
+    named = mp.build_codex_panel(_codex_state(_codex_window(resets_in=-5), credits=1), _NOW, alias="Review", names_only=True)
     assert mp.accessibility_label(named) == (
-        "GPT  (Codex), pro, 9 seconds ago. 7 day, 0 percent, has reset. 1 usage reset."
+        "Review  (Codex), pro, 9 seconds ago. 7 day, 0 percent, has reset. 1 usage reset."
     )
     none = mp.build_codex_panel(_codex_state(credits=None), _NOW)
     assert mp.accessibility_label(none) == "Codex. no reading. usage resets unknown."

@@ -1,6 +1,6 @@
 """Codex usage for the menu bar: rollout files, the app-server and its budget.
 
-The menu bar shows one Codex block beside the Claude accounts: the usage
+The menu bar shows one Codex block after the accounts: the usage
 windows of whatever account ``~/.codex`` holds, and how many banked usage
 resets it has. This module is the pure half of that, stdlib only and free of
 rumps and AppKit, so it is unit-tested on any platform.
@@ -728,9 +728,9 @@ class LaunchBudget:
 
 # ---- the monitor: state and its own worker ------------------------------------------
 #
-# Codex reads run on their own thread, never inside the Claude snapshot
+# Codex reads run on their own thread, never inside the account snapshot
 # worker: that worker's in-flight flag drops every refresh asked for while
-# it runs, so a 20 second app-server call there would leave the Claude rows
+# it runs, so a 20 second app-server call there would leave the account rows
 # stale after a switch. Like that worker, this one only rebinds a plain
 # attribute for the main thread to read.
 

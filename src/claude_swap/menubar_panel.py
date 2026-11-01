@@ -319,7 +319,7 @@ def build_account_panel(entry: tuple, now: float, names_only: bool = False, hold
 # ---- the Codex block ---------------------------------------------------------------
 
 def codex_window_row(window: CodexWindow, now: float) -> WindowRow:
-    """A Codex window as a bar row: like a Claude row, without pace or roll-forward.
+    """A Codex window as a bar row: like an account's row, without pace or roll-forward.
 
     Codex has no proven fixed cycle, so a window whose reset time has passed
     is not moved on by a period: it shows 0% and "reset" until the next

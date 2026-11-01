@@ -2245,11 +2245,11 @@ def test_settings_round_trip_codex_keys(tmp_path: Path):
     defaults = menubar.MenuBarSettings()
     assert (defaults.show_codex, defaults.title_codex, defaults.codex_alias) == (True, True, "")
     path = tmp_path / "menubar_settings.json"
-    original = menubar.MenuBarSettings(show_codex=False, title_codex=False, codex_alias="GPT")
+    original = menubar.MenuBarSettings(show_codex=False, title_codex=False, codex_alias="Review")
     original.save(path)
     assert menubar.MenuBarSettings.load(path) == original
     saved = json.loads(path.read_text(encoding="utf-8"))
-    assert (saved["show_codex"], saved["title_codex"], saved["codex_alias"]) == (False, False, "GPT")
+    assert (saved["show_codex"], saved["title_codex"], saved["codex_alias"]) == (False, False, "Review")
 
 
 def test_settings_ignore_wrong_type_codex_alias(tmp_path: Path):
@@ -2299,8 +2299,8 @@ def test_format_title_codex_off():
 
 def test_format_title_codex_alias():
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="off")
-    title = menubar.format_title("a@x.com", None, s, now=_CODEX_NOW, codex=_codex(credits=0), codex_alias="GPT")
-    assert title == "⇄ GPT 56% · UR 0"
+    title = menubar.format_title("a@x.com", None, s, now=_CODEX_NOW, codex=_codex(credits=0), codex_alias="Review")
+    assert title == "⇄ Review 56% · UR 0"
 
 
 def test_format_title_codex_without_an_active_account():
@@ -2309,7 +2309,7 @@ def test_format_title_codex_without_an_active_account():
 
 
 @pytest.mark.parametrize("stored, shown", [
-    ("GPT", "GPT"), ("", None), ("  ", None), ("my gpt", None), ("123", None), ("-x", None),
+    ("Review", "Review"), ("", None), ("  ", None), ("my review", None), ("123", None), ("-x", None),
     ("x@y", None), ("Pro\u200b", "Pro"),
 ])
 def test_codex_alias_name_uses_the_account_alias_rule(stored, shown):

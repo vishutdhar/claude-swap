@@ -1925,27 +1925,27 @@ def test_rename_menu_has_codex_entry_and_sets_alias(capp, window, tmp_path):
     capp.rebuild_menu()
     entries = _submenu(capp, "Rename account").itemArray()
     assert [i.title() for i in entries] == ["1  work  (a@x.com)", "Codex"]
-    window.answer = (1, "GPT")
+    window.answer = (1, "Review")
     _choose_rename(capp, 1)
     made = window.made[-1]
     assert (made["title"], made["default_text"]) == ("Rename Codex", "")
     assert made["message"] == "Name for the Codex block. Leave empty to use Codex."
-    assert capp.settings.codex_alias == "GPT"
-    assert json.loads((tmp_path / "menubar_settings.json").read_text())["codex_alias"] == "GPT"
-    assert _account_items(capp)[-1].title().startswith("GPT · 7d 56%")
-    assert _account_items(capp)[-1].view().panel.name_text == "GPT"
-    assert capp.title.endswith(" · GPT 56% · UR 2")
-    assert [i.title() for i in _submenu(capp, "Rename account").itemArray()][-1] == "GPT  (Codex)"
+    assert capp.settings.codex_alias == "Review"
+    assert json.loads((tmp_path / "menubar_settings.json").read_text())["codex_alias"] == "Review"
+    assert _account_items(capp)[-1].title().startswith("Review · 7d 56%")
+    assert _account_items(capp)[-1].view().panel.name_text == "Review"
+    assert capp.title.endswith(" · Review 56% · UR 2")
+    assert [i.title() for i in _submenu(capp, "Rename account").itemArray()][-1] == "Review  (Codex)"
     assert getattr(capp.switcher, "renames", []) == []  # the account store is never touched
     window.answer = (1, "  ")  # empty: back to "Codex"
     _choose_rename(capp, 1)
-    assert window.made[-1]["default_text"] == "GPT"
+    assert window.made[-1]["default_text"] == "Review"
     assert capp.settings.codex_alias == ""
     assert _account_items(capp)[-1].view().panel.name_text == "Codex"
 
 
 @pytest.mark.parametrize("typed, message", [
-    ("my gpt", "Names cannot contain spaces; use - or _"),
+    ("my review", "Names cannot contain spaces; use - or _"),
     ("x@y", "alias 'x@y' contains an unsupported character U+0040 (commercial at)"),
     ("42", "alias '42' cannot be purely numeric (reserved for slot numbers)"),
 ])
@@ -1974,18 +1974,18 @@ def test_codex_rename_drops_invisible_characters(capp, window, monkeypatch):
     monkeypatch.setattr(capp.settings, "save", lambda _p: None)
     capp.snapshot = _snap(_entry_alias("1", "a@x.com", None, active=True))
     capp.rebuild_menu()
-    window.answer = (1, "GPT\u200b")
+    window.answer = (1, "Review\u200b")
     _choose_rename(capp, 1)
-    assert capp.settings.codex_alias == "GPT"
+    assert capp.settings.codex_alias == "Review"
 
 
 def test_names_only_hides_the_codex_plan_behind_an_alias(capp, monkeypatch):
     monkeypatch.setattr(capp.settings, "save", lambda _p: None)
-    capp.settings.codex_alias = "GPT"
+    capp.settings.codex_alias = "Review"
     capp.snapshot = _snap(_entry_alias("1", "a@x.com", None, active=True))
     capp.on_toggle_names_only(None)
     panel = _account_items(capp)[-1].view().panel
-    assert (panel.name_text, panel.show_email) == ("GPT", False)
+    assert (panel.name_text, panel.show_email) == ("Review", False)
 
 
 def test_a_hand_edited_codex_alias_the_rule_refuses_shows_codex(capp):
