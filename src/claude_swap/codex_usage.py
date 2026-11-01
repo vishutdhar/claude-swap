@@ -507,9 +507,10 @@ def _exited_within(pid: int, seconds: float) -> bool:
 class _Session:
     """One running app-server: line framing on its stdout, the deadline, the cap."""
 
-    def __init__(self, proc: subprocess.Popen, deadline: float):
+    def __init__(self, proc: subprocess.Popen, deadline: float, abort=None):
         self.proc = proc
         self.deadline = deadline
+        self.abort = abort  # a threading.Event: set, the conversation ends at once
         self.buffer = b""
         self.total = 0
         self.eof = False
@@ -548,6 +549,8 @@ class _Session:
                 raise _Failed("reply could not be read")
             if self.eof:
                 raise _Failed("exited before answering")
+            if self.abort is not None and self.abort.is_set():
+                raise _Failed("aborted")
             remaining = self.deadline - time.monotonic()
             if remaining <= 0:
                 raise _Failed("timeout")
@@ -591,7 +594,11 @@ class _Session:
 
 
 def read_rate_limits(
-    binary: Path, timeout: float = APP_SERVER_TIMEOUT_S, now: float | None = None, env: dict | None = None
+    binary: Path,
+    timeout: float = APP_SERVER_TIMEOUT_S,
+    now: float | None = None,
+    env: dict | None = None,
+    abort=None,
 ) -> AppServerReply:
     """Ask ``codex app-server`` for the rate limits and the banked reset count. Never raises.
 
@@ -601,21 +608,26 @@ def read_rate_limits(
     Non-JSON lines, notifications and server requests are skipped while the
     reply is awaited. On a timeout (the whole conversation, ``timeout``
     seconds) the group is killed and the error is "timeout". ``now`` stamps
-    the reading; it defaults to the time of the reply.
+    the reading; it defaults to the time of the reply. ``abort`` (a
+    ``threading.Event``) ends the conversation within a quarter second of
+    being set, the child's group killed and reaped, error "aborted"; set
+    before the launch, nothing is launched.
     """
     try:
-        return _converse(Path(binary), float(timeout), now, env)
+        return _converse(Path(binary), float(timeout), now, env, abort)
     except Exception as exc:  # a backstop: the conversation reports its own failures
         return AppServerReply(None, None, f"failed: {type(exc).__name__}")
 
 
-def _converse(binary: Path, timeout: float, now: float | None, env: dict | None) -> AppServerReply:
+def _converse(binary: Path, timeout: float, now: float | None, env: dict | None, abort=None) -> AppServerReply:
     try:
         hello = rpc_request(1, "initialize", {"clientInfo": {"name": CLIENT_NAME, "version": _client_version()}})
         ready = rpc_notification("initialized")
         ask = rpc_request(2, "account/rateLimits/read")
     except RPCRefused as exc:
         return AppServerReply(None, None, str(exc))
+    if abort is not None and abort.is_set():
+        return AppServerReply(None, None, "aborted")
     deadline = time.monotonic() + timeout
     try:
         proc = subprocess.Popen(
@@ -630,7 +642,7 @@ def _converse(binary: Path, timeout: float, now: float | None, env: dict | None)
     except (OSError, ValueError) as exc:
         return AppServerReply(None, None, f"could not start: {getattr(exc, 'strerror', None) or type(exc).__name__}")
     try:
-        session = _Session(proc, deadline)
+        session = _Session(proc, deadline, abort)
     except Exception:
         _kill_now(proc)  # nothing could talk to it: never leave it running
         raise
@@ -643,7 +655,7 @@ def _converse(binary: Path, timeout: float, now: float | None, env: dict | None)
         result = session.await_result(2)
         graceful = True
     except _Failed as exc:
-        graceful = exc.reason not in ("timeout", "exited before answering", "output too large")
+        graceful = exc.reason not in ("timeout", "exited before answering", "output too large", "aborted")
         return AppServerReply(None, None, exc.reason)
     finally:
         session.finish(graceful)
@@ -884,7 +896,10 @@ class CodexMonitor:
     ``tick`` is one synchronous read; ``request`` runs it on a daemon thread,
     one at a time, and a request made while one runs is run once more after
     it (a manual one, Refresh now, stays manual). ``state`` is read without a
-    lock: the worker only ever rebinds it.
+    lock: the worker only ever rebinds it. ``close`` (Quit) ends a read in
+    flight, its child included, and stops all reads for good: the worker is
+    a daemon thread and the child has its own session, so nothing would end
+    them once the app is gone.
     """
 
     def __init__(
@@ -916,6 +931,8 @@ class CodexMonitor:
         self._again = False
         self._again_manual = False
         self._on_done = None
+        self._closed = False
+        self._abort = threading.Event()  # set by close: a read in flight ends now
         # The count saved before a restart shows at once; the launch at
         # start replaces it, and the day rule dims it if it is too old.
         try:
@@ -960,14 +977,16 @@ class CodexMonitor:
         except Exception as exc:
             self._logger.debug("Codex rollout read failed: %s", type(exc).__name__)
         credits, credits_at, error = previous.reset_credits, previous.credits_at, previous.error
-        launch, failure = self._reserve(now, manual) if self.binary is not None else (False, None)
+        launch, failure = (False, None)
+        if self.binary is not None and not self._closed:
+            launch, failure = self._reserve(now, manual)
         if failure:
             error = failure  # no launch; the badge keeps what it had
         if launch:
             # Written down before it runs: a launch litters even when it fails.
             self._first_of_process = False
             try:
-                reply = self._read_app_server(self.binary)
+                reply = self._read_app_server(self.binary, abort=self._abort)
             except Exception as exc:  # the client never raises; a backstop
                 reply = AppServerReply(None, None, f"failed: {type(exc).__name__}")
             error = reply.error
@@ -997,9 +1016,26 @@ class CodexMonitor:
             self._logged_failure = failure
         return False, failure
 
+    def close(self, timeout: float = 2.0) -> bool:
+        """End any read in flight (its child's group killed and reaped) and every read after.
+
+        Waits up to ``timeout`` seconds for the worker; True when it has
+        stopped. Called by Quit before the app goes.
+        """
+        with self._lock:
+            self._closed = True
+            self._again = self._again_manual = False
+        self._abort.set()
+        deadline = time.monotonic() + timeout
+        while self._running and time.monotonic() < deadline:
+            time.sleep(0.02)
+        return not self._running
+
     def request(self, manual: bool = False, on_done=None) -> None:
         """Run ``tick`` on the worker thread; ``on_done(state)`` runs there after each run."""
         with self._lock:
+            if self._closed:
+                return
             if on_done is not None:
                 self._on_done = on_done
             if self._running:

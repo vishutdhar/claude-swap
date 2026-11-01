@@ -614,7 +614,7 @@ class _AppServer:
         self.replies = list(replies)
         self.calls = []
 
-    def __call__(self, binary):
+    def __call__(self, binary, abort=None):
         self.calls.append(binary)
         reply = self.replies[min(len(self.calls), len(self.replies)) - 1]
         if isinstance(reply, Exception):
@@ -855,3 +855,39 @@ def test_monitor_reply_updates_the_file(tmp_path):
     assert saved["launches"] == [NOW, NOW + 7 * HOUR]
     fresh, _ = _monitor(tmp_path, app=app, clock=clock)  # a restart
     assert (fresh.state.reset_credits, fresh.state.credits_at) == (4, NOW)
+
+
+# --- quitting during a read ends the child -----------------------------------------------
+
+@posix_only
+def test_quit_during_hung_read_terminates_child_group(tmp_path):
+    server, log = _server(tmp_path, "hang")
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    monitor = cu.CodexMonitor(
+        sessions, cu.LaunchBudget(tmp_path / "launches.json"), server, logging.getLogger("claude-swap"),
+        read_rollouts=lambda folder, now: None,  # the real client, 20 s timeout
+    )
+    monitor.request()
+    deadline = time.monotonic() + 5
+    while "initialize" not in _methods(log) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    pid = _pid(log)
+    assert not _gone(pid)  # hung, mid-conversation
+    started = time.monotonic()
+    assert monitor.close(timeout=2.0) is True
+    assert time.monotonic() - started < 2.5
+    assert _gone(pid)  # its group was ended and it was reaped
+    assert not monitor.busy
+    monitor.request()  # closed: nothing more runs
+    assert not monitor.busy
+    assert cu.LaunchBudget(tmp_path / "launches.json").launches_in_last_day(time.time()) == 1
+
+
+def test_close_before_any_read_launches_nothing(tmp_path):
+    app = _AppServer(cu.AppServerReply(_reading(56.0, NOW, "app-server"), 2, None))
+    monitor, _reads = _monitor(tmp_path, app=app)
+    assert monitor.close(timeout=1.0) is True
+    monitor.request()
+    assert monitor.tick().reset_credits is None
+    assert app.calls == []

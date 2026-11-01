@@ -2339,6 +2339,12 @@ def create_app(switcher, codex_monitor=None):
             # Outcomes the sync tick has not shown yet (a rejected name) are
             # shown now; after quit nothing would.
             self._drain_rename_outcomes(quitting=True)
+            # A Codex read in flight runs a child in its own session, which
+            # would outlive the app: end it (bounded) before going.
+            try:
+                self._codex.close(timeout=2.0)
+            except Exception:
+                self.switcher._logger.debug("could not close the Codex monitor", exc_info=True)
             self._stop_engine()
             rumps.quit_application()
 

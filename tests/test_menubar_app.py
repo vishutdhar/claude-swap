@@ -1760,6 +1760,12 @@ class _FakeCodex:
         self.state = state  # published before the callback, as the monitor does
         self.on_done(state)
 
+    closed: list = []
+
+    def close(self, timeout=2.0):
+        self.closed = self.closed + [timeout]
+        return True
+
 
 @pytest.fixture
 def codex():
@@ -2045,3 +2051,16 @@ def test_in_place_text_rows_include_codex(capp, codex, cshown, on_screen):
     assert _row(capp).accessibilityPerformPress()
     assert _pump(lambda: not _row(capp).busy)
     assert _account_items(capp)[-1].title().startswith("Codex · 7d 56% · UR 0")
+
+
+def test_quit_closes_the_codex_monitor_first(capp, codex, monkeypatch):
+    seen = []
+    monkeypatch.setattr(rumps, "quit_application", lambda: seen.append(list(codex.closed)))
+    capp.on_quit(None)
+    assert seen == [[2.0]]  # closed, bounded, before the app quits
+
+
+def test_quit_with_the_real_monitor_returns_promptly(app, monkeypatch):
+    quits, _alerts, took = _quit(app, monkeypatch)
+    assert quits == [1] and took < 1.0
+    assert app._codex._closed
