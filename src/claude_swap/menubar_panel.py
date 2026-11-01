@@ -318,25 +318,26 @@ def build_account_panel(entry: tuple, now: float, names_only: bool = False, hold
 
 # ---- the Codex block ---------------------------------------------------------------
 
-def codex_window_row(window: CodexWindow, now: float) -> WindowRow:
-    """A Codex window as a bar row: like an account's row, without pace or roll-forward.
+def codex_window_row(window: CodexWindow, now: float, fetched_at: float | None = None) -> WindowRow:
+    """A Codex window as a bar row: an account's row, paced, never rolled forward.
 
     Codex has no proven fixed cycle, so a window whose reset time has passed
-    is not moved on by a period: it shows 0% and "reset" until the next
-    reading replaces it.
+    is not moved on by a period: it shows 0% and "reset", with no pace tick,
+    until the next reading replaces it. Otherwise the row is built exactly
+    as an account's weekly row, paced by ``pace.compute_pace`` over the
+    window's own length, measured at ``fetched_at`` (the reading's time).
+    That rule hides the tick for a day after a window starts, so a window a
+    day or shorter never shows one, like the accounts' 5h row; without a
+    reset time or a measurement time there is no tick either.
     """
     countdown = _countdown_until(window.resets_at, now) if window.resets_at is not None else None
     if window.resets_at is not None and countdown is None:
         return WindowRow(window.label, 0.0, "0%", RESET_DONE, "ok", None, "")
-    return WindowRow(
-        label=window.label,
-        fraction=_clamp01(window.pct / 100.0),
-        pct_text=f"{window.pct:.0f}%",
-        reset_text=countdown or "",
-        state=usage_state(window.pct),
-        pace_fraction=None,
-        note="",
-    )
+    raw: dict = {"pct": window.pct}
+    if window.resets_at is not None:
+        raw["resets_at"] = datetime.fromtimestamp(window.resets_at, timezone.utc).isoformat()
+    pace_result = pace.compute_pace(raw, fetched_at=fetched_at, period_s=window.window_minutes * 60.0)
+    return _row(window.label, raw, window.pct, now, pace_result)
 
 
 def codex_text_label(name: str, rows, badge_text: str | None, age: str | None) -> str:
@@ -366,7 +367,10 @@ def build_codex_panel(
     alias = alias or None
     name = alias or CODEX_NAME
     plan = (reading.plan_type if reading is not None else None) or ""
-    rows = [codex_window_row(window, now) for window in reading.windows] if reading is not None else []
+    rows = (
+        [codex_window_row(window, now, reading.fetched_at) for window in reading.windows]
+        if reading is not None else []
+    )
     rows = rows or [_unknown(NO_READING)]
     badge_text, badge_state = ur_badge(state.reset_credits, state.credits_known(now))
     age = age_text(reading.fetched_at, now) if reading is not None else None

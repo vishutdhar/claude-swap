@@ -1007,3 +1007,49 @@ def test_account_panel_defaults_unchanged():
     panel = mp.build_account_panel(_entry({"five_hour": {"pct": 10.0}}, num=1), _NOW)
     assert (panel.kind, panel.badge_text, panel.badge_state) == ("account", None, "ok")
     assert mp.accessibility_label(panel).startswith("Account 1, a@x.com")
+
+
+# --- the Codex pace tick (the account weekly rows' rule) ---------------------------------
+
+def _paced(pct, resets_after_fetch, minutes=10080, fetched_age=60.0, now=_NOW):
+    fetched = now - fetched_age
+    window = cu.CodexWindow(cu.window_label(minutes), pct, minutes, fetched + resets_after_fetch)
+    return mp.codex_window_row(window, now, fetched_at=fetched)
+
+
+def test_codex_row_pace_tick_half_elapsed():
+    row = _paced(30.0, 3.5 * 86400)  # half the week left when measured
+    assert row.pace_fraction == pytest.approx(0.5)
+    assert row.ahead is False
+    ahead = _paced(80.0, 3.5 * 86400)  # 80% used at the half-way mark
+    assert ahead.pace_fraction == pytest.approx(0.5) and ahead.ahead is True
+    spent = _paced(100.0, 3.5 * 86400)
+    assert spent.pace_fraction == pytest.approx(0.5) and spent.ahead is False  # over hides ahead, as for accounts
+    assert (row.pct_text, row.reset_text) == ("30%", "3d 11h")  # the rest of the row as before
+
+
+def test_codex_row_no_tick_past_or_unknown_reset():
+    assert _paced(30.0, -120).pace_fraction is None  # passed reset: "reset", no tick
+    unknown = mp.codex_window_row(cu.CodexWindow("7d", 30.0, 10080, None), _NOW, fetched_at=_NOW - 60)
+    assert unknown.pace_fraction is None and unknown.reset_text == ""
+    no_time = mp.codex_window_row(cu.CodexWindow("7d", 30.0, 10080, _NOW + 3 * 86400), _NOW)
+    assert no_time.pace_fraction is None  # no measurement time, no pace
+
+
+def test_codex_row_pace_follows_the_account_suppression():
+    # compute_pace hides the tick for a day after a window starts, as on the
+    # account rows: a weekly window in its first day, and any window a day or
+    # shorter (the 5h one), get none.
+    assert _paced(30.0, 6.5 * 86400).pace_fraction is None
+    assert _paced(30.0, 2 * 3600, minutes=300).pace_fraction is None
+    assert _paced(30.0, 5.5 * 86400).pace_fraction == pytest.approx(1.5 / 7)
+
+
+def test_build_codex_panel_paces_against_the_readings_time():
+    fetched_age = 2 * 3600.0  # measured two hours ago
+    window = cu.CodexWindow("7d", 80.0, 10080, _NOW - fetched_age + 3.5 * 86400)
+    reading = cu.CodexReading((window,), "pro", _NOW - fetched_age, "rollout")
+    panel = mp.build_codex_panel(cu.CodexState(True, reading, 2, _NOW - 60, None), _NOW)
+    (row,) = panel.rows
+    assert row.pace_fraction == pytest.approx(0.5)  # elapsed at the measurement, not now
+    assert "7 day, 80 percent, ahead of pace, resets in " in mp.accessibility_label(panel)
