@@ -1162,6 +1162,32 @@ def test_equal_timestamp_reservations_count_as_distinct_launches(tmp_path):
     assert results.count(True) == 8
     assert json.loads(path.read_text())["launches"] == [NOW] * 8
     assert cu.LaunchBudget(path).launches_in_last_day(NOW) == 8
-    assert a.launches_in_last_day(NOW) == 8  # its own, in the log and in memory, count once
+    assert a.launches_in_last_day(NOW) == 8  # counted from the log alone
     a.release(NOW)  # one unused reservation taken back: one entry, not all
     assert json.loads(path.read_text())["launches"] == [NOW] * 7
+
+
+# --- the log is the only record of launches (no copy kept in memory) ----------------------
+
+def test_trimmed_future_launches_never_reappear_from_memory(tmp_path):
+    path = tmp_path / "launches.json"
+    fast = cu.LaunchBudget(path)
+    ahead = NOW + 2 * 86400  # its clock two days fast
+    for i in range(8):
+        assert fast.record(ahead + i * HOUR)
+    right = cu.LaunchBudget(path)  # another menu bar, its clock right, trims them
+    assert right.reserve(NOW, manual=False, first_of_process=True)
+    later = ahead + 8 * HOUR  # those dates come round: they were trimmed, they stay gone
+    assert fast.launches_in_last_day(later) == cu.LaunchBudget(path).launches_in_last_day(later) == 0
+    assert fast.reserve(later, manual=False, first_of_process=True)
+
+
+def test_a_trimmed_count_never_reappears_from_memory(tmp_path):
+    path = tmp_path / "launches.json"
+    fast = cu.LaunchBudget(path)
+    fast.save_credits(4, NOW + 2 * 86400)  # reported under a clock two days fast
+    right = cu.LaunchBudget(path)
+    assert right.reserve(NOW, manual=False, first_of_process=True)  # writes the log without it
+    assert "reset_credits" not in json.loads(path.read_text())
+    assert fast.reserve(NOW + 2 * 86400, manual=False, first_of_process=True)
+    assert "reset_credits" not in json.loads(path.read_text())  # not written back from memory

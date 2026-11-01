@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import json
 import math
-from collections import Counter
 import os
 import re
 import selectors
@@ -762,6 +761,12 @@ class LaunchBudget:
     dropped. ``last_failure`` says why the last reservation or record could
     not be written ("launch log unwritable", "launch log busy").
 
+    The log, read under the lock, is the only record: nothing is kept in
+    memory beside it. A copy in memory could only bring back what another
+    menu bar trimmed for a reason (entries a wrong clock dated days ahead),
+    and since no launch goes without a written reservation it is not
+    needed to hold the limits.
+
     Every writer may pass its time as a clock (a callable) rather than a
     number: it is then read inside the lock, after any other writer has
     finished, so a time taken before a long scan cannot make that writer's
@@ -784,8 +789,6 @@ class LaunchBudget:
         self.lock_timeout = lock_timeout
         self.last_failure: str | None = None
         self.last_reserved: float | None = None
-        self._memory: list[float] = []  # launches this process wrote down
-        self._credits: tuple[int | None, float | None] = (None, None)  # the last count saved here
 
     def _read_raw(self) -> dict:
         try:
@@ -817,15 +820,16 @@ class LaunchBudget:
 
         Written under the lock, so it cannot undo a reservation another menu
         bar is writing; when the lock cannot be had the count is not saved
-        this time (the menu still shows it). ``now`` (a number or a clock,
-        read inside the lock; default ``at``) dates the rest of the log.
+        this time (the menu still shows it). A newer count already in the
+        log is kept. ``now`` (a number or a clock, read inside the lock;
+        default ``at``) dates the rest of the log.
         """
-        self._credits = (credits, at)
         lock = self._acquire()
         if lock is None:
             return
         try:
-            self._write(_read_clock(at if now is None else now))
+            now = _read_clock(at if now is None else now)
+            self._write(now, self._recent(now), credits=(credits, at))
         finally:
             lock.release()
 
@@ -841,18 +845,13 @@ class LaunchBudget:
         return None
 
     def _recent(self, now: float) -> list[float]:
-        """Launches inside the rolling day, oldest first, the log and memory merged.
+        """The log's launches inside the rolling day, oldest first.
 
         Two launches in the same second are two launches: nothing is
-        deduplicated. Memory only holds this process's own written launches,
-        which the log holds too, so per time the larger of the two counts is
-        kept (a ``Counter`` union), never their sum. Entries more than
-        ``FUTURE_SLACK_S`` ahead of ``now`` are left out.
+        deduplicated. Entries more than ``FUTURE_SLACK_S`` ahead of ``now``
+        are left out.
         """
-        merged = Counter(self._read()) | Counter(self._memory)
-        return sorted(
-            t for t in merged.elements() if now - t < DAY_S and t - now <= FUTURE_SLACK_S
-        )
+        return sorted(t for t in self._read() if now - t < DAY_S and t - now <= FUTURE_SLACK_S)
 
     def launches_in_last_day(self, now: float) -> int:
         return len(self._recent(now))
@@ -902,8 +901,6 @@ class LaunchBudget:
         ``now`` (a number or a clock, read inside the lock; default ``at``)
         dates the rest of the log.
         """
-        if at in self._memory:
-            self._memory.remove(at)
         lock = self._acquire()
         if lock is None:
             return
@@ -912,7 +909,7 @@ class LaunchBudget:
             launches = self._recent(now)
             if at in launches:
                 launches.remove(at)
-            self._write(now, launches=launches)
+            self._write(now, launches)
         finally:
             lock.release()
 
@@ -931,23 +928,23 @@ class LaunchBudget:
             lock.release()
 
     def _append(self, now: float) -> bool:
-        """Add ``now`` to the log (lock held); counted in memory only once written."""
-        if not self._write(now, extra=(now,)):
+        """Add ``now`` to the log (lock held)."""
+        if not self._write(now, sorted(self._recent(now) + [now])):
             self.last_failure = "launch log unwritable"
             return False
-        self._memory = [t for t in self._memory if now - t < DAY_S] + [now]
         return True
 
-    def _write(self, now: float, extra=(), launches=None) -> bool:
-        """The log as of ``now``: the day's launches (and ``extra``), or ``launches``
-        as given, and the newest known reset count, replaced atomically. False
-        when it could not be written."""
-        if launches is None:
-            launches = sorted(self._recent(now) + list(extra))
+    def _write(self, now: float, launches: list[float], credits=None) -> bool:
+        """Replace the log (lock held, atomically) with ``launches`` and the reset
+        count: ``credits`` (count, time) when given and newer than the log's,
+        else the log's own, when it is valid and not dated ahead of ``now``.
+        False when it could not be written."""
         data: dict = {"launches": launches}
-        saved, mine = self.load_credits(now), self._credits
-        if mine[0] is not None and mine[1] - now <= FUTURE_SLACK_S and (saved[0] is None or mine[1] >= saved[1]):
-            saved = mine
+        saved = self.load_credits(now)
+        if credits is not None and credits[1] - now <= FUTURE_SLACK_S and (
+            saved[0] is None or credits[1] >= saved[1]
+        ):
+            saved = credits
         if saved[0] is not None:
             data["reset_credits"], data["credits_at"] = saved
         tmp = None
