@@ -33,6 +33,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -745,8 +746,13 @@ def _read_clock(now) -> float:
 class LaunchBudget:
     """When ``codex app-server`` may be launched, from a log of recent launches.
 
-    The log (``{"launches": [epoch, ...], "reset_credits": 2, "credits_at":
-    epoch}``) is shared by every menu bar using the backup folder. A launch
+    The log (``{"launches": [{"t": epoch, "id": token}, ...],
+    "reset_credits": 2, "credits_at": epoch}``) is shared by every menu bar
+    using the backup folder. Each launch carries its reservation's own token,
+    so a reservation taken back (``release``) removes only itself, never
+    another menu bar's launch in the same second; counting ignores the
+    tokens. A bare number (the log as earlier builds wrote it) reads as a
+    launch with no token, counted and never released. A launch
     is taken with ``reserve``: under an exclusive lock on a sidecar file
     (``<log>.lock``; the log itself is replaced on every write, so a lock on
     it would not hold), the log is read, the rules decide, and the launch is
@@ -788,7 +794,7 @@ class LaunchBudget:
         self.manual_every = manual_every
         self.lock_timeout = lock_timeout
         self.last_failure: str | None = None
-        self.last_reserved: float | None = None
+        self.last_reservation: str | None = None  # the token of the last reservation written
 
     def _read_raw(self) -> dict:
         try:
@@ -797,11 +803,21 @@ class LaunchBudget:
             return {}
         return raw if isinstance(raw, dict) else {}
 
-    def _read(self) -> list[float]:
+    def _read(self) -> list[tuple[float, str | None]]:
+        """``(time, token)`` for each launch in the log; a bare number has no token."""
         launches = self._read_raw().get("launches")
         if not isinstance(launches, list):
             return []
-        return [t for t in (finite_float(v) for v in launches[-_LOG_KEEP:]) if t is not None]
+        found = []
+        for entry in launches[-_LOG_KEEP:]:
+            if isinstance(entry, dict):
+                t, token = finite_float(entry.get("t")), entry.get("id")
+                token = token if isinstance(token, str) and token else None
+            else:
+                t, token = finite_float(entry), None
+            if t is not None:
+                found.append((t, token))
+        return found
 
     def load_credits(self, now: float | None = None) -> tuple[int | None, float | None]:
         """The saved reset count and when it was reported, or ``(None, None)``.
@@ -844,14 +860,17 @@ class LaunchBudget:
             self.last_failure = "launch log unwritable"
         return None
 
-    def _recent(self, now: float) -> list[float]:
-        """The log's launches inside the rolling day, oldest first.
+    def _recent(self, now: float) -> list[tuple[float, str | None]]:
+        """The log's launches inside the rolling day, as ``(time, token)``, oldest first.
 
         Two launches in the same second are two launches: nothing is
         deduplicated. Entries more than ``FUTURE_SLACK_S`` ahead of ``now``
         are left out.
         """
-        return sorted(t for t in self._read() if now - t < DAY_S and t - now <= FUTURE_SLACK_S)
+        return sorted(
+            (e for e in self._read() if now - e[0] < DAY_S and e[0] - now <= FUTURE_SLACK_S),
+            key=lambda e: e[0],
+        )
 
     def launches_in_last_day(self, now: float) -> int:
         return len(self._recent(now))
@@ -860,7 +879,7 @@ class LaunchBudget:
         """Whether a launch may go now. In order: the daily cap, the first
         launch of this process, a manual one 30 minutes after the last, a
         scheduled one six hours after it."""
-        recent = self._recent(now)
+        recent = [t for t, _token in self._recent(now)]
         if len(recent) >= self.daily_cap:
             return False
         if first_of_process or not recent:
@@ -875,10 +894,11 @@ class LaunchBudget:
         the caller launches only then. ``go()``, when given, is asked last,
         under the lock: False (Show Codex turned off while this waited for
         the lock) writes nothing. ``now`` is a number or a clock read inside
-        the lock. ``last_reserved`` is the time written.
+        the lock. ``last_reservation`` is the written reservation's token,
+        for ``release``.
         """
         self.last_failure = None
-        self.last_reserved = None
+        self.last_reservation = None
         lock = self._acquire()
         if lock is None:
             return False
@@ -888,28 +908,34 @@ class LaunchBudget:
                 return False
             if go is not None and not go():
                 return False
-            if not self._append(now):
+            token = self._append(now)
+            if token is None:
                 return False
-            self.last_reserved = now
+            self.last_reservation = token
             return True
         finally:
             lock.release()
 
-    def release(self, at: float, now=None) -> None:
-        """Take back a reservation that was never used (no child was started). Never raises.
+    def release(self, token: str | None, now=None) -> None:
+        """Take back the reservation ``token`` (its child never started). Never raises.
 
-        ``now`` (a number or a clock, read inside the lock; default ``at``)
-        dates the rest of the log.
+        Only the entry with that token goes: one already trimmed is not
+        looked for under its time, so another menu bar's launch in the same
+        second stays. A launch without a token is never released. ``now`` (a
+        number or a clock, read inside the lock; default the time now) dates
+        the rest of the log.
         """
+        if not token:
+            return
         lock = self._acquire()
         if lock is None:
             return
         try:
-            now = _read_clock(at if now is None else now)
+            now = _read_clock(time.time if now is None else now)
             launches = self._recent(now)
-            if at in launches:
-                launches.remove(at)
-            self._write(now, launches)
+            kept = [entry for entry in launches if entry[1] != token]
+            if len(kept) != len(launches):
+                self._write(now, kept)
         finally:
             lock.release()
 
@@ -923,23 +949,24 @@ class LaunchBudget:
         if lock is None:
             return False
         try:
-            return self._append(_read_clock(now))
+            return self._append(_read_clock(now)) is not None
         finally:
             lock.release()
 
-    def _append(self, now: float) -> bool:
-        """Add ``now`` to the log (lock held)."""
-        if not self._write(now, sorted(self._recent(now) + [now])):
+    def _append(self, now: float) -> str | None:
+        """Add a launch at ``now`` with a new token to the log (lock held); the token, or None."""
+        token = uuid.uuid4().hex
+        if not self._write(now, sorted(self._recent(now) + [(now, token)], key=lambda e: e[0])):
             self.last_failure = "launch log unwritable"
-            return False
-        return True
+            return None
+        return token
 
-    def _write(self, now: float, launches: list[float], credits=None) -> bool:
+    def _write(self, now: float, launches: list[tuple[float, str | None]], credits=None) -> bool:
         """Replace the log (lock held, atomically) with ``launches`` and the reset
         count: ``credits`` (count, time) when given and newer than the log's,
         else the log's own, when it is valid and not dated ahead of ``now``.
         False when it could not be written."""
-        data: dict = {"launches": launches}
+        data: dict = {"launches": [{"t": t, "id": token} for t, token in launches]}
         saved = self.load_credits(now)
         if credits is not None and credits[1] - now <= FUTURE_SLACK_S and (
             saved[0] is None or credits[1] >= saved[1]
@@ -1132,10 +1159,10 @@ class CodexMonitor:
             launch, failure = self._reserve(manual)
         if failure:
             error = failure  # no launch; the badge keeps what it had
-        reserved_at = self.budget.last_reserved if launch else None
+        reservation = self.budget.last_reservation if launch else None
         if launch and not self._wanted():
             # Turned off (or Quit) after the reservation was written: no child.
-            self.budget.release(reserved_at, now=self._clock)
+            self.budget.release(reservation, now=self._clock)
             launch = False
         if launch:
             # Written down before it runs: a launch litters even when it fails.
@@ -1146,7 +1173,7 @@ class CodexMonitor:
             except Exception as exc:  # the client never raises; a backstop
                 reply = AppServerReply(None, None, f"failed: {type(exc).__name__}")
             if reply.error == "aborted" and self._child.launched == launched_before:
-                self.budget.release(reserved_at, now=self._clock)  # stopped before any child started
+                self.budget.release(reservation, now=self._clock)  # stopped before any child started
             error = reply.error
             if error:
                 self._logger.debug("Codex app-server read failed: %s", error)

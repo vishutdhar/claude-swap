@@ -494,7 +494,7 @@ def test_full_budget_recovers_after_clock_rollback(tmp_path):
     fresh = cu.LaunchBudget(path)
     assert fresh.launches_in_last_day(NOW) == 0
     assert fresh.reserve(NOW, manual=False, first_of_process=True)
-    assert json.loads(path.read_text())["launches"] == [NOW]  # written back without them
+    assert _logged(path)["launches"] == [NOW]  # written back without them
 
 
 def test_a_reset_count_dated_ahead_is_not_trusted(tmp_path):
@@ -517,7 +517,7 @@ def test_budget_file_keeps_a_day_only(tmp_path):
     budget = _budget(tmp_path)
     budget.record(NOW - 25 * HOUR)
     budget.record(NOW)
-    saved = json.loads((tmp_path / "launches.json").read_text())
+    saved = _logged(tmp_path / "launches.json")
     assert saved == {"launches": [NOW]}
 
 
@@ -528,7 +528,7 @@ def test_budget_unreadable_file_is_empty(tmp_path, text):
     assert budget.launches_in_last_day(NOW) == 0
     assert budget.may_launch(NOW, manual=False, first_of_process=False)
     budget.record(NOW)
-    assert json.loads((tmp_path / "launches.json").read_text()) == {"launches": [NOW]}
+    assert _logged(tmp_path / "launches.json") == {"launches": [NOW]}
 
 
 def test_budget_refuses_a_launch_it_cannot_write_down(tmp_path):
@@ -825,11 +825,11 @@ def test_budget_saves_and_loads_the_reset_count(tmp_path):
     assert budget.load_credits() == (None, None)
     budget.record(NOW)
     budget.save_credits(2, NOW + 5)
-    assert json.loads(path.read_text()) == {"launches": [NOW], "reset_credits": 2, "credits_at": NOW + 5}
+    assert _logged(path) == {"launches": [NOW], "reset_credits": 2, "credits_at": NOW + 5}
     again = cu.LaunchBudget(path)
     assert again.load_credits() == (2, NOW + 5)
     again.record(NOW + 7 * HOUR)  # a later launch keeps the count
-    assert json.loads(path.read_text()) == {
+    assert _logged(path) == {
         "launches": [NOW, NOW + 7 * HOUR], "reset_credits": 2, "credits_at": NOW + 5,
     }
 
@@ -841,7 +841,7 @@ def test_budget_ignores_a_bad_saved_count(tmp_path, count, at):
     budget = cu.LaunchBudget(path)
     assert budget.load_credits() == (None, None)
     budget.record(NOW)
-    assert json.loads(path.read_text()) == {"launches": [NOW]}  # not carried forward either
+    assert _logged(path) == {"launches": [NOW]}  # not carried forward either
 
 
 def test_monitor_seeds_the_count_from_disk(tmp_path):
@@ -871,11 +871,11 @@ def test_monitor_reply_updates_the_file(tmp_path):
     )
     monitor, _reads = _monitor(tmp_path, app=app, clock=clock)
     assert monitor.tick().reset_credits == 4
-    saved = json.loads(path.read_text())
+    saved = _logged(path)
     assert (saved["reset_credits"], saved["credits_at"]) == (4, NOW)
     clock.now += 7 * HOUR
     monitor.tick()  # a reply without the count leaves the saved one alone
-    saved = json.loads(path.read_text())
+    saved = _logged(path)
     assert (saved["reset_credits"], saved["credits_at"]) == (4, NOW)
     assert saved["launches"] == [NOW, NOW + 7 * HOUR]
     fresh, _ = _monitor(tmp_path, app=app, clock=clock)  # a restart
@@ -1148,7 +1148,7 @@ def test_forward_clock_jump_during_scan_preserves_newer_log_entries(tmp_path):
     monitor.budget._acquire = acquire
     monitor.tick()  # took its time at NOW, before both jumps
     assert len(acquired) == 2 and len(app.calls) == 1  # the reservation, then the count
-    saved = json.loads(path.read_text())
+    saved = _logged(path)
     assert saved["launches"] == [NOW + 599, NOW + 600, NOW + 1199]  # the other's two kept
     assert (saved["reset_credits"], saved["credits_at"]) == (3, NOW + 600)  # the newer count wins
 
@@ -1158,13 +1158,18 @@ def test_forward_clock_jump_during_scan_preserves_newer_log_entries(tmp_path):
 def test_equal_timestamp_reservations_count_as_distinct_launches(tmp_path):
     path = tmp_path / "launches.json"
     a, b = cu.LaunchBudget(path), cu.LaunchBudget(path)
-    results = [(a, b)[i % 2].reserve(NOW, manual=True, first_of_process=True) for i in range(10)]
+    results, tokens = [], []
+    for i in range(10):
+        budget = (a, b)[i % 2]
+        results.append(budget.reserve(NOW, manual=True, first_of_process=True))
+        tokens.append(budget.last_reservation)
     assert results.count(True) == 8
-    assert json.loads(path.read_text())["launches"] == [NOW] * 8
+    assert len({t for t in tokens if t}) == 8  # each launch its own token
+    assert _logged(path)["launches"] == [NOW] * 8
     assert cu.LaunchBudget(path).launches_in_last_day(NOW) == 8
     assert a.launches_in_last_day(NOW) == 8  # counted from the log alone
-    a.release(NOW)  # one unused reservation taken back: one entry, not all
-    assert json.loads(path.read_text())["launches"] == [NOW] * 7
+    a.release(tokens[0], now=NOW)  # one unused reservation taken back: one entry, not all
+    assert _logged(path)["launches"] == [NOW] * 7
 
 
 # --- the log is the only record of launches (no copy kept in memory) ----------------------
@@ -1191,3 +1196,36 @@ def test_a_trimmed_count_never_reappears_from_memory(tmp_path):
     assert "reset_credits" not in json.loads(path.read_text())
     assert fast.reserve(NOW + 2 * 86400, manual=False, first_of_process=True)
     assert "reset_credits" not in json.loads(path.read_text())  # not written back from memory
+
+
+# --- each reservation is its owner's: released by its token, not its time --------------
+
+def _logged(path):
+    """The log with each launch reduced to its time (entries are {"t": time, "id": token})."""
+    data = json.loads(path.read_text())
+    return {**data, "launches": [entry["t"] for entry in data["launches"]]}
+
+
+def test_release_after_clock_trim_preserves_other_process_same_timestamp(tmp_path):
+    path = tmp_path / "launches.json"
+    a, b = cu.LaunchBudget(path), cu.LaunchBudget(path)
+    assert a.reserve(NOW, manual=False, first_of_process=True)
+    unused = a.last_reservation  # taken; its child never starts
+    assert b.reserve(NOW + 2 * 86400, manual=False, first_of_process=True)  # b two days fast: a's entry trimmed
+    assert b.reserve(NOW, manual=False, first_of_process=True)  # b put right: it launches in the same second
+    a.release(unused, now=NOW)  # a takes back its own reservation, which is no longer there
+    assert _logged(path)["launches"] == [NOW]  # b's launch still counts
+    assert cu.LaunchBudget(path).launches_in_last_day(NOW) == 1
+
+
+def test_legacy_bare_entries_count_but_are_never_released(tmp_path):
+    path = tmp_path / "launches.json"
+    path.write_text(json.dumps({"launches": [NOW, NOW]}))  # the log as earlier builds wrote it
+    budget = cu.LaunchBudget(path)
+    assert budget.launches_in_last_day(NOW) == 2
+    budget.release(None, now=NOW)
+    assert budget.launches_in_last_day(NOW) == 2
+    assert budget.reserve(NOW + 7 * HOUR, manual=False, first_of_process=False)
+    entries = json.loads(path.read_text())["launches"]
+    assert [e["id"] for e in entries[:2]] == [None, None] and isinstance(entries[2]["id"], str)
+    assert entries[0] != entries[2]["id"]
