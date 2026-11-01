@@ -975,3 +975,32 @@ def test_oversized_numbers_in_a_reply_and_the_launch_log(tmp_path):
 ])
 def test_finite_float(value, expected):
     assert cu.finite_float(value) == expected
+
+
+# --- Show Codex off stops reads that were already asked for ----------------------------
+
+def test_disable_codex_cancels_queued_and_not_yet_started_reads(tmp_path):
+    gate, started = threading.Event(), threading.Event()
+
+    def slow_rollouts(now):
+        started.set()
+        gate.wait(5)
+        return None
+
+    app = _AppServer(cu.AppServerReply(_reading(56.0, NOW, "app-server"), 2, None))
+    monitor, reads = _monitor(tmp_path, rollouts=slow_rollouts, app=app)
+    monitor.request()  # reading the rollouts; the launch at start would come next
+    assert started.wait(5)
+    monitor.request(manual=True)  # queued behind it
+    monitor.enabled = False  # Show Codex off
+    gate.set()
+    _wait_idle(monitor)
+    assert app.calls == []  # no child after the toggle
+    assert len(reads) == 1  # the queued read was dropped
+    assert cu.LaunchBudget(tmp_path / "launches.json").launches_in_last_day(NOW) == 0  # nor reserved
+    monitor.request()
+    assert not monitor.busy  # off: nothing starts
+    monitor.enabled = True  # on again: the launch at start is still owed
+    monitor.request()
+    _wait_idle(monitor)
+    assert len(app.calls) == 1

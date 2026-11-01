@@ -923,7 +923,9 @@ class CodexMonitor:
     ``tick`` is one synchronous read; ``request`` runs it on a daemon thread,
     one at a time, and a request made while one runs is run once more after
     it (a manual one, Refresh now, stays manual). ``state`` is read without a
-    lock: the worker only ever rebinds it. ``close`` (Quit) ends a read in
+    lock: the worker only ever rebinds it. ``enabled`` off (Show Codex off)
+    drops a queued read, refuses new ones and stops a read already running
+    short of a launch. ``close`` (Quit) ends a read in
     flight, its child included, and stops all reads for good: the worker is
     a daemon thread and the child has its own session, so nothing would end
     them once the app is gone.
@@ -959,6 +961,7 @@ class CodexMonitor:
         self._again_manual = False
         self._on_done = None
         self._closed = False
+        self._enabled = True
         self._abort = threading.Event()  # set by close: a read in flight ends now
         # The count saved before a restart shows at once; the launch at
         # start replaces it, and the day rule dims it if it is too old.
@@ -971,6 +974,18 @@ class CodexMonitor:
     @property
     def state(self) -> CodexState:
         return self._state
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    @enabled.setter
+    def enabled(self, value: bool) -> None:
+        """Show Codex: off drops what is queued; a read running launches nothing more."""
+        with self._lock:
+            self._enabled = bool(value)
+            if not self._enabled:
+                self._again = self._again_manual = False
 
     @property
     def busy(self) -> bool:
@@ -1005,7 +1020,9 @@ class CodexMonitor:
             self._logger.debug("Codex rollout read failed: %s", type(exc).__name__)
         credits, credits_at, error = previous.reset_credits, previous.credits_at, previous.error
         launch, failure = (False, None)
-        if self.binary is not None and not self._closed:
+        # Checked here, right before the launch: Show Codex turned off or
+        # Quit while the rollouts were read starts no child.
+        if self.binary is not None and self._enabled and not self._closed:
             launch, failure = self._reserve(now, manual)
         if failure:
             error = failure  # no launch; the badge keeps what it had
@@ -1061,7 +1078,7 @@ class CodexMonitor:
     def request(self, manual: bool = False, on_done=None) -> None:
         """Run ``tick`` on the worker thread; ``on_done(state)`` runs there after each run."""
         with self._lock:
-            if self._closed:
+            if self._closed or not self._enabled:
                 return
             if on_done is not None:
                 self._on_done = on_done
@@ -1091,7 +1108,7 @@ class CodexMonitor:
                 except Exception:
                     self._logger.debug("Codex read callback failed", exc_info=True)
             with self._lock:
-                if not self._again:
+                if not self._again or not self._enabled or self._closed:
                     self._running = False
                     return
                 manual, self._again, self._again_manual = self._again_manual, False, False

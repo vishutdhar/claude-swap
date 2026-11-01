@@ -1435,6 +1435,7 @@ def create_app(switcher, codex_monitor=None):
                 codex_monitor if codex_monitor is not None
                 else default_codex_monitor(switcher.backup_dir, switcher._logger)
             )
+            self._codex.enabled = self.settings.show_codex  # off: no read runs at all
             self._codex_seen = self._codex.state  # the state last reported (worker thread)
             self._last_codex_log = None  # codex_usage_log_key of the last line logged
             self._setup_native_menu()
@@ -2556,6 +2557,9 @@ def create_app(switcher, codex_monitor=None):
 
         def on_toggle_codex(self, _sender):
             self.settings.show_codex = not self.settings.show_codex
+            # Off also drops a read already asked for and stops one running
+            # short of its launch.
+            self._codex.enabled = self.settings.show_codex
             if self.settings.show_codex:
                 self._request_codex()  # off stopped every read; catch up now
             self._save_and_rebuild()

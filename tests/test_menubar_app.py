@@ -2099,3 +2099,25 @@ def test_codex_row_leaving_preserves_the_in_place_text_refresh(capp, codex, csho
     assert titles[0].startswith("1  a@x.com  5h 55%") and titles[1].startswith("2  b@x.com  5h 66%")
     assert titles[2].startswith("Codex")  # its row stays until the rebuild
     assert capp._rebuild_pending
+
+
+def test_show_codex_toggle_switches_the_monitor(capp, codex, monkeypatch):
+    monkeypatch.setattr(capp.settings, "save", lambda _p: None)
+    assert codex.enabled is True
+    capp.on_toggle_codex(None)
+    assert codex.enabled is False
+    capp.on_toggle_codex(None)
+    assert codex.enabled is True
+
+
+def test_an_app_started_with_codex_off_disables_the_monitor(tmp_path, monkeypatch):
+    menubar.MenuBarSettings(show_codex=False).save(tmp_path / "menubar_settings.json")
+    monkeypatch.setattr(rumps.rumps, "application_support", lambda _name: str(tmp_path))
+    monkeypatch.setattr("claude_swap.snapshot_source.SnapshotSource", _NoFetch)
+    fake = _FakeCodex(_codex_state())
+    built = menubar.create_app(_FakeSwitcher(tmp_path), codex_monitor=fake)
+    try:
+        assert fake.enabled is False and fake.requests == []
+    finally:
+        built.refresh_timer.stop()
+        built.sync_timer.stop()
