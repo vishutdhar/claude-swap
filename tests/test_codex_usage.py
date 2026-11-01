@@ -1249,3 +1249,29 @@ def test_prespawn_abort_preserves_startup_allowance(tmp_path):
     monitor.enabled = True
     state = monitor.tick()  # the read at start is still owed, whatever the six hour cadence says
     assert len(calls) == 2 and state.reset_credits == 2
+
+
+def test_live_credits_become_unknown_after_clock_rollback(tmp_path):
+    fast = NOW + 2 * 86400
+    state = cu.CodexState(True, None, 2, fast, None)  # reported under a clock two days fast
+    assert not state.credits_known(NOW)  # the clock put right: a wrong clock's count
+    assert state.credits_known(fast + 60)
+    assert cu.CodexState(True, None, 2, NOW + 200, None).credits_known(NOW)  # a little ahead is fine
+    # Live, in a running monitor: no restart, no new count since.
+    clock = _Clock(fast)
+    app = _AppServer(
+        cu.AppServerReply(_reading(56.0, fast, "app-server"), 2, None),
+        cu.AppServerReply(_reading(57.0, NOW + 60, "app-server"), None, None),  # no count this time
+    )
+    monitor, _reads = _monitor(tmp_path, app=app, clock=clock)
+    assert monitor.tick().credits_known(clock.now)
+    clock.now = NOW + 60
+    state = monitor.tick()
+    assert state.reset_credits == 2 and not state.credits_known(clock.now)
+    assert cu.ur_badge(state.reset_credits, state.credits_known(clock.now)) == ("UR ?", "unknown")
+
+
+def test_one_rule_for_dated_ahead():
+    assert cu.dated_ahead(NOW + cu.FUTURE_SLACK_S + 1, NOW)
+    assert not cu.dated_ahead(NOW + cu.FUTURE_SLACK_S, NOW)
+    assert not cu.dated_ahead(NOW - 86400, NOW)

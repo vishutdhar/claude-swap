@@ -738,6 +738,13 @@ LOCK_WAIT_S = 2.0  # how long a reservation waits for another menu bar's lock
 FUTURE_SLACK_S = 300.0
 
 
+def dated_ahead(at: float, now: float) -> bool:
+    """Whether a time recorded as ``at`` is further ahead of ``now`` than
+    ``FUTURE_SLACK_S``: written under a wrong clock, so not to be trusted.
+    The one rule for launches, a saved reset count and a live one."""
+    return at - now > FUTURE_SLACK_S
+
+
 def _read_clock(now) -> float:
     """A time given as a number, or read now from a clock (a callable)."""
     return float(now()) if callable(now) else float(now)
@@ -827,7 +834,7 @@ class LaunchBudget:
         """
         raw = self._read_raw()
         count, at = _reset_count(raw.get("reset_credits")), finite_float(raw.get("credits_at"))
-        if count is None or at is None or (now is not None and at - now > FUTURE_SLACK_S):
+        if count is None or at is None or (now is not None and dated_ahead(at, now)):
             return None, None
         return count, at
 
@@ -868,7 +875,7 @@ class LaunchBudget:
         are left out.
         """
         return sorted(
-            (e for e in self._read() if now - e[0] < DAY_S and e[0] - now <= FUTURE_SLACK_S),
+            (e for e in self._read() if now - e[0] < DAY_S and not dated_ahead(e[0], now)),
             key=lambda e: e[0],
         )
 
@@ -968,7 +975,7 @@ class LaunchBudget:
         False when it could not be written."""
         data: dict = {"launches": [{"t": t, "id": token} for t, token in launches]}
         saved = self.load_credits(now)
-        if credits is not None and credits[1] - now <= FUTURE_SLACK_S and (
+        if credits is not None and not dated_ahead(credits[1], now) and (
             saved[0] is None or credits[1] >= saved[1]
         ):
             saved = credits
@@ -1016,11 +1023,13 @@ class CodexState:
     error: str | None  # why the last app-server read failed, if it did
 
     def credits_known(self, now: float) -> bool:
-        """A reset count reported within the last day."""
+        """A reset count reported within the last day, and not dated ahead of
+        the clock (``dated_ahead``: reported under a clock since put right)."""
         return (
             self.reset_credits is not None
             and self.credits_at is not None
             and now - self.credits_at <= CREDITS_FRESH_S
+            and not dated_ahead(self.credits_at, now)
         )
 
 
