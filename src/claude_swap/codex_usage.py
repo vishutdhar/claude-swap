@@ -31,6 +31,7 @@ import signal
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -720,3 +721,177 @@ class LaunchBudget:
                     os.unlink(tmp)
                 except OSError:
                     pass
+
+
+# ---- the monitor: state and its own worker ------------------------------------------
+#
+# Codex reads run on their own thread, never inside the Claude snapshot
+# worker: that worker's in-flight flag drops every refresh asked for while
+# it runs, so a 20 second app-server call there would leave the Claude rows
+# stale after a switch. Like that worker, this one only rebinds a plain
+# attribute for the main thread to read.
+
+CREDITS_FRESH_S = DAY_S  # a reset count older than this is shown as unknown
+
+
+@dataclass(frozen=True)
+class CodexState:
+    """What the menu bar shows for Codex."""
+
+    present: bool  # a codex binary was found or ~/.codex/sessions exists
+    reading: CodexReading | None  # the newest reading seen, from either source
+    reset_credits: int | None  # banked usage resets, from the app-server only
+    credits_at: float | None  # when the app-server last reported the count
+    error: str | None  # why the last app-server read failed, if it did
+
+    def credits_known(self, now: float) -> bool:
+        """A reset count reported within the last day."""
+        return (
+            self.reset_credits is not None
+            and self.credits_at is not None
+            and now - self.credits_at <= CREDITS_FRESH_S
+        )
+
+
+ABSENT = CodexState(False, None, None, None, None)
+
+
+def _newest(*readings: CodexReading | None) -> CodexReading | None:
+    """The reading measured last; on a tie the earlier argument wins."""
+    best = None
+    for reading in readings:
+        if reading is not None and (best is None or reading.fetched_at > best.fetched_at):
+            best = reading
+    return best
+
+
+class CodexMonitor:
+    """Keeps the Codex state current: rollouts every tick, the app-server on budget.
+
+    ``tick`` is one synchronous read; ``request`` runs it on a daemon thread,
+    one at a time, and a request made while one runs is run once more after
+    it (a manual one, Refresh now, stays manual). ``state`` is read without a
+    lock: the worker only ever rebinds it.
+    """
+
+    def __init__(
+        self,
+        sessions_dir: Path,
+        budget: LaunchBudget,
+        binary: Path | None,
+        logger,
+        read_rollouts=newest_rollout_reading,
+        read_app_server=read_rate_limits,
+        clock=time.time,
+        start_thread=None,
+    ):
+        self.sessions_dir = Path(sessions_dir)
+        self.budget = budget
+        self.binary = binary
+        self._logger = logger
+        self._read_rollouts = read_rollouts
+        self._read_app_server = read_app_server
+        self._clock = clock
+        self._start_thread = start_thread or (
+            lambda target: threading.Thread(target=target, daemon=True, name="codex-monitor").start()
+        )
+        self._first_of_process = True  # the launch at start is still owed
+        self._app_reading: CodexReading | None = None
+        self._lock = threading.Lock()
+        self._running = False
+        self._again = False
+        self._again_manual = False
+        self._on_done = None
+        self._state = CodexState(self._present(), None, None, None, None)
+
+    @property
+    def state(self) -> CodexState:
+        return self._state
+
+    @property
+    def busy(self) -> bool:
+        """A read is running or queued."""
+        return self._running
+
+    def _present(self) -> bool:
+        if self.binary is not None:
+            return True
+        try:
+            return self.sessions_dir.is_dir()
+        except OSError:
+            return False
+
+    def tick(self, manual: bool = False) -> CodexState:
+        """One read: the rollouts, then the app-server when the budget allows.
+
+        Windows come from the newest of the reply, this tick's rollout
+        reading and the last reading shown; the reset count changes only when
+        a reply carries one. Failures are logged at debug and kept as
+        ``error``; nothing raises.
+        """
+        if not self._present():
+            self._state = ABSENT
+            return ABSENT
+        now = self._clock()
+        previous = self._state
+        rollout = None
+        try:
+            rollout = self._read_rollouts(self.sessions_dir, now)
+        except Exception as exc:
+            self._logger.debug("Codex rollout read failed: %s", type(exc).__name__)
+        credits, credits_at, error = previous.reset_credits, previous.credits_at, previous.error
+        if self.binary is not None and self.budget.may_launch(now, manual, self._first_of_process):
+            self.budget.record(now)  # counted before it runs: a launch litters even when it fails
+            self._first_of_process = False
+            try:
+                reply = self._read_app_server(self.binary)
+            except Exception as exc:  # the client never raises; a backstop
+                reply = AppServerReply(None, None, f"failed: {type(exc).__name__}")
+            error = reply.error
+            if error:
+                self._logger.debug("Codex app-server read failed: %s", error)
+            if reply.reading is not None:
+                self._app_reading = reply.reading
+            if reply.reset_credits is not None:
+                credits, credits_at = reply.reset_credits, self._clock()
+        state = CodexState(
+            True, _newest(self._app_reading, rollout, previous.reading), credits, credits_at, error
+        )
+        self._state = state
+        return state
+
+    def request(self, manual: bool = False, on_done=None) -> None:
+        """Run ``tick`` on the worker thread; ``on_done(state)`` runs there after each run."""
+        with self._lock:
+            if on_done is not None:
+                self._on_done = on_done
+            if self._running:
+                self._again = True
+                self._again_manual = self._again_manual or manual
+                return
+            self._running = True
+        try:
+            self._start_thread(lambda: self._run(manual))
+        except Exception:
+            with self._lock:
+                self._running = False
+            self._logger.debug("Codex read could not start", exc_info=True)
+
+    def _run(self, manual: bool) -> None:
+        while True:
+            try:
+                state = self.tick(manual)
+            except Exception:
+                self._logger.debug("Codex read failed", exc_info=True)
+                state = self._state
+            callback = self._on_done
+            if callback is not None:
+                try:
+                    callback(state)
+                except Exception:
+                    self._logger.debug("Codex read callback failed", exc_info=True)
+            with self._lock:
+                if not self._again:
+                    self._running = False
+                    return
+                manual, self._again, self._again_manual = self._again_manual, False, False

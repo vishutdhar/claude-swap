@@ -476,3 +476,207 @@ def test_budget_holds_in_memory_when_the_file_cannot_be_written(tmp_path):
     assert budget.launches_in_last_day(NOW + 1) == 1
     assert not budget.may_launch(NOW + 60, manual=False, first_of_process=False)
     assert [p.name for p in tmp_path.iterdir()] == ["launches.json"]  # no temp file left
+
+
+# --- Task 4: the monitor ------------------------------------------------------------
+
+import logging  # noqa: E402
+import threading  # noqa: E402
+import time  # noqa: E402
+
+
+class _Clock:
+    def __init__(self, now=NOW):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+
+def _reading(pct, fetched_at, source="rollout", plan="pro"):
+    return cu.CodexReading((cu.CodexWindow("7d", pct, 10080, float(RESETS_AT)),), plan, fetched_at, source)
+
+
+class _AppServer:
+    """Answers each launch with the next reply (the last repeats); records launches."""
+
+    def __init__(self, *replies):
+        self.replies = list(replies)
+        self.calls = []
+
+    def __call__(self, binary):
+        self.calls.append(binary)
+        reply = self.replies[min(len(self.calls), len(self.replies)) - 1]
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+
+def _monitor(tmp_path, *, rollouts=None, app=None, binary="codex", sessions=True, clock=None, logger=None):
+    sessions_dir = tmp_path / "sessions"
+    if sessions:
+        sessions_dir.mkdir(exist_ok=True)
+    reads = []
+
+    def read_rollouts(folder, now):
+        reads.append(now)
+        return rollouts(now) if callable(rollouts) else rollouts
+
+    monitor = cu.CodexMonitor(
+        sessions_dir,
+        cu.LaunchBudget(tmp_path / "launches.json"),
+        Path(binary) if binary else None,
+        logger or logging.getLogger("claude-swap"),
+        read_rollouts=read_rollouts,
+        read_app_server=app or _AppServer(cu.AppServerReply(None, None, "not used")),
+        clock=clock or _Clock(),
+    )
+    return monitor, reads
+
+
+def test_monitor_absent_codex_is_not_present_and_quiet(tmp_path, caplog):
+    app = _AppServer(cu.AppServerReply(_reading(5, NOW, "app-server"), 2, None))
+    monitor, reads = _monitor(tmp_path, app=app, binary=None, sessions=False)
+    assert monitor.state.present is False
+    with caplog.at_level(logging.DEBUG, logger="claude-swap"):
+        for _ in range(3):
+            state = monitor.tick()
+    assert state == cu.CodexState(False, None, None, None, None)
+    assert app.calls == [] and reads == []
+    assert caplog.records == []
+
+
+def test_monitor_present_but_empty(tmp_path):
+    monitor, reads = _monitor(tmp_path, rollouts=None, binary=None)
+    state = monitor.tick()
+    assert state.present is True and state.reading is None and state.reset_credits is None
+    assert len(reads) == 1
+
+
+def test_monitor_merges_newest_source(tmp_path):
+    clock = _Clock()
+    rollout = _reading(70.0, NOW + 30)  # measured after the app-server answered
+    app = _AppServer(cu.AppServerReply(_reading(56.0, NOW, "app-server"), 2, None))
+    monitor, _reads = _monitor(tmp_path, rollouts=rollout, app=app, clock=clock)
+    state = monitor.tick()
+    assert state.reading is rollout
+    assert (state.reset_credits, state.credits_at, state.error) == (2, NOW, None)
+    # And the other way round: an older rollout record loses to the reply.
+    (tmp_path / "b").mkdir()
+    monitor2, _ = _monitor(tmp_path / "b", rollouts=_reading(70.0, NOW - 30), app=app, clock=clock)
+    assert monitor2.tick().reading.source == "app-server"
+
+
+def test_monitor_keeps_the_last_reading_when_the_rollouts_have_none(tmp_path):
+    clock = _Clock()
+    answers = {"value": _reading(40.0, NOW)}
+    monitor, _reads = _monitor(tmp_path, rollouts=lambda now: answers["value"], binary=None, clock=clock)
+    first = monitor.tick().reading
+    answers["value"] = None  # the five newest files hold no limits yet
+    clock.now += 60
+    assert monitor.tick().reading is first
+
+
+def test_monitor_keeps_credits_when_reply_lacks_them(tmp_path):
+    clock = _Clock()
+    app = _AppServer(
+        cu.AppServerReply(_reading(56.0, NOW, "app-server"), 3, None),
+        cu.AppServerReply(_reading(57.0, NOW + 7 * HOUR, "app-server"), None, None),
+        cu.AppServerReply(None, None, "timeout"),
+    )
+    monitor, _reads = _monitor(tmp_path, app=app, clock=clock)
+    assert monitor.tick().reset_credits == 3
+    clock.now += 7 * HOUR
+    state = monitor.tick()
+    assert len(app.calls) == 2
+    assert (state.reset_credits, state.credits_at) == (3, NOW)  # kept, with its own time
+    assert state.reading.windows[0].pct == 57.0
+    clock.now += 7 * HOUR
+    state = monitor.tick()
+    assert (state.reset_credits, state.error) == (3, "timeout")
+    assert state.reading.windows[0].pct == 57.0  # a failed launch keeps the last reading
+
+
+def test_monitor_credits_known_for_a_day():
+    state = cu.CodexState(True, None, 2, NOW, None)
+    assert state.credits_known(NOW + 24 * HOUR)
+    assert not state.credits_known(NOW + 24 * HOUR + 1)
+    assert not cu.CodexState(True, None, None, None, None).credits_known(NOW)
+
+
+def test_monitor_respects_budget(tmp_path):
+    clock = _Clock()
+    app = _AppServer(cu.AppServerReply(_reading(56.0, NOW, "app-server"), 2, None))
+    monitor, reads = _monitor(tmp_path, app=app, clock=clock)
+    monitor.tick()
+    clock.now += 10
+    monitor.tick()
+    assert len(app.calls) == 1 and len(reads) == 2  # one launch, every tick reads the rollouts
+    clock.now += 29 * 60
+    monitor.tick(manual=True)
+    assert len(app.calls) == 1  # Refresh now inside the half hour keeps the last count
+    clock.now += 60
+    monitor.tick(manual=True)
+    assert len(app.calls) == 2
+    assert cu.LaunchBudget(tmp_path / "launches.json").launches_in_last_day(clock.now) == 2
+
+
+def test_monitor_errors_do_not_raise(tmp_path, caplog):
+    app = _AppServer(RuntimeError("boom"))
+
+    def broken(now):
+        raise OSError("disk gone")
+
+    monitor, _reads = _monitor(tmp_path, rollouts=broken, app=app)
+    with caplog.at_level(logging.DEBUG, logger="claude-swap"):
+        state = monitor.tick()
+    assert state.present and state.reading is None
+    assert state.error == "failed: RuntimeError"
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("Codex rollout read failed" in m for m in messages)
+    assert any("Codex app-server read failed: failed: RuntimeError" in m for m in messages)
+    assert all(r.levelno == logging.DEBUG for r in caplog.records)
+
+
+def _wait_idle(monitor, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while monitor.busy and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not monitor.busy
+
+
+def test_monitor_request_runs_once_and_queues_once(tmp_path):
+    monitor, _reads = _monitor(tmp_path, binary=None)
+    gate, started = threading.Event(), threading.Event()
+    runs, done = [], []
+    real_tick = monitor.tick
+
+    def slow_tick(manual=False):
+        runs.append(manual)
+        if len(runs) == 1:
+            started.set()
+            gate.wait(5)
+        return real_tick(manual)
+
+    monitor.tick = slow_tick
+    monitor.request(on_done=lambda state: done.append(threading.current_thread() is threading.main_thread()))
+    assert started.wait(5)
+    monitor.request()
+    monitor.request(manual=True)
+    monitor.request()
+    gate.set()
+    _wait_idle(monitor)
+    assert runs == [False, True]  # two runs in all; the queued one is manual
+    assert done == [False, False]  # on_done after each run, on the worker thread
+
+
+def test_monitor_request_survives_a_failing_callback(tmp_path):
+    monitor, _reads = _monitor(tmp_path, binary=None)
+
+    def bad(_state):
+        raise RuntimeError("callback broke")
+
+    monitor.request(on_done=bad)
+    _wait_idle(monitor)
+    monitor.request()
+    _wait_idle(monitor)  # still accepts work
