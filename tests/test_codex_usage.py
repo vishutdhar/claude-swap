@@ -385,3 +385,94 @@ def test_tests_never_find_the_real_codex():
     # conftest's guard: whatever this Mac has installed, no test finds it.
     assert cu.default_codex_dirs() == []
     assert cu.find_codex_binary() is None
+
+
+# --- Task 3: the launch budget ------------------------------------------------------
+
+HOUR = 3600.0
+
+
+def _budget(tmp_path, name="launches.json"):
+    return cu.LaunchBudget(tmp_path / name)
+
+
+def test_budget_first_of_process(tmp_path):
+    budget = _budget(tmp_path)
+    assert budget.may_launch(NOW, manual=False, first_of_process=True)
+    budget.record(NOW)
+    # A restart right after a launch still gets its one launch at start.
+    assert budget.may_launch(NOW + 1, manual=False, first_of_process=True)
+    assert not budget.may_launch(NOW + 1, manual=False, first_of_process=False)
+
+
+def test_budget_with_no_launches_logged_may_launch(tmp_path):
+    assert _budget(tmp_path).may_launch(NOW, manual=False, first_of_process=False)
+
+
+def test_budget_scheduled_every_six_hours(tmp_path):
+    budget = _budget(tmp_path)
+    budget.record(NOW)
+    assert not budget.may_launch(NOW + 6 * HOUR - 1, manual=False, first_of_process=False)
+    assert budget.may_launch(NOW + 6 * HOUR, manual=False, first_of_process=False)
+
+
+def test_budget_manual_every_thirty_minutes(tmp_path):
+    budget = _budget(tmp_path)
+    budget.record(NOW)
+    assert not budget.may_launch(NOW + 29 * 60, manual=True, first_of_process=False)
+    assert budget.may_launch(NOW + 30 * 60, manual=True, first_of_process=False)
+    assert not budget.may_launch(NOW + 30 * 60, manual=False, first_of_process=False)
+
+
+def test_budget_daily_cap_eight(tmp_path):
+    budget = _budget(tmp_path)
+    for i in range(8):
+        budget.record(NOW + i * HOUR)
+    assert budget.launches_in_last_day(NOW + 7 * HOUR) == 8
+    later = NOW + 7 * HOUR + 31 * 60
+    for manual, first in ((True, False), (False, True), (True, True)):
+        assert not budget.may_launch(later, manual=manual, first_of_process=first)  # the ninth
+    # Once the first launch is a day old there is room again.
+    assert budget.may_launch(NOW + 24 * HOUR, manual=True, first_of_process=False)
+
+
+def test_budget_counts_a_launch_dated_ahead_as_just_made(tmp_path):
+    budget = _budget(tmp_path)
+    budget.record(NOW + HOUR)  # the clock was set back since
+    assert budget.launches_in_last_day(NOW) == 1
+    assert not budget.may_launch(NOW, manual=True, first_of_process=False)
+
+
+def test_budget_persists_across_instances(tmp_path):
+    _budget(tmp_path).record(NOW)
+    again = _budget(tmp_path)
+    assert again.launches_in_last_day(NOW + 1) == 1
+    assert not again.may_launch(NOW + 1, manual=False, first_of_process=False)
+
+
+def test_budget_file_keeps_a_day_only(tmp_path):
+    budget = _budget(tmp_path)
+    budget.record(NOW - 25 * HOUR)
+    budget.record(NOW)
+    saved = json.loads((tmp_path / "launches.json").read_text())
+    assert saved == {"launches": [NOW]}
+
+
+@pytest.mark.parametrize("text", ["{ not json", "[1, 2]", '{"launches": "x"}', '{"launches": [true, "1", null]}'])
+def test_budget_unreadable_file_is_empty(tmp_path, text):
+    (tmp_path / "launches.json").write_text(text)
+    budget = _budget(tmp_path)
+    assert budget.launches_in_last_day(NOW) == 0
+    assert budget.may_launch(NOW, manual=False, first_of_process=False)
+    budget.record(NOW)
+    assert json.loads((tmp_path / "launches.json").read_text()) == {"launches": [NOW]}
+
+
+def test_budget_holds_in_memory_when_the_file_cannot_be_written(tmp_path):
+    blocked = tmp_path / "launches.json"
+    blocked.mkdir()  # a folder where the file should be: every write fails
+    budget = cu.LaunchBudget(blocked)
+    budget.record(NOW)  # never raises
+    assert budget.launches_in_last_day(NOW + 1) == 1
+    assert not budget.may_launch(NOW + 60, manual=False, first_of_process=False)
+    assert [p.name for p in tmp_path.iterdir()] == ["launches.json"]  # no temp file left

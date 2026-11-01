@@ -30,6 +30,7 @@ import selectors
 import signal
 import stat
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -633,3 +634,89 @@ def _converse(binary: Path, timeout: float, now: float | None, env: dict | None)
         session.finish(graceful)
     reading, credits = parse_rate_limits_result(result, time.time() if now is None else now)
     return AppServerReply(reading, credits, None)
+
+
+# ---- the launch budget ---------------------------------------------------------
+#
+# Each ``codex app-server`` launch leaves a folder in ~/.codex/.tmp, so
+# launches are few: one when the menu bar starts, then one every six hours
+# for the reset count (it changes over days), and Refresh now may add one
+# at most every half hour. Never more than eight in any 24 hours, counted
+# from a small log on disk so a restart cannot reset the count.
+
+DAY_S = 24 * 3600.0
+_LOG_KEEP = 64  # entries read from the log at most; it holds a day's launches
+
+
+class LaunchBudget:
+    """When ``codex app-server`` may be launched, from a log of recent launches.
+
+    The log (``{"launches": [epoch, ...]}``) is read on every question, so
+    two menu bars sharing a backup folder share one budget, and every
+    launch is also kept in memory, so a log that cannot be written never
+    lifts the limits. A launch dated ahead of the clock (the clock was set
+    back) counts as just made.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        daily_cap: int = 8,
+        scheduled_every: float = 6 * 3600.0,
+        manual_every: float = 1800.0,
+    ):
+        self.path = Path(path)
+        self.daily_cap = daily_cap
+        self.scheduled_every = scheduled_every
+        self.manual_every = manual_every
+        self._memory: list[float] = []
+
+    def _read(self) -> list[float]:
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        launches = raw.get("launches") if isinstance(raw, dict) else None
+        if not isinstance(launches, list):
+            return []
+        return [t for t in (_number(v) for v in launches[-_LOG_KEEP:]) if t is not None]
+
+    def _recent(self, now: float) -> list[float]:
+        """Launches inside the rolling day, oldest first, the log and memory merged."""
+        return sorted(t for t in set(self._read()) | set(self._memory) if now - t < DAY_S)
+
+    def launches_in_last_day(self, now: float) -> int:
+        return len(self._recent(now))
+
+    def may_launch(self, now: float, manual: bool, first_of_process: bool) -> bool:
+        """Whether a launch may go now. In order: the daily cap, the first
+        launch of this process, a manual one 30 minutes after the last, a
+        scheduled one six hours after it."""
+        recent = self._recent(now)
+        if len(recent) >= self.daily_cap:
+            return False
+        if first_of_process or not recent:
+            return True
+        since = now - recent[-1]
+        return since >= (self.manual_every if manual else self.scheduled_every)
+
+    def record(self, now: float) -> None:
+        """Count a launch: in memory first, then in the log (atomically). Never raises."""
+        self._memory = [t for t in self._memory if now - t < DAY_S] + [now]
+        launches = self._recent(now)
+        tmp = None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=self.path.name + ".", suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"launches": launches}, f)
+            os.replace(tmp, self.path)
+            tmp = None
+        except OSError:
+            pass
+        finally:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
