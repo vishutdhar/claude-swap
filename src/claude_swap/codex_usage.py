@@ -756,6 +756,13 @@ class CodexState:
 ABSENT = CodexState(False, None, None, None, None)
 
 
+def ur_badge(credits: int | None, known: bool) -> tuple[str, str]:
+    """The usage-resets badge: ("UR 2", "ok"), ("UR 0", "over") or ("UR ?", "unknown")."""
+    if not known or credits is None:
+        return "UR ?", "unknown"
+    return f"UR {credits}", "over" if credits == 0 else "ok"
+
+
 def _newest(*readings: CodexReading | None) -> CodexReading | None:
     """The reading measured last; on a tie the earlier argument wins."""
     best = None

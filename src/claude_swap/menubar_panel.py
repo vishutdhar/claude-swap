@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from claude_swap import oauth, pace
-from claude_swap.codex_usage import CodexState, CodexWindow
+from claude_swap.codex_usage import CodexState, CodexWindow, ur_badge
 from claude_swap.json_output import DEAD_LOGIN_SENTINELS
 from claude_swap.menubar import (
     GuardHold,
@@ -337,13 +337,6 @@ def codex_window_row(window: CodexWindow, now: float) -> WindowRow:
         pace_fraction=None,
         note="",
     )
-
-
-def ur_badge(credits: int | None, known: bool) -> tuple[str, str]:
-    """The usage-resets badge: ("UR 2", "ok"), ("UR 0", "over") or ("UR ?", "unknown")."""
-    if not known or credits is None:
-        return "UR ?", "unknown"
-    return f"UR {credits}", "over" if credits == 0 else "ok"
 
 
 def codex_text_label(name: str, rows, badge_text: str | None, age: str | None) -> str:

@@ -32,6 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from claude_swap import pace
+from claude_swap.codex_usage import CodexState, ur_badge
 from claude_swap.exceptions import (
     AccountNotFoundError,
     ClaudeSwitchError,
@@ -39,7 +40,7 @@ from claude_swap.exceptions import (
     LockError,
 )
 from claude_swap.locking import FileLock
-from claude_swap.models import clean_alias_text
+from claude_swap.models import clean_alias_text, normalize_alias
 from claude_swap.switcher import SENTINEL_NOTES
 
 ICON = "⇄"
@@ -110,6 +111,9 @@ class MenuBarSettings:
     auto_switch_enabled: bool = False
     show_usage_bars: bool = True  # draw each account as a panel of usage bars
     show_names_only: bool = False  # an aliased account shows its alias without the email
+    show_codex: bool = True  # the Codex block after the accounts; off stops every Codex read
+    title_codex: bool = True  # append Codex's weekly pct and usage resets to the title
+    codex_alias: str = ""  # the Codex block's name; empty is "Codex" (display only)
 
     @classmethod
     def load(cls, path: Path) -> "MenuBarSettings":
@@ -445,18 +449,66 @@ def _local_part(email: str, limit: int = 12) -> str:
     return local
 
 
+CODEX_NAME = "Codex"
+
+
+def codex_alias_name(text: str) -> str | None:
+    """The Codex block's alias as stored, when the account alias rule accepts it.
+
+    The rename prompt only ever stores names ``normalize_alias`` accepts; a
+    name edited into the settings file by hand is held to the same rule, and
+    anything it refuses (or an empty name) shows as "Codex".
+    """
+    try:
+        return normalize_alias(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def codex_title_segments(
+    settings: MenuBarSettings, codex: CodexState | None, alias: str | None, now: float
+) -> list[str]:
+    """The title's Codex segments: ``["Codex 56%", "UR 2"]``, or none.
+
+    Shown with the block and "Codex in title" on, once there is a reading.
+    The percentage is the longest window's (the weekly one today); a window
+    whose reset time has passed drops it, never rolled forward, and the name
+    and the usage-resets count stay.
+    """
+    if not (settings.show_codex and settings.title_codex) or codex is None or codex.reading is None:
+        return []
+    name = alias or CODEX_NAME
+    windows = codex.reading.windows
+    window = max(windows, key=lambda w: w.window_minutes) if windows else None
+    passed = window is not None and window.resets_at is not None and _countdown_until(window.resets_at, now) is None
+    head = f"{name} {window.pct:.0f}%" if window is not None and not passed else name
+    badge, _state = ur_badge(codex.reset_credits, codex.credits_known(now))
+    return [head, badge]
+
+
 def format_title(
     active_email: str | None,
     active_usage: dict | str | None,
     settings: MenuBarSettings,
     now: float | None = None,
     alias: str | None = None,
+    codex: CodexState | None = None,
+    codex_alias: str | None = None,
 ) -> str:
-    """Build the menu-bar title from the active account and settings."""
-    if active_email is None:
-        return ICON
+    """Build the menu-bar title from the active account, Codex and settings."""
     if now is None:
         now = time.time()
+    segments: list[str] = []
+    if active_email is not None:
+        segments.extend(_claude_title_segments(active_email, active_usage, settings, now, alias))
+    segments.extend(codex_title_segments(settings, codex, codex_alias, now))
+    if not segments:
+        return ICON
+    return f"{ICON} " + " · ".join(segments)
+
+
+def _claude_title_segments(active_email, active_usage, settings, now, alias) -> list[str]:
+    """The active Claude account's title segments: name, windows, model limits."""
     segments: list[str] = []
     if settings.show_account_name:
         segments.append(alias if alias else _local_part(active_email))
@@ -477,9 +529,7 @@ def format_title(
             window = _rolled_weekly_window(window, now)
             if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)) and window.get("name"):
                 segments.append(f"{window['name']} {window['pct']:.0f}%")
-    if not segments:
-        return ICON
-    return f"{ICON} " + " · ".join(segments)
+    return segments
 
 
 def format_usage_log(email: str, usage: dict | str | None) -> str | None:
