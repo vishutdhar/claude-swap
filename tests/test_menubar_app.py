@@ -2066,7 +2066,7 @@ def test_quit_with_the_real_monitor_returns_promptly(app, monkeypatch):
     assert app._codex._closed
 
 
-def test_codex_height_change_preserves_claude_in_place_refresh(capp, codex, cshown, on_screen):
+def test_codex_height_change_preserves_the_account_in_place_refresh(capp, codex, cshown, on_screen):
     cshown(_Source(_AFTER))
     items = list(capp.menu._menu.itemArray())
     views = [i.view() for i in _account_items(capp)]
@@ -2123,7 +2123,7 @@ def test_an_app_started_with_codex_off_disables_the_monitor(tmp_path, monkeypatc
         built.sync_timer.stop()
 
 
-def test_codex_finishes_after_claude_repaints_open_menu(capp, codex, cshown, on_screen):
+def test_codex_finishing_after_the_account_read_repaints_the_open_menu(capp, codex, cshown, on_screen):
     cshown(_Source(_AFTER))
     items = list(capp.menu._menu.itemArray())
     views = [i.view() for i in _account_items(capp)]
