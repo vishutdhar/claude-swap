@@ -1050,3 +1050,75 @@ def test_close_kills_the_childs_group_itself_when_the_worker_is_stuck(tmp_path, 
     assert killed == [(4242, cu.signal.SIGKILL)]
     group.reaping()
     assert group.kill() is False  # reaped: its group id is no longer ours to signal
+
+
+# --- Show Codex off while a launch is being reserved --------------------------------------
+
+def test_disable_during_budget_reservation_prevents_spawn(tmp_path):
+    from claude_swap.locking import FileLock
+
+    # 1. Off while the worker waits for another menu bar's lock: nothing is written or started.
+    app = _AppServer(cu.AppServerReply(_reading(56.0, NOW, "app-server"), 2, None))
+    monitor, _reads = _monitor(tmp_path, app=app)
+    waiting = threading.Event()
+    real_acquire = monitor.budget._acquire
+
+    def acquire():
+        waiting.set()
+        return real_acquire()
+
+    monitor.budget._acquire = acquire
+    holder = FileLock(monitor.budget.lock_path)
+    assert holder.acquire()
+    try:
+        monitor.request()
+        assert waiting.wait(5)
+        monitor.enabled = False
+    finally:
+        holder.release()
+    _wait_idle(monitor)
+    assert app.calls == []
+    assert cu.LaunchBudget(tmp_path / "launches.json").launches_in_last_day(NOW) == 0
+
+
+@posix_only
+def test_disable_right_after_the_reservation_releases_it_unused(tmp_path):
+    # 2. Off between the written reservation and the launch: no child, and
+    # the reservation is taken back, so it does not count.
+    server, log = _server(tmp_path, "ok")
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    budget = cu.LaunchBudget(tmp_path / "launches.json")
+    monitor = cu.CodexMonitor(sessions, budget, server, logging.getLogger("claude-swap"),
+                              read_rollouts=lambda folder, now: None)
+    real_reserve = budget.reserve
+
+    def reserve(*args, **kwargs):
+        taken = real_reserve(*args, **kwargs)
+        monitor.enabled = False  # the toggle lands just after
+        return taken
+
+    budget.reserve = reserve
+    monitor.tick()
+    assert not log.exists()  # never launched
+    assert cu.LaunchBudget(tmp_path / "launches.json").launches_in_last_day(time.time()) == 0
+
+
+@posix_only
+def test_disable_during_a_read_ends_the_child(tmp_path):
+    # 3. Off with the child already running: it is ended at once (it counts:
+    # it was launched).
+    server, log = _server(tmp_path, "hang")
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    monitor = cu.CodexMonitor(sessions, cu.LaunchBudget(tmp_path / "launches.json"), server,
+                              logging.getLogger("claude-swap"), read_rollouts=lambda folder, now: None)
+    monitor.request()
+    assert _wait_for(lambda: "initialize" in _methods(log))
+    pid = _pid(log)
+    monitor.enabled = False
+    _wait_idle(monitor, timeout=2.0)
+    assert _gone(pid)
+    assert monitor.state.error == "aborted"
+    monitor.enabled = True  # on again: reads work as before
+    assert not monitor._abort.is_set()

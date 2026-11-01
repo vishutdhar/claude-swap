@@ -772,6 +772,7 @@ class LaunchBudget:
         self.manual_every = manual_every
         self.lock_timeout = lock_timeout
         self.last_failure: str | None = None
+        self.last_reserved: float | None = None
         self._memory: list[float] = []  # launches this process wrote down
         self._credits: tuple[int | None, float | None] = (None, None)  # the last count saved here
 
@@ -852,18 +853,43 @@ class LaunchBudget:
         since = now - recent[-1]
         return since >= (self.manual_every if manual else self.scheduled_every)
 
-    def reserve(self, now: float, manual: bool, first_of_process: bool) -> bool:
+    def reserve(self, now: float, manual: bool, first_of_process: bool, go=None) -> bool:
         """Decide and write down a launch in one locked step. Never raises.
 
         True only when the rules allow it and the reservation is in the log;
-        the caller launches only then.
+        the caller launches only then. ``go()``, when given, is asked last,
+        under the lock: False (Show Codex turned off while this waited for
+        the lock) writes nothing. ``last_reserved`` is the time written.
         """
         self.last_failure = None
+        self.last_reserved = None
         lock = self._acquire()
         if lock is None:
             return False
         try:
-            return self.may_launch(now, manual, first_of_process) and self._append(now)
+            if not self.may_launch(now, manual, first_of_process):
+                return False
+            if go is not None and not go():
+                return False
+            if not self._append(now):
+                return False
+            self.last_reserved = now
+            return True
+        finally:
+            lock.release()
+
+    def release(self, at: float) -> None:
+        """Take back a reservation that was never used (no child was started). Never raises."""
+        if at in self._memory:
+            self._memory.remove(at)
+        lock = self._acquire()
+        if lock is None:
+            return
+        try:
+            launches = self._recent(at)
+            if at in launches:
+                launches.remove(at)
+            self._write(at, launches=launches)
         finally:
             lock.release()
 
@@ -886,10 +912,13 @@ class LaunchBudget:
         self._memory = [t for t in self._memory if now - t < DAY_S] + [now]
         return True
 
-    def _write(self, now: float, extra=()) -> bool:
-        """The log as of ``now``: the day's launches (and ``extra``) and the newest
-        known reset count, replaced atomically. False when it could not be written."""
-        data: dict = {"launches": sorted(set(self._recent(now)) | set(extra))}
+    def _write(self, now: float, extra=(), launches=None) -> bool:
+        """The log as of ``now``: the day's launches (and ``extra``), or ``launches``
+        as given, and the newest known reset count, replaced atomically. False
+        when it could not be written."""
+        if launches is None:
+            launches = sorted(set(self._recent(now)) | set(extra))
+        data: dict = {"launches": launches}
         saved, mine = self.load_credits(now), self._credits
         if mine[0] is not None and mine[1] - now <= FUTURE_SLACK_S and (saved[0] is None or mine[1] >= saved[1]):
             saved = mine
@@ -1029,11 +1058,17 @@ class CodexMonitor:
 
     @enabled.setter
     def enabled(self, value: bool) -> None:
-        """Show Codex: off drops what is queued; a read running launches nothing more."""
+        """Show Codex. Off drops what is queued, and sets the abort: a reservation
+        still waiting for its lock writes nothing, one written but unused is
+        taken back, and a child already running is ended. On clears it again
+        (unless closed)."""
         with self._lock:
             self._enabled = bool(value)
             if not self._enabled:
                 self._again = self._again_manual = False
+                self._abort.set()
+            elif not self._closed:
+                self._abort.clear()
 
     @property
     def busy(self) -> bool:
@@ -1074,13 +1109,21 @@ class CodexMonitor:
             launch, failure = self._reserve(now, manual)
         if failure:
             error = failure  # no launch; the badge keeps what it had
+        reserved_at = self.budget.last_reserved if launch else None
+        if launch and not self._wanted():
+            # Turned off (or Quit) after the reservation was written: no child.
+            self.budget.release(reserved_at)
+            launch = False
         if launch:
             # Written down before it runs: a launch litters even when it fails.
             self._first_of_process = False
+            launched_before = self._child.launched
             try:
                 reply = self._read_app_server(self.binary, abort=self._abort, child=self._child)
             except Exception as exc:  # the client never raises; a backstop
                 reply = AppServerReply(None, None, f"failed: {type(exc).__name__}")
+            if reply.error == "aborted" and self._child.launched == launched_before:
+                self.budget.release(reserved_at)  # stopped before any child started
             error = reply.error
             if error:
                 self._logger.debug("Codex app-server read failed: %s", error)
@@ -1095,11 +1138,15 @@ class CodexMonitor:
         self._state = state
         return state
 
+    def _wanted(self) -> bool:
+        """Reads may still launch: Show Codex is on and Quit has not closed the monitor."""
+        return self._enabled and not self._closed
+
     def _reserve(self, now: float, manual: bool) -> tuple[bool, str | None]:
         """``(True, None)`` with a written reservation for a launch now; else
         ``(False, why)``, why being None when the rules simply say not yet.
         A failure is logged at debug once, not on every tick it repeats."""
-        if self.budget.reserve(now, manual, self._first_of_process):
+        if self.budget.reserve(now, manual, self._first_of_process, go=self._wanted):
             self._logged_failure = None
             return True, None
         failure = self.budget.last_failure
