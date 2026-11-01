@@ -532,6 +532,51 @@ def _claude_title_segments(active_email, active_usage, settings, now, alias) -> 
     return segments
 
 
+CODEX_LAUNCH_LOG = "menubar_codex_launches.json"  # beside the menu bar settings
+CODEX_RENAME_SPACES = "Names cannot contain spaces; use - or _"
+
+
+def default_codex_monitor(backup_dir: Path, logger):
+    """The Codex monitor the menu bar runs: ~/.codex/sessions, the CLI on its
+    usual paths, and the launch budget's log beside the menu bar settings."""
+    from claude_swap.codex_usage import CodexMonitor, LaunchBudget, find_codex_binary
+
+    try:
+        sessions = Path.home() / ".codex" / "sessions"
+    except RuntimeError:  # no home directory: no rollouts to read
+        sessions = Path("/nonexistent/.codex/sessions")
+    return CodexMonitor(sessions, LaunchBudget(Path(backup_dir) / CODEX_LAUNCH_LOG), find_codex_binary(), logger)
+
+
+def codex_usage_log_key(state: CodexState | None, now: float):
+    """De-dupe key for the Codex usage line: each window's pct and the badge.
+
+    Like the Claude key, it leaves out the reading's age and reset times, so
+    an idle account is not logged again on every read.
+    """
+    if state is None or state.reading is None:
+        return None
+    badge, _state = ur_badge(state.reset_credits, state.credits_known(now))
+    return tuple((w.label, w.pct) for w in state.reading.windows), badge
+
+
+def format_codex_usage_log(state: CodexState | None, now: float) -> str | None:
+    """"usage codex: 7d 56% (resets Nov 4 10:12) · UR 2", or None without a reading."""
+    if state is None or state.reading is None:
+        return None
+    from claude_swap.oauth import reset_clock_string
+
+    parts = []
+    for window in state.reading.windows:
+        seg = f"{window.label} {window.pct:.0f}%"
+        if window.resets_at is not None:
+            when = datetime.fromtimestamp(window.resets_at, timezone.utc)
+            seg += f" (resets {reset_clock_string(when, datetime.fromtimestamp(now, timezone.utc))})"
+        parts.append(seg)
+    parts.append(ur_badge(state.reset_credits, state.credits_known(now))[0])
+    return "usage codex: " + " · ".join(parts)
+
+
 def format_usage_log(email: str, usage: dict | str | None) -> str | None:
     """A log line of an account's session (5h) and weekly (7d) limits.
 
@@ -1314,11 +1359,12 @@ def plain_text_entry(prompt) -> None:
         field.setAutomaticTextCompletionEnabled_(False)
 
 
-def create_app(switcher):
+def create_app(switcher, codex_monitor=None):
     """Build the menu bar app for ``switcher`` without starting its event loop.
 
     ``run`` starts it; tests drive the returned app directly (rebuilds, the
-    sync tick, panel activation) with a fake switcher.
+    sync tick, panel activation) with a fake switcher. ``codex_monitor``
+    replaces the Codex monitor (``default_codex_monitor``), for tests.
     """
     import rumps
 
@@ -1382,6 +1428,15 @@ def create_app(switcher):
             self._press_pending = False
             self._refresh_row = None  # the Refresh now row's view in the current menu
             self._shown_rows: list = []  # (number, item) of the current menu's account rows
+            # Codex runs on its own worker (see codex_usage), never in the
+            # snapshot worker above. Its reads publish a state; the app only
+            # marks the menu dirty when that state changed.
+            self._codex = (
+                codex_monitor if codex_monitor is not None
+                else default_codex_monitor(switcher.backup_dir, switcher._logger)
+            )
+            self._codex_seen = self._codex.state  # the state last reported (worker thread)
+            self._last_codex_log = None  # codex_usage_log_key of the last line logged
             self._setup_native_menu()
             self.rebuild_menu()
             # Background display refresh on the user's interval, plus a fast
@@ -1391,6 +1446,8 @@ def create_app(switcher):
             self.sync_timer = rumps.Timer(self.on_sync_tick, 1)
             self.sync_timer.start()
             self.refresh_async()  # first display fetch
+            if self.settings.show_codex:
+                self._request_codex()  # first Codex read: the rollouts, and the launch at start
             if self.settings.auto_switch_enabled:
                 self._start_engine()
 
@@ -1473,6 +1530,10 @@ def create_app(switcher):
                 return  # the row already says Refreshing…
             self._press_pending = True
             self._show_refreshing(True)
+            if self.settings.show_codex:
+                # Its own worker; the launch budget decides whether this one
+                # may start the app-server (at most once per half hour).
+                self._request_codex(manual=True)
             if self._refreshing:
                 # One worker at a time: the reading asked for runs as soon as
                 # the one in flight reports back.
@@ -1539,19 +1600,15 @@ def create_app(switcher):
             after the menu closes draws this same snapshot, submenus included.
             """
             from claude_swap import menubar_panel_view as pv
-            from claude_swap.menubar_panel import build_account_panel, fits_in_place
+            from claude_swap.menubar_panel import CODEX_KEY, fits_in_place
 
+            codex = self._codex_shown()  # read once, as the snapshot is
             rows = self._shown_rows
             entries = list(snap["accounts"])
             views = [item._menuitem.view() for _num, item in rows]
             holds = snap.get("holds")
             if views and all(isinstance(view, pv.CswapUsagePanelView) for view in views):
-                now = time.time()
-                names_only = self.settings.show_names_only
-                panels = [
-                    build_account_panel(entry, now, names_only=names_only, holds=holds)
-                    for entry in entries
-                ]
+                panels = [panel for _key, panel in self._panels_for(snap, codex, time.time())]
                 layout = pv.PanelLayout(panels)
                 if not fits_in_place(
                     [(view.panel.num, view.frame().size.height) for view in views],
@@ -1561,15 +1618,21 @@ def create_app(switcher):
                 for view, panel in zip(views, panels):
                     pv.update_panel_view(view, panel, layout)
             elif all(view is None for view in views):
+                sources = [(entry[0], entry) for entry in entries]
+                if codex is not None:
+                    sources.append((CODEX_KEY, codex))
                 if not fits_in_place(
-                    [(num, None) for num, _item in rows], [(entry[0], None) for entry in entries]
+                    [(num, None) for num, _item in rows], [(key, None) for key, _source in sources]
                 ):
                     return False
-                for (_num, item), entry in zip(rows, entries):
-                    self._label_text_row(item, entry, holds)
+                for (_num, item), (key, source) in zip(rows, sources):
+                    if key == CODEX_KEY:
+                        self._label_codex_row(item, source)
+                    else:
+                        self._label_text_row(item, source, holds)
             else:
                 return False
-            self._set_title(snap)
+            self._set_title(snap, codex)
             return True
 
         def _log_usage(self, snap):
@@ -1590,6 +1653,76 @@ def create_app(switcher):
 
         def on_refresh_tick(self, _timer):
             self.refresh_async()
+            if self.settings.show_codex:
+                self._request_codex()
+
+        # ---- Codex -----------------------------------------------------------
+        def _request_codex(self, manual=False):
+            """Start (or queue) a Codex read on its own worker. Never raises."""
+            try:
+                self._codex.request(manual=manual, on_done=self._on_codex_done)
+            except Exception:
+                self.switcher._logger.debug("could not start a Codex read", exc_info=True)
+
+        def _on_codex_done(self, state):
+            """A Codex read ended (the Codex worker thread): log it, and redraw on a change.
+
+            Only plain attributes are written here; the sync tick rebuilds.
+            """
+            self._log_codex_usage(state)
+            if state != self._codex_seen:
+                self._codex_seen = state
+                self._dirty = True
+
+        def _log_codex_usage(self, state):
+            now = time.time()
+            key = codex_usage_log_key(state, now)
+            if key is None or key == self._last_codex_log:
+                return
+            line = format_codex_usage_log(state, now)
+            if line:
+                self.switcher._logger.info(line)
+                self._last_codex_log = key
+
+        def _codex_shown(self):
+            """The Codex state to draw, read once per draw; None when the block is hidden."""
+            if not self.settings.show_codex:
+                return None
+            state = self._codex.state
+            return state if state.present else None
+
+        def _codex_alias(self):
+            return codex_alias_name(self.settings.codex_alias)
+
+        def _codex_panel(self, codex, now):
+            from claude_swap.menubar_panel import build_codex_panel
+
+            return build_codex_panel(
+                codex, now, alias=self._codex_alias(), names_only=self.settings.show_names_only
+            )
+
+        def _panels_for(self, snap, codex, now):
+            """``(key, panel)`` for every row the menu shows, in order: the accounts, then Codex."""
+            from claude_swap.menubar_panel import CODEX_KEY, build_account_panel
+
+            names_only = self.settings.show_names_only
+            holds = snap.get("holds")
+            keyed = [
+                (entry[0], build_account_panel(entry, now, names_only=names_only, holds=holds))
+                for entry in snap["accounts"]
+            ]
+            if codex is not None:
+                keyed.append((CODEX_KEY, self._codex_panel(codex, now)))
+            return keyed
+
+        def _label_codex_row(self, item, codex):
+            """The Codex text row: its title, no checkmark, and the spoken label."""
+            from claude_swap.menubar_panel import accessibility_label
+
+            panel = self._codex_panel(codex, time.time())
+            item.title = panel.text_label
+            item.state = 0
+            item._menuitem.setAccessibilityTitle_(accessibility_label(panel))
 
         def on_sync_tick(self, _timer):
             if self._dirty or (self._rebuild_pending and not self._menu_open):
@@ -1707,7 +1840,8 @@ def create_app(switcher):
             # Read once: a worker refresh can replace self.snapshot at any
             # moment, and every part of this menu must describe one snapshot.
             snap = self.snapshot
-            self._set_title(snap)
+            codex = self._codex_shown()  # likewise read once
+            self._set_title(snap, codex)
             # Stop a rumps memory leak: rumps registers each menu item's callback
             # in the process-global NSApp._ns_to_py_and_callback, but Menu.clear()
             # never removes them, so rebuilding the whole menu on every refresh
@@ -1722,7 +1856,7 @@ def create_app(switcher):
             if _reg is not None:
                 purge_menu_callbacks(_reg, self.menu._menu)
             self.menu.clear()
-            account_items = self._account_items(snap)
+            account_items = self._account_items(snap, codex)
             refresh_item = rumps.MenuItem("Refresh now", callback=self.on_refresh_now)
             self._attach_refresh_row(refresh_item)
 
@@ -1737,22 +1871,25 @@ def create_app(switcher):
                 None,
                 self._add_menu(rumps),
                 self._disable_menu(rumps, snap),
-                self._rename_menu(rumps, snap),
+                self._rename_menu(rumps, snap, codex),
                 self._remove_menu(rumps, snap),
                 rumps.MenuItem("Refresh current credentials", callback=self.on_refresh_creds),
                 self._history_menu(rumps),
                 None,
-                self._settings_menu(rumps),
+                # Refresh now, the frequent action, is kept off Quit.
                 refresh_item,
+                self._settings_menu(rumps),
                 rumps.MenuItem("Quit", callback=self.on_quit),
             ]
 
-        def _set_title(self, snap):
+        def _set_title(self, snap, codex=None):
             self.title = format_title(
                 snap["active_email"],
                 snap["active_usage"],
                 self.settings,
                 alias=snap.get("active_alias"),
+                codex=codex,
+                codex_alias=self._codex_alias(),
             )
 
         def _attach_refresh_row(self, item):
@@ -1793,43 +1930,47 @@ def create_app(switcher):
                 holds=holds,
             ))
 
-        def _account_items(self, snap):
-            """One row per account: a text row, drawn as a usage panel when enabled."""
-            rows = []  # (account number, item)
+        def _account_items(self, snap, codex=None):
+            """One row per account, then the Codex block when shown: text rows,
+            drawn as usage panels when enabled. The Codex row is not a switch
+            (no callback)."""
+            from claude_swap.menubar_panel import CODEX_KEY
+
+            rows = []  # (account number or CODEX_KEY, item)
             holds = snap.get("holds")
             for entry in snap["accounts"]:
                 num = entry[0]
                 item = rumps.MenuItem(str(num), callback=self._make_switch_to(num))
                 self._label_text_row(item, entry, holds)
                 rows.append((num, item))
+            head = [] if rows else [rumps.MenuItem("No managed accounts", callback=None)]
+            if codex is not None:
+                item = rumps.MenuItem(CODEX_NAME, callback=None)
+                self._label_codex_row(item, codex)
+                rows.append((CODEX_KEY, item))
             self._shown_rows = rows
             if not rows:
-                return [rumps.MenuItem("No managed accounts", callback=None)]
+                return head
             if (
                 self.settings.show_usage_bars
                 and not self._bars_broken
                 and self._account_target is not None
             ):
-                self._attach_usage_bars(rows, snap["accounts"], holds)
-            return [item for _num, item in rows]
+                self._attach_usage_bars(rows, snap, codex)
+            return head + [item for _num, item in rows]
 
-        def _attach_usage_bars(self, rows, accounts, holds=None):
-            """Draw every account row as a usage panel, or leave them all as text.
+        def _attach_usage_bars(self, rows, snap, codex=None):
+            """Draw every row (accounts, then Codex) as a usage panel, or leave them all as text.
 
-            Panels are paired with rows by account number. Any failure here
-            (building, attaching, installing the delegate) is rolled back by
-            ``attach_usage_panels`` to the exact text rows.
+            Panels are paired with rows by account number (the Codex row by
+            its key). Any failure here (building, attaching, installing the
+            delegate) is rolled back by ``attach_usage_panels`` to the exact
+            text rows.
             """
             try:
                 from claude_swap import menubar_panel_view as pv
-                from claude_swap.menubar_panel import build_account_panel
 
-                now = time.time()
-                names_only = self.settings.show_names_only
-                panels = {
-                    entry[0]: build_account_panel(entry, now, names_only=names_only, holds=holds)
-                    for entry in accounts
-                }
+                panels = dict(self._panels_for(snap, codex, time.time()))
                 pv.attach_usage_panels(
                     [(item, panels[num]) for num, item in rows],
                     target=self._account_target,
@@ -1923,7 +2064,7 @@ def create_app(switcher):
                 menu.add(item)
             return menu
 
-        def _rename_menu(self, rumps, snap):
+        def _rename_menu(self, rumps, snap, codex=None):
             menu = rumps.MenuItem("Rename account")
             accounts = snap["accounts"]
             if not accounts:
@@ -1940,7 +2081,47 @@ def create_app(switcher):
                     title,
                     callback=self._make_rename(num, email, alias, snap.get("orgs", {}).get(num)),
                 ))
+            if codex is not None:
+                # Last, while the block is shown. Its name is the menu bar's
+                # own setting, not the account store's: no lock, no worker.
+                menu.add(rumps.MenuItem(
+                    account_identity(CODEX_NAME, self._codex_alias()), callback=self._make_codex_rename()
+                ))
             return menu
+
+        def _make_codex_rename(self):
+            def cb(_sender):
+                # An accessory app is not frontmost; bring it forward or the
+                # prompt can render blank (as with "From setup-token…").
+                import AppKit
+                AppKit.NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+                prompt = rumps.Window(
+                    title="Rename Codex",
+                    message="Name for the Codex block. Leave empty to use Codex.",
+                    default_text=self._codex_alias() or "",
+                    ok="Rename", cancel="Cancel", dimensions=(320, 24),
+                )
+                plain_text_entry(prompt)
+                response = prompt.run()
+                if response.clicked != 1:
+                    return
+                self._rename_codex(response.text)
+            return cb
+
+        def _rename_codex(self, text):
+            """Name the Codex block by the account alias rule; empty is "Codex" again."""
+            name = clean_alias_text(text)
+            if name:
+                if any(ch.isspace() for ch in name):
+                    rumps.alert(title="claude-swap", message=CODEX_RENAME_SPACES)
+                    return
+                try:
+                    name = normalize_alias(name)
+                except ValueError as e:
+                    rumps.alert(title="claude-swap", message=str(e))
+                    return
+            self.settings.codex_alias = name
+            self._save_and_rebuild()
 
         def _history_menu(self, rumps):
             menu = rumps.MenuItem("Switch history")
@@ -1986,6 +2167,14 @@ def create_app(switcher):
             names_item = rumps.MenuItem("Show names only", callback=self.on_toggle_names_only)
             names_item.state = 1 if self.settings.show_names_only else 0
             menu.add(names_item)
+
+            codex_item = rumps.MenuItem("Show Codex", callback=self.on_toggle_codex)
+            codex_item.state = 1 if self.settings.show_codex else 0
+            menu.add(codex_item)
+
+            codex_title_item = rumps.MenuItem("Codex in title", callback=self.on_toggle_title_codex)
+            codex_title_item.state = 1 if self.settings.title_codex else 0
+            menu.add(codex_title_item)
 
             interval = rumps.MenuItem("Refresh interval")
             labels = {30: "30 seconds", 60: "60 seconds", 300: "5 minutes"}
@@ -2335,6 +2524,16 @@ def create_app(switcher):
 
         def on_toggle_names_only(self, _sender):
             self.settings.show_names_only = not self.settings.show_names_only
+            self._save_and_rebuild()
+
+        def on_toggle_codex(self, _sender):
+            self.settings.show_codex = not self.settings.show_codex
+            if self.settings.show_codex:
+                self._request_codex()  # off stopped every read; catch up now
+            self._save_and_rebuild()
+
+        def on_toggle_title_codex(self, _sender):
+            self.settings.title_codex = not self.settings.title_codex
             self._save_and_rebuild()
 
         def on_toggle_scoped(self, _sender):

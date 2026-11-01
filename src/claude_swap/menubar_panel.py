@@ -23,6 +23,7 @@ from claude_swap import oauth, pace
 from claude_swap.codex_usage import CodexState, CodexWindow, ur_badge
 from claude_swap.json_output import DEAD_LOGIN_SENTINELS
 from claude_swap.menubar import (
+    CODEX_NAME,
     GuardHold,
     _countdown_until,
     _live_countdown,
@@ -70,7 +71,6 @@ STATE_SEP = " · "  # joins the state words ("active · held · 28m")
 # The Codex block: one panel after the accounts, keyed by a name that can
 # never be a slot number, so ``fits_in_place`` tells it from every account.
 CODEX_KEY = "codex"
-CODEX_NAME = "Codex"
 NO_READING = "no reading"
 RESET_DONE = "reset"  # a Codex window whose reset time has passed
 BADGE_STATES = ("ok", "over", "unknown")

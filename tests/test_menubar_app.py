@@ -1726,3 +1726,322 @@ def test_a_slow_failed_read_logs_both_its_duration_and_its_failure(app, caplog):
     assert "menubar snapshot took 75s (over 60s)" in lines
     assert any(m.startswith("menubar snapshot failed: TimeoutError at ") for m in lines)
     assert "lock stayed busy" not in " ".join(lines)
+
+
+# --- the Codex block -----------------------------------------------------------------
+
+from claude_swap import codex_usage as cu  # noqa: E402
+from claude_swap import menubar_panel as mp  # noqa: E402
+
+
+def _codex_state(pct=56.0, credits=2, windows=None, reading=True):
+    now = time.time()
+    if not reading:
+        return cu.CodexState(True, None, credits, None if credits is None else now - 60, None)
+    windows = windows or (cu.CodexWindow("7d", pct, 10080, now + 2 * 86400),)
+    found = cu.CodexReading(tuple(windows), "pro", now - 9, "rollout")
+    return cu.CodexState(True, found, credits, None if credits is None else now - 60, None)
+
+
+class _FakeCodex:
+    """Stands in for CodexMonitor: records requests; ``finish`` plays the worker's end."""
+
+    def __init__(self, state):
+        self.state = state
+        self.requests = []
+        self.on_done = None
+
+    def request(self, manual=False, on_done=None):
+        self.requests.append(manual)
+        if on_done is not None:
+            self.on_done = on_done
+
+    def finish(self, state):
+        self.state = state  # published before the callback, as the monitor does
+        self.on_done(state)
+
+
+@pytest.fixture
+def codex():
+    return _FakeCodex(_codex_state())
+
+
+@pytest.fixture
+def capp(tmp_path, monkeypatch, codex):
+    """The app with a Codex monitor stand-in that has a reading."""
+    monkeypatch.setattr(rumps.rumps, "application_support", lambda _name: str(tmp_path))
+    monkeypatch.setattr("claude_swap.snapshot_source.SnapshotSource", _NoFetch)
+    monkeypatch.setattr(rumps, "notification", lambda *a, **k: None)
+    monkeypatch.setattr(rumps, "alert", lambda *a, **k: 1)
+    built = menubar.create_app(_FakeSwitcher(tmp_path), codex_monitor=codex)
+    deadline = time.monotonic() + 5
+    while built._refreshing and time.monotonic() < deadline:
+        time.sleep(0.01)
+    yield built
+    built.refresh_timer.stop()
+    built.sync_timer.stop()
+
+
+@pytest.fixture
+def cshown(capp, monkeypatch):
+    """``shown`` for the app with a Codex block: _BEFORE in an open menu."""
+    monkeypatch.setattr(menubar, "_adapt_snapshot", lambda raw: raw)
+    capp.snapshot = _BEFORE
+    capp.rebuild_menu()
+
+    def use(source):
+        capp._snapshot_source = source
+        _open(capp)
+        return source
+
+    return use
+
+
+def test_bottom_order_refresh_settings_quit(app):
+    app.rebuild_menu()
+    assert _root_titles(app)[-3:] == ["Refresh now", "Settings", "Quit"]
+
+
+def test_the_default_app_finds_no_codex_in_tests(app, tmp_path):
+    # conftest empties the binary search and HOME is a throwaway folder: the
+    # app built without a stand-in sees no Codex at all and launches nothing.
+    from pathlib import Path
+
+    assert app._codex.binary is None
+    assert app._codex.state.present is False
+    assert app._codex.sessions_dir == Path.home() / ".codex" / "sessions"
+    assert app._codex.budget.path == tmp_path / "menubar_codex_launches.json"
+    app.snapshot = _snap(_entry("1", "a@x.com", active=True))
+    app.rebuild_menu()
+    assert [_title_num(i) for i in _account_items(app)] == ["1"]
+
+
+def test_codex_row_after_accounts_when_present(capp, codex):
+    assert codex.requests == [False]  # the first read, right after the first refresh
+    capp.snapshot = _snap(_entry("1", "a@x.com", active=True), _entry("2", "b@x.com"))
+    capp.rebuild_menu()
+    items = _account_items(capp)
+    assert [i.view().panel.num for i in items] == ["1", "2", "codex"]
+    last = items[-1]
+    assert last.title().startswith("Codex · 7d 56% · UR 2")
+    assert last.action() is None and last.state() == 0  # not a switch
+    assert last.view().panel.kind == "codex" and last.view().is_last
+    assert not items[1].view().is_last  # the last account now has its rule
+    assert capp.title.endswith(" · Codex 56% · UR 2")
+
+
+def test_codex_row_is_also_a_text_row(capp):
+    capp.settings.show_usage_bars = False
+    capp.snapshot = _snap(_entry("1", "a@x.com", active=True))
+    capp.rebuild_menu()
+    first, last = _account_items(capp)
+    assert last.view() is None
+    assert last.title().startswith("Codex · 7d 56% · UR 2 · ")
+    assert last.action() is None and last.state() == 0
+    assert last.accessibilityTitle().startswith("Codex, pro, ")
+
+
+def test_codex_row_without_accounts(capp):
+    capp.snapshot = _snap()
+    capp.rebuild_menu()
+    titles = [i.title() for i in _account_items(capp)]
+    assert titles[0] == "No managed accounts" and titles[1].startswith("Codex")
+
+
+def test_codex_row_hidden_when_absent_or_setting_off(capp, codex, monkeypatch):
+    monkeypatch.setattr(capp.settings, "save", lambda _p: None)
+    capp.snapshot = _snap(_entry("1", "a@x.com", active=True))
+    codex.state = cu.ABSENT
+    capp.rebuild_menu()
+    assert [_title_num(i) for i in _account_items(capp)] == ["1"]
+    assert "Codex" not in capp.title
+    codex.state = _codex_state()
+    capp.on_toggle_codex(None)  # off
+    assert capp.settings.show_codex is False
+    assert [_title_num(i) for i in _account_items(capp)] == ["1"]
+    assert "Codex" not in capp.title
+    assert "Codex" not in [i.title() for i in _submenu(capp, "Rename account").itemArray()]
+    before = list(codex.requests)
+    capp.on_refresh_tick(None)
+    capp.on_refresh_pressed()
+    assert codex.requests == before  # off stops every Codex read
+    capp.on_toggle_codex(None)  # on again: a read at once
+    assert codex.requests == before + [False]
+    assert _account_items(capp)[-1].view().panel.kind == "codex"
+
+
+def test_settings_menu_has_the_codex_toggles(capp, monkeypatch):
+    monkeypatch.setattr(capp.settings, "save", lambda _p: None)
+    capp.snapshot = _snap(_entry("1", "a@x.com", active=True))
+    capp.rebuild_menu()
+    items = {i.title(): i for i in _submenu(capp, "Settings").itemArray()}
+    assert items["Show Codex"].state() == 1 and items["Codex in title"].state() == 1
+    items["Codex in title"].target().callback_(items["Codex in title"])
+    assert capp.settings.title_codex is False
+    assert "Codex" not in capp.title
+    assert _account_items(capp)[-1].view().panel.kind == "codex"  # the block stays
+
+
+def test_refresh_tick_requests_a_codex_read(capp, codex):
+    capp.on_refresh_tick(None)
+    assert codex.requests == [False, False]
+
+
+def test_refresh_now_requests_a_manual_codex_read(capp, codex):
+    capp.on_refresh_pressed()
+    assert codex.requests == [False, True]
+    _wait_idle(capp)
+
+
+def test_codex_done_marks_dirty_and_rebuilds(capp, codex):
+    capp.snapshot = _snap(_entry("1", "a@x.com", active=True))
+    capp.rebuild_menu()
+    capp._dirty = False
+    codex.finish(codex.state)  # nothing changed: no rebuild owed
+    assert capp._dirty is False
+    codex.finish(_codex_state(credits=0))  # on the worker thread in the app
+    assert capp._dirty is True
+    capp.on_sync_tick(None)
+    panel = _account_items(capp)[-1].view().panel
+    assert (panel.badge_text, panel.badge_state) == ("UR 0", "over")
+    assert capp.title.endswith("UR 0")
+
+
+def test_codex_done_logs_usage_once_per_change(capp, codex, caplog):
+    with caplog.at_level(logging.INFO, logger="claude-swap"):
+        codex.finish(_codex_state(pct=56.0))
+        codex.finish(_codex_state(pct=56.0))  # same numbers, a newer reading: not again
+        codex.finish(_codex_state(pct=57.0))
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("usage codex:")]
+    assert len(lines) == 2
+    assert lines[0].startswith("usage codex: 7d 56% (resets ") and lines[0].endswith(" · UR 2")
+    assert lines[1].startswith("usage codex: 7d 57% ")
+
+
+def test_rename_menu_has_codex_entry_and_sets_alias(capp, window, tmp_path):
+    import json
+
+    capp.snapshot = _snap(_entry_alias("1", "a@x.com", "work", active=True))
+    capp.rebuild_menu()
+    entries = _submenu(capp, "Rename account").itemArray()
+    assert [i.title() for i in entries] == ["1  work  (a@x.com)", "Codex"]
+    window.answer = (1, "GPT")
+    _choose_rename(capp, 1)
+    made = window.made[-1]
+    assert (made["title"], made["default_text"]) == ("Rename Codex", "")
+    assert made["message"] == "Name for the Codex block. Leave empty to use Codex."
+    assert capp.settings.codex_alias == "GPT"
+    assert json.loads((tmp_path / "menubar_settings.json").read_text())["codex_alias"] == "GPT"
+    assert _account_items(capp)[-1].title().startswith("GPT · 7d 56%")
+    assert _account_items(capp)[-1].view().panel.name_text == "GPT"
+    assert capp.title.endswith(" · GPT 56% · UR 2")
+    assert [i.title() for i in _submenu(capp, "Rename account").itemArray()][-1] == "GPT  (Codex)"
+    assert getattr(capp.switcher, "renames", []) == []  # the account store is never touched
+    window.answer = (1, "  ")  # empty: back to "Codex"
+    _choose_rename(capp, 1)
+    assert window.made[-1]["default_text"] == "GPT"
+    assert capp.settings.codex_alias == ""
+    assert _account_items(capp)[-1].view().panel.name_text == "Codex"
+
+
+@pytest.mark.parametrize("typed, message", [
+    ("my gpt", "Names cannot contain spaces; use - or _"),
+    ("x@y", "alias 'x@y' contains an unsupported character U+0040 (commercial at)"),
+    ("42", "alias '42' cannot be purely numeric (reserved for slot numbers)"),
+])
+def test_codex_rename_refuses_what_an_account_alias_refuses(capp, window, monkeypatch, typed, message):
+    alerts = []
+    monkeypatch.setattr(rumps, "alert", lambda **kw: alerts.append(kw) or 1)
+    capp.settings.codex_alias = "keep"
+    capp.snapshot = _snap(_entry_alias("1", "a@x.com", None, active=True))
+    capp.rebuild_menu()
+    window.answer = (1, typed)
+    _choose_rename(capp, 1)
+    assert [a["message"] for a in alerts] == [message]
+    assert capp.settings.codex_alias == "keep"
+
+
+def test_codex_rename_cancel_changes_nothing(capp, window):
+    capp.settings.codex_alias = "keep"
+    capp.snapshot = _snap(_entry_alias("1", "a@x.com", None, active=True))
+    capp.rebuild_menu()
+    window.answer = (0, "other")
+    _choose_rename(capp, 1)
+    assert capp.settings.codex_alias == "keep"
+
+
+def test_codex_rename_drops_invisible_characters(capp, window, monkeypatch):
+    monkeypatch.setattr(capp.settings, "save", lambda _p: None)
+    capp.snapshot = _snap(_entry_alias("1", "a@x.com", None, active=True))
+    capp.rebuild_menu()
+    window.answer = (1, "GPT\u200b")
+    _choose_rename(capp, 1)
+    assert capp.settings.codex_alias == "GPT"
+
+
+def test_names_only_hides_the_codex_plan_behind_an_alias(capp, monkeypatch):
+    monkeypatch.setattr(capp.settings, "save", lambda _p: None)
+    capp.settings.codex_alias = "GPT"
+    capp.snapshot = _snap(_entry_alias("1", "a@x.com", None, active=True))
+    capp.on_toggle_names_only(None)
+    panel = _account_items(capp)[-1].view().panel
+    assert (panel.name_text, panel.show_email) == ("GPT", False)
+
+
+def test_a_hand_edited_codex_alias_the_rule_refuses_shows_codex(capp):
+    capp.settings.codex_alias = "has space"
+    capp.snapshot = _snap(_entry("1", "a@x.com", active=True))
+    capp.rebuild_menu()
+    assert _account_items(capp)[-1].view().panel.name_text == "Codex"
+    assert capp.title.endswith(" · Codex 56% · UR 2")
+
+
+def test_the_codex_panel_switches_nothing(capp, queued, on_screen):
+    capp.snapshot = _snap(_entry("1", "a@x.com", active=True))
+    capp.rebuild_menu()
+    _open(capp)
+    view = _account_items(capp)[-1].view()
+    assert not view.accessibilityPerformPress()
+    _click(view)
+    _close(capp)
+    assert queued == [] and capp.switcher.switched == []
+
+
+def test_in_place_repaint_includes_codex_row(capp, codex, cshown, on_screen):
+    source = cshown(_Source(_AFTER))
+    items = list(capp.menu._menu.itemArray())
+    views = [i.view() for i in _account_items(capp)]
+    assert views[-1].panel.badge_text == "UR 2"
+    codex.state = _codex_state(credits=3)  # the Codex read finished first
+    assert _row(capp).accessibilityPerformPress()
+    assert codex.requests[-1] is True
+    assert _pump(lambda: not _row(capp).busy)
+    assert source.takes == [{"full": True, "store_only": False, "fresh": True}]
+    assert list(capp.menu._menu.itemArray()) == items  # nothing swapped under the pointer
+    assert [i.view() for i in _account_items(capp)] == views  # the same views, redrawn
+    assert _pcts(capp)[:2] == ["55%", "66%"]
+    assert views[-1].panel.badge_text == "UR 3"
+    assert capp.title.endswith(" · Codex 56% · UR 3")
+
+
+def test_in_place_repaint_waits_when_the_codex_block_changed_height(capp, codex, cshown, on_screen):
+    cshown(_Source(_AFTER))
+    two = (cu.CodexWindow("5h", 10.0, 300, time.time() + 3600), cu.CodexWindow("7d", 56.0, 10080, time.time() + 86400))
+    codex.state = _codex_state(windows=two)
+    assert _row(capp).accessibilityPerformPress()
+    assert _pump(lambda: not _row(capp).busy)
+    assert capp._rebuild_pending
+    assert len(_account_items(capp)[-1].view().panel.rows) == 1  # left alone until the close
+    _close(capp)
+    capp.on_sync_tick(None)
+    assert [r.label for r in _account_items(capp)[-1].view().panel.rows] == ["5h", "7d"]
+
+
+def test_in_place_text_rows_include_codex(capp, codex, cshown, on_screen):
+    capp.settings.show_usage_bars = False
+    capp.rebuild_menu()
+    cshown(_Source(_AFTER))
+    codex.state = _codex_state(credits=0)
+    assert _row(capp).accessibilityPerformPress()
+    assert _pump(lambda: not _row(capp).busy)
+    assert _account_items(capp)[-1].title().startswith("Codex · 7d 56% · UR 0")
