@@ -20,6 +20,7 @@ import math
 import objc
 from AppKit import (
     NSAccessibilityButtonRole,
+    NSAccessibilityStaticTextRole,
     NSAppearance,
     NSAppearanceNameAqua,
     NSAppearanceNameDarkAqua,
@@ -114,6 +115,18 @@ def _fill_rounded(rect, radius: float, color) -> None:
     NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(NSMakeRect(*rect), radius, radius).fill()
 
 
+def _stroke_rounded(rect, radius: float, color) -> None:
+    """A rounded outline drawn inside ``rect``, half a line in, so it stays crisp."""
+    x, y, w, h = rect
+    half = mp.BADGE_STROKE / 2
+    path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+        NSMakeRect(x + half, y + half, w - mp.BADGE_STROKE, h - mp.BADGE_STROKE), radius, radius
+    )
+    path.setLineWidth_(mp.BADGE_STROKE)
+    color.setStroke()
+    path.stroke()
+
+
 # ---- layout shared by every panel in one menu -----------------------------------------
 
 class PanelLayout:
@@ -137,7 +150,10 @@ class PanelLayout:
             [_width("00h 00m", self.fonts["digits"])]
             + [_width(r.reset_text, self.fonts["digits"]) for r in rows]
         )
-        num_w = max((_width(str(p.num), self.fonts["num"]) for p in panels), default=0.0)
+        # Only accounts have a slot number; the Codex block's key is never drawn.
+        num_w = max(
+            (_width(str(p.num), self.fonts["num"]) for p in panels if p.kind == "account"), default=0.0
+        )
         self._widths = dict(
             label_w=min(self.LABEL_MAX, float(label_w)),
             pct_w=_width("100%", self.fonts["digits"]),
@@ -347,7 +363,12 @@ class CswapUsagePanelView(CswapMenuRowView):
         objc.super(CswapUsagePanelView, self).dealloc()
 
     def _activate(self) -> bool:
-        """Ask the app's target to switch to this panel's account."""
+        """Ask the app's target to switch to this panel's account.
+
+        The Codex block is not an account: it shows usage and switches nothing.
+        """
+        if self.panel is None or self.panel.kind != "account":
+            return False
         target = self.account_target
         return bool(target is not None and target.activate_panel(self))
 
@@ -425,26 +446,52 @@ def _draw_panel(view, dirty) -> None:
         NSBezierPath.fillRect_(NSMakeRect(*mp.hairline_rect(cols, height)))
 
 
+def _badge_color(state: str, ink):
+    """The usage-resets badge's text and outline colour."""
+    if ink.highlighted:
+        return ink.secondary  # the selection's text colour, like everything else
+    if state == "over":
+        return _fill_color("over")
+    if state == "unknown":
+        return ink.tertiary
+    return ink.secondary
+
+
 def _draw_header(panel, layout, cols, ink) -> None:
-    """Slot number, name, email; on the right the state words and the age."""
+    """Slot number, name, email; on the right the state words (or the badge) and the age.
+
+    The Codex block has no slot number; its plan type sits where the email
+    goes and its usage-resets badge before the age, in a rounded outline.
+    """
     fonts, top, h = layout.fonts, mp.TOP_PAD, layout.header_h
 
     def centred(font) -> float:
         return top + (h - _line_h(font)) / 2
 
-    _text(str(panel.num), fonts["num"], ink.tertiary).drawAtPoint_((mp.LEFT_INSET, centred(fonts["num"])))
+    if panel.kind == "account":
+        _text(str(panel.num), fonts["num"], ink.tertiary).drawAtPoint_((mp.LEFT_INSET, centred(fonts["num"])))
 
-    pieces = []  # (text, font), in reading order
+    pieces = []  # (text, font, pill colour or None), in reading order
     for word in panel.state_words:  # "held · 28m" stays one piece
         if word == "active":
             accent = ink.secondary if ink.highlighted else NSColor.controlAccentColor()
-            pieces.append((_text("ACTIVE", fonts["tag"], accent), fonts["tag"]))
+            pieces.append((_text("ACTIVE", fonts["tag"], accent), fonts["tag"], None))
         else:
-            pieces.append((_text(word, fonts["meta"], ink.secondary), fonts["meta"]))
+            pieces.append((_text(word, fonts["meta"], ink.secondary), fonts["meta"], None))
+    if panel.badge_text:
+        color = _badge_color(panel.badge_state, ink)
+        pieces.append((_text(panel.badge_text, fonts["meta"], color), fonts["meta"], color))
     if panel.age_text:
-        pieces.append((_text(panel.age_text, fonts["meta"], ink.tertiary), fonts["meta"]))
-    xs, meta_w = mp.right_run(cols.reset_right, [t.size().width for t, _f in pieces], mp.AGE_GAP)
-    for (text, font), x in zip(pieces, xs):
+        pieces.append((_text(panel.age_text, fonts["meta"], ink.tertiary), fonts["meta"], None))
+    widths = [
+        t.size().width + (2 * mp.BADGE_PAD_X if pill is not None else 0.0) for t, _f, pill in pieces
+    ]
+    xs, meta_w = mp.right_run(cols.reset_right, widths, mp.AGE_GAP)
+    for (text, font, pill), x, w in zip(pieces, xs, widths):
+        if pill is not None:
+            pill_h = _line_h(font) + 2 * mp.BADGE_PAD_Y
+            _stroke_rounded((x, top + (h - pill_h) / 2, w, pill_h), mp.BADGE_RADIUS, pill)
+            x += mp.BADGE_PAD_X
         text.drawAtPoint_((x, centred(font)))
 
     name_font = fonts["title_active"] if panel.is_active else fonts["title"]
@@ -766,8 +813,11 @@ def make_panel_view(panel, layout: PanelLayout, target=None, on_draw_failure=Non
     view.on_draw_failure = on_draw_failure
     view.setAutoresizingMask_(NSViewWidthSizable)  # the menu widens it to its own width
     # An activatable element, read as the account and one sentence per window.
+    # The Codex block switches nothing, so it is read as text, not a button.
     view.setAccessibilityElement_(True)
-    view.setAccessibilityRole_(NSAccessibilityButtonRole)
+    view.setAccessibilityRole_(
+        NSAccessibilityButtonRole if panel.kind == "account" else NSAccessibilityStaticTextRole
+    )
     view.setAccessibilityLabel_(mp.accessibility_label(panel))
     return view
 

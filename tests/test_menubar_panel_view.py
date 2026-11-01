@@ -1381,3 +1381,130 @@ def test_a_failing_call_on_the_main_thread_is_logged_not_raised(caplog):
     with caplog.at_level(logging.DEBUG, logger="claude-swap"):
         pv.call_on_main(boom)
         assert _pump_tracking(lambda: any(r.exc_info for r in caplog.records))
+
+
+# --- the Codex block ------------------------------------------------------------------
+
+from claude_swap import codex_usage as cu  # noqa: E402
+
+
+def _codex_panel(credits=2, credits_age=60.0, alias=None, names_only=False, plan="pro"):
+    window = cu.CodexWindow("7d", 56.0, 10080, _NOW + 2 * 86400)
+    reading = cu.CodexReading((window,), plan, _NOW - 9, "rollout")
+    state = cu.CodexState(True, reading, credits, None if credits is None else _NOW - credits_age, None)
+    return mp.build_codex_panel(state, _NOW, alias=alias, names_only=names_only)
+
+
+def _png(view) -> bytes:
+    rep = _render(view)
+    return bytes(rep.representationUsingType_properties_(AppKit.NSBitmapImageFileTypePNG, {}))
+
+
+def _max_alpha(view, rep, x0, y0, x1, y1):
+    scale = rep.pixelsWide() / view.bounds().size.width
+    return max(
+        rep.colorAtX_y_(x, y).alphaComponent()
+        for x in range(int(x0 * scale), int(x1 * scale))
+        for y in range(int(y0 * scale), int(y1 * scale))
+    )
+
+
+def test_codex_panel_renders_badge_and_no_slot_number():
+    import dataclasses
+
+    account = mp.build_account_panel(
+        ("4", "a@x.com", False, {"seven_day": {"pct": 30.0}}, None, None, False, _NOW - 60), _NOW
+    )
+    codex = _codex_panel()
+    layout = pv.PanelLayout([account, codex])
+    with_badge = pv.make_panel_view(codex, layout)
+    without = pv.make_panel_view(dataclasses.replace(codex, badge_text=None), layout)
+    assert _png(with_badge) != _png(without)
+    # The slot number's column, across the header line: ink for the account,
+    # nothing at all for Codex.
+    box = (mp.LEFT_INSET, mp.TOP_PAD, mp.LEFT_INSET + mp.NUM_COLUMN, mp.TOP_PAD + layout.header_h)
+    account_view = pv.make_panel_view(account, layout)
+    assert _max_alpha(account_view, _render(account_view), *box) > 0.1  # tertiary ink
+    assert _max_alpha(with_badge, _render(with_badge), *box) == 0.0
+
+
+def test_badge_states_render_differently():
+    panels = [_codex_panel(credits=2), _codex_panel(credits=0), _codex_panel(credits=None)]
+    assert [p.badge_state for p in panels] == ["ok", "over", "unknown"]
+    layout = pv.PanelLayout(panels)
+    images = [_png(pv.make_panel_view(p, layout)) for p in panels]
+    assert len(set(images)) == 3
+
+
+def test_codex_header_draws_name_plan_badge_and_age_not_its_key(monkeypatch):
+    calls = _drawn(monkeypatch, _codex_panel())
+    strings = [s for s, _f, _c in calls]
+    for text in ("Codex", "pro", "UR 2", "9s ago"):
+        assert text in strings
+    assert "codex" not in strings  # the key is never drawn as a slot number
+    fonts = pv._fonts()
+    assert [f for s, f, _c in calls if s == "UR 2"][0].isEqual_(fonts["meta"])
+    assert _is(_colour_of(calls, "UR 2"), "secondaryLabelColor")
+    assert _is(_colour_of(calls, "Codex"), "labelColor")
+    assert strings.index("UR 2") < strings.index("9s ago")  # the badge, then the age
+
+
+@pytest.mark.parametrize("credits, colour", [(0, "systemRedColor"), (None, "tertiaryLabelColor")])
+def test_badge_colour_by_state(monkeypatch, credits, colour):
+    calls = _drawn(monkeypatch, _codex_panel(credits=credits))
+    text = "UR 0" if credits == 0 else "UR ?"
+    assert _is(_colour_of(calls, text), colour)
+
+
+def test_highlighted_badge_uses_the_selection_colour(monkeypatch):
+    for credits in (2, 0, None):
+        calls = _drawn(monkeypatch, _codex_panel(credits=credits), highlighted=True)
+        (badge,) = [c for s, _f, c in calls if s.startswith("UR ")]
+        assert _is(badge, "selectedMenuItemTextColor")
+
+
+def test_badge_pill_is_stroked_in_the_badge_colour(monkeypatch):
+    strokes = []
+    real = pv._stroke_rounded
+
+    def spy(rect, radius, color):
+        strokes.append((rect, color))
+        return real(rect, radius, color)
+
+    monkeypatch.setattr(pv, "_stroke_rounded", spy)
+    panel = _codex_panel(credits=0)
+    _render(pv.make_panel_view(panel, pv.PanelLayout([panel])))
+    (rect, color) = strokes[-1]
+    assert _is(color, "systemRedColor")
+    x, y, w, h = rect
+    assert w > pv._width("UR 0", pv._fonts()["meta"]) + mp.BADGE_PAD_X  # the text has room inside
+
+
+def test_codex_panel_does_not_widen_the_gutter():
+    account = mp.build_account_panel(
+        ("1", "a@x.com", False, {"seven_day": {"pct": 30.0}}, None, None, False, _NOW - 60), _NOW
+    )
+    assert pv.PanelLayout([account, _codex_panel()]).columns == pv.PanelLayout([account]).columns
+
+
+def test_codex_panel_is_not_a_switch(run_now, on_screen, switched):
+    menu = _Menu([_codex_panel()], switched.append)
+    view = menu.views[0]
+    assert view.accessibilityRole() != AppKit.NSAccessibilityButtonRole
+    assert view.accessibilityLabel().startswith("Codex, pro")
+    assert not view.accessibilityPerformPress()
+    view.force_highlight = True
+    view.mouseUp_(_mouse_up(view))
+    view.keyDown_(_key_event(36))
+    assert switched == []
+
+
+def test_codex_block_renders_in_both_appearances(tmp_path):
+    account = mp.build_account_panel(
+        ("1", "a@x.com", True, {"five_hour": {"pct": 30.0}}, None, None, False, _NOW - 60), _NOW
+    )
+    for appearance in ("aqua", "darkAqua"):
+        for highlighted in (False, True):
+            path = tmp_path / f"{appearance}-{highlighted}.png"
+            pv.render_png([account, _codex_panel(alias="a-twelve-chr")], str(path), appearance, highlighted=highlighted)
+            assert path.stat().st_size > 1000
