@@ -1166,14 +1166,17 @@ class CodexMonitor:
             launch = False
         if launch:
             # Written down before it runs: a launch litters even when it fails.
-            self._first_of_process = False
+            was_first, self._first_of_process = self._first_of_process, False
             launched_before = self._child.launched
             try:
                 reply = self._read_app_server(self.binary, abort=self._abort, child=self._child)
             except Exception as exc:  # the client never raises; a backstop
                 reply = AppServerReply(None, None, f"failed: {type(exc).__name__}")
             if reply.error == "aborted" and self._child.launched == launched_before:
-                self.budget.release(reservation, now=self._clock)  # stopped before any child started
+                # Stopped before any child started: the reservation is taken
+                # back, and with it, a read at start is still owed.
+                self.budget.release(reservation, now=self._clock)
+                self._first_of_process = was_first
             error = reply.error
             if error:
                 self._logger.debug("Codex app-server read failed: %s", error)

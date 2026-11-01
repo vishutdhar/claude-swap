@@ -1229,3 +1229,23 @@ def test_legacy_bare_entries_count_but_are_never_released(tmp_path):
     entries = json.loads(path.read_text())["launches"]
     assert [e["id"] for e in entries[:2]] == [None, None] and isinstance(entries[2]["id"], str)
     assert entries[0] != entries[2]["id"]
+
+
+def test_prespawn_abort_preserves_startup_allowance(tmp_path):
+    path = tmp_path / "launches.json"
+    assert cu.LaunchBudget(path).record(NOW - 60)  # another menu bar launched a minute ago
+    calls = []
+
+    def app(binary, abort=None, child=None):
+        calls.append(binary)
+        if len(calls) == 1:
+            monitor.enabled = False  # off between the written reservation and the spawn
+            return cu.AppServerReply(None, None, "aborted")  # the client's check: no child started
+        return cu.AppServerReply(_reading(56.0, NOW, "app-server"), 2, None)
+
+    monitor, _reads = _monitor(tmp_path, app=app)
+    monitor.tick()
+    assert cu.LaunchBudget(path).launches_in_last_day(NOW) == 1  # taken back
+    monitor.enabled = True
+    state = monitor.tick()  # the read at start is still owed, whatever the six hour cadence says
+    assert len(calls) == 2 and state.reset_credits == 2
