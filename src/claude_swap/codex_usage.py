@@ -737,6 +737,11 @@ LOCK_WAIT_S = 2.0  # how long a reservation waits for another menu bar's lock
 FUTURE_SLACK_S = 300.0
 
 
+def _read_clock(now) -> float:
+    """A time given as a number, or read now from a clock (a callable)."""
+    return float(now()) if callable(now) else float(now)
+
+
 class LaunchBudget:
     """When ``codex app-server`` may be launched, from a log of recent launches.
 
@@ -755,6 +760,11 @@ class LaunchBudget:
     with its time, and a count or time that does not read back as valid is
     dropped. ``last_failure`` says why the last reservation or record could
     not be written ("launch log unwritable", "launch log busy").
+
+    Every writer may pass its time as a clock (a callable) rather than a
+    number: it is then read inside the lock, after any other writer has
+    finished, so a time taken before a long scan cannot make that writer's
+    newer entries look dated ahead and drop them.
     """
 
     def __init__(
@@ -801,19 +811,20 @@ class LaunchBudget:
             return None, None
         return count, at
 
-    def save_credits(self, credits: int, at: float) -> None:
+    def save_credits(self, credits: int, at: float, now=None) -> None:
         """Keep a reported reset count with its time, beside the launches. Never raises.
 
         Written under the lock, so it cannot undo a reservation another menu
         bar is writing; when the lock cannot be had the count is not saved
-        this time (the menu still shows it).
+        this time (the menu still shows it). ``now`` (a number or a clock,
+        read inside the lock; default ``at``) dates the rest of the log.
         """
         self._credits = (credits, at)
         lock = self._acquire()
         if lock is None:
             return
         try:
-            self._write(at)
+            self._write(_read_clock(at if now is None else now))
         finally:
             lock.release()
 
@@ -859,7 +870,8 @@ class LaunchBudget:
         True only when the rules allow it and the reservation is in the log;
         the caller launches only then. ``go()``, when given, is asked last,
         under the lock: False (Show Codex turned off while this waited for
-        the lock) writes nothing. ``last_reserved`` is the time written.
+        the lock) writes nothing. ``now`` is a number or a clock read inside
+        the lock. ``last_reserved`` is the time written.
         """
         self.last_failure = None
         self.last_reserved = None
@@ -867,6 +879,7 @@ class LaunchBudget:
         if lock is None:
             return False
         try:
+            now = _read_clock(now)
             if not self.may_launch(now, manual, first_of_process):
                 return False
             if go is not None and not go():
@@ -878,29 +891,37 @@ class LaunchBudget:
         finally:
             lock.release()
 
-    def release(self, at: float) -> None:
-        """Take back a reservation that was never used (no child was started). Never raises."""
+    def release(self, at: float, now=None) -> None:
+        """Take back a reservation that was never used (no child was started). Never raises.
+
+        ``now`` (a number or a clock, read inside the lock; default ``at``)
+        dates the rest of the log.
+        """
         if at in self._memory:
             self._memory.remove(at)
         lock = self._acquire()
         if lock is None:
             return
         try:
-            launches = self._recent(at)
+            now = _read_clock(at if now is None else now)
+            launches = self._recent(now)
             if at in launches:
                 launches.remove(at)
-            self._write(at, launches=launches)
+            self._write(now, launches=launches)
         finally:
             lock.release()
 
-    def record(self, now: float) -> bool:
-        """Write down a launch without asking the rules (locked). True when written. Never raises."""
+    def record(self, now) -> bool:
+        """Write down a launch without asking the rules (locked). True when written. Never raises.
+
+        ``now`` is a number or a clock read inside the lock.
+        """
         self.last_failure = None
         lock = self._acquire()
         if lock is None:
             return False
         try:
-            return self._append(now)
+            return self._append(_read_clock(now))
         finally:
             lock.release()
 
@@ -1106,13 +1127,13 @@ class CodexMonitor:
         # Checked here, right before the launch: Show Codex turned off or
         # Quit while the rollouts were read starts no child.
         if self.binary is not None and self._enabled and not self._closed:
-            launch, failure = self._reserve(now, manual)
+            launch, failure = self._reserve(manual)
         if failure:
             error = failure  # no launch; the badge keeps what it had
         reserved_at = self.budget.last_reserved if launch else None
         if launch and not self._wanted():
             # Turned off (or Quit) after the reservation was written: no child.
-            self.budget.release(reserved_at)
+            self.budget.release(reserved_at, now=self._clock)
             launch = False
         if launch:
             # Written down before it runs: a launch litters even when it fails.
@@ -1123,7 +1144,7 @@ class CodexMonitor:
             except Exception as exc:  # the client never raises; a backstop
                 reply = AppServerReply(None, None, f"failed: {type(exc).__name__}")
             if reply.error == "aborted" and self._child.launched == launched_before:
-                self.budget.release(reserved_at)  # stopped before any child started
+                self.budget.release(reserved_at, now=self._clock)  # stopped before any child started
             error = reply.error
             if error:
                 self._logger.debug("Codex app-server read failed: %s", error)
@@ -1131,7 +1152,7 @@ class CodexMonitor:
                 self._app_reading = reply.reading
             if reply.reset_credits is not None:
                 credits, credits_at = reply.reset_credits, self._clock()
-                self.budget.save_credits(credits, credits_at)
+                self.budget.save_credits(credits, credits_at, now=self._clock)
         state = CodexState(
             True, _newest(self._app_reading, rollout, previous.reading), credits, credits_at, error
         )
@@ -1142,11 +1163,12 @@ class CodexMonitor:
         """Reads may still launch: Show Codex is on and Quit has not closed the monitor."""
         return self._enabled and not self._closed
 
-    def _reserve(self, now: float, manual: bool) -> tuple[bool, str | None]:
+    def _reserve(self, manual: bool) -> tuple[bool, str | None]:
         """``(True, None)`` with a written reservation for a launch now; else
         ``(False, why)``, why being None when the rules simply say not yet.
         A failure is logged at debug once, not on every tick it repeats."""
-        if self.budget.reserve(now, manual, self._first_of_process, go=self._wanted):
+        # The clock, not ``now``: the time is read inside the lock (see LaunchBudget).
+        if self.budget.reserve(self._clock, manual, self._first_of_process, go=self._wanted):
             self._logged_failure = None
             return True, None
         failure = self.budget.last_failure

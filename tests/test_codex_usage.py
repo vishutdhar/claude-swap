@@ -1122,3 +1122,32 @@ def test_disable_during_a_read_ends_the_child(tmp_path):
     assert monitor.state.error == "aborted"
     monitor.enabled = True  # on again: reads work as before
     assert not monitor._abort.is_set()
+
+
+# --- the time is read inside the lock ---------------------------------------------------
+
+def test_forward_clock_jump_during_scan_preserves_newer_log_entries(tmp_path):
+    path = tmp_path / "launches.json"
+    clock = _Clock()
+    app = _AppServer(cu.AppServerReply(_reading(56.0, NOW, "app-server"), 3, None))
+    monitor, _reads = _monitor(tmp_path, app=app, clock=clock)  # its log is `path`
+    acquired = []
+    real_acquire = monitor.budget._acquire
+
+    def acquire():
+        # Before each lock this worker takes, the clock jumps ten minutes
+        # ahead and another menu bar, on that clock, writes first.
+        acquired.append(1)
+        clock.now += 600
+        other = cu.LaunchBudget(path)
+        assert other.record(clock.now - 1)
+        if len(acquired) == 1:
+            other.save_credits(5, clock.now - 1)
+        return real_acquire()
+
+    monitor.budget._acquire = acquire
+    monitor.tick()  # took its time at NOW, before both jumps
+    assert len(acquired) == 2 and len(app.calls) == 1  # the reservation, then the count
+    saved = json.loads(path.read_text())
+    assert saved["launches"] == [NOW + 599, NOW + 600, NOW + 1199]  # the other's two kept
+    assert (saved["reset_credits"], saved["credits_at"]) == (3, NOW + 600)  # the newer count wins
