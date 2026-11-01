@@ -18,6 +18,9 @@ import pytest
 from claude_swap import codex_usage as cu
 
 RESETS_AT = 1793774344
+# Links, the executable bit and the fake server (a shell script) are POSIX;
+# the menu bar that uses all this is macOS only.
+posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX links, modes and shell scripts")
 NOW = datetime(2026, 11, 1, 12, 0, 0, tzinfo=timezone.utc).timestamp()
 
 
@@ -120,6 +123,7 @@ def test_read_rollout_tail_reads_only_the_tail(tmp_path):
     assert cu.read_rollout_tail(path).windows[0].pct == 10.0
 
 
+@posix_only
 def test_read_rollout_tail_refuses_symlink(tmp_path):
     real = _rollout(tmp_path / "real", "rollout-a.jsonl", _line(_record()))
     link = tmp_path / "rollout-link.jsonl"
@@ -128,6 +132,7 @@ def test_read_rollout_tail_refuses_symlink(tmp_path):
     assert cu.read_rollout_tail(link) is None
 
 
+@posix_only
 def test_read_rollout_tail_refuses_a_hard_link_and_other_names(tmp_path):
     real = _rollout(tmp_path, "rollout-a.jsonl", _line(_record()))
     os.link(real, tmp_path / "rollout-b.jsonl")
@@ -178,6 +183,7 @@ def test_newest_rollout_reading_looks_back_seven_days_and_reads_five_files(tmp_p
     assert cu.newest_rollout_reading(sessions, NOW, limit=7).windows[0].pct == 66.0
 
 
+@posix_only
 def test_newest_rollout_reading_skips_a_symlinked_day_folder(tmp_path):
     sessions = tmp_path / "sessions"
     elsewhere = _rollout(tmp_path / "elsewhere", "rollout-a.jsonl", _line(_record()))
@@ -282,6 +288,7 @@ def _gone(pid):
     return False
 
 
+@posix_only
 def test_read_rate_limits_ok_sends_only_allowed_methods(tmp_path):
     server, log = _server(tmp_path, "ok")
     reply = cu.read_rate_limits(server, timeout=10, now=NOW)
@@ -295,18 +302,21 @@ def test_read_rate_limits_ok_sends_only_allowed_methods(tmp_path):
     assert _gone(_pid(log))  # reaped, not left behind
 
 
+@posix_only
 def test_read_rate_limits_today_shape(tmp_path):
     server, _log_path = _server(tmp_path, "realshape")
     reply = cu.read_rate_limits(server, timeout=10, now=NOW)
     assert (reply.reading.plan_type, reply.reset_credits, reply.error) == ("pro", 2, None)
 
 
+@posix_only
 def test_read_rate_limits_without_credits(tmp_path):
     server, _log_path = _server(tmp_path, "nocredits")
     reply = cu.read_rate_limits(server, timeout=10, now=NOW)
     assert reply.reading is not None and reply.reset_credits is None and reply.error is None
 
 
+@posix_only
 def test_read_rate_limits_noisy_still_finds_reply(tmp_path):
     server, log = _server(tmp_path, "noisy")
     reply = cu.read_rate_limits(server, timeout=10, now=NOW)
@@ -314,6 +324,7 @@ def test_read_rate_limits_noisy_still_finds_reply(tmp_path):
     assert _methods(log) == ["initialize", "initialized", "account/rateLimits/read"]
 
 
+@posix_only
 def test_read_rate_limits_rpcerror(tmp_path):
     server, _log_path = _server(tmp_path, "rpcerror")
     reply = cu.read_rate_limits(server, timeout=10, now=NOW)
@@ -322,6 +333,7 @@ def test_read_rate_limits_rpcerror(tmp_path):
     assert reply.error == "not logged in as <email>"
 
 
+@posix_only
 def test_read_rate_limits_hang_times_out_and_kills(tmp_path):
     import time
 
@@ -333,6 +345,7 @@ def test_read_rate_limits_hang_times_out_and_kills(tmp_path):
     assert _gone(_pid(log))
 
 
+@posix_only
 def test_read_rate_limits_server_that_exits(tmp_path):
     server, log = _server(tmp_path, "exit")
     reply = cu.read_rate_limits(server, timeout=10, now=NOW)
@@ -340,6 +353,7 @@ def test_read_rate_limits_server_that_exits(tmp_path):
     assert _methods(log) == []
 
 
+@posix_only
 def test_read_rate_limits_caps_its_output(tmp_path):
     server, log = _server(tmp_path, "flood")
     reply = cu.read_rate_limits(server, timeout=10, now=NOW)
@@ -351,6 +365,7 @@ def test_read_rate_limits_never_raises(tmp_path):
     assert cu.read_rate_limits(tmp_path / "no-such-codex", timeout=1).error.startswith("could not start")
 
 
+@posix_only
 def test_the_client_sends_nothing_the_encoder_refuses(tmp_path, monkeypatch):
     # Every line the client writes comes from the encoder, built before the
     # launch: with the read taken off the allowlist, nothing is even started.
@@ -361,6 +376,7 @@ def test_the_client_sends_nothing_the_encoder_refuses(tmp_path, monkeypatch):
     assert not log.exists()
 
 
+@posix_only
 def test_read_rate_limits_puts_the_install_dirs_first_on_path(tmp_path, monkeypatch):
     dirs = [tmp_path / "brew", tmp_path / "local"]
     monkeypatch.setattr(cu, "default_codex_dirs", lambda: dirs)
@@ -370,6 +386,7 @@ def test_read_rate_limits_puts_the_install_dirs_first_on_path(tmp_path, monkeypa
     assert path == f"PATH {dirs[0]}:{dirs[1]}:/usr/bin:/bin"
 
 
+@posix_only
 def test_find_codex_binary(tmp_path):
     empty, plain, good = tmp_path / "empty", tmp_path / "plain", tmp_path / "good"
     for folder in (empty, plain, good):

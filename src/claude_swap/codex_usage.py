@@ -46,6 +46,9 @@ ROLLOUT_DAYS = 7  # day folders looked at, today and the six before it
 # real records never are, and one would otherwise win "newest" for good.
 FUTURE_ALLOWANCE_S = 120.0
 _MAX_WINDOW_MINUTES = 10_000_000
+# Open flags where the platform has them (the menu bar is macOS only; the
+# tests also run on Linux and Windows).
+_OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
 _MAX_EPOCH = 1e11  # past this an epoch is milliseconds or garbage
 
 
@@ -191,7 +194,7 @@ def _read_tail(path: Path, max_bytes: int) -> bytes | None:
         before = os.lstat(path)
         if not _single_regular(before):
             return None
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        fd = os.open(path, _OPEN_FLAGS)
     except OSError:
         return None
     try:
@@ -200,12 +203,12 @@ def _read_tail(path: Path, max_bytes: int) -> bytes | None:
             return None
         offset = max(0, st.st_size - max_bytes)
         chunks, wanted = [], st.st_size - offset
+        os.lseek(fd, offset, os.SEEK_SET)
         while wanted > 0:
-            chunk = os.pread(fd, min(wanted, 65536), offset)
+            chunk = os.read(fd, min(wanted, 65536))
             if not chunk:
                 break
             chunks.append(chunk)
-            offset += len(chunk)
             wanted -= len(chunk)
     except OSError:
         return None
