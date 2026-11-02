@@ -1514,3 +1514,41 @@ def test_a_stale_corrupt_log_self_heals(tmp_path):
     folder.mkdir()  # not a file at all: never written over, however old
     os.utime(folder, (NOW - 25 * HOUR, NOW - 25 * HOUR))
     assert cu.LaunchBudget(folder).reserve(NOW, manual=False, first_of_process=True) is False
+
+
+# --- any read of the log is first contact -------------------------------------------------
+
+def _eight_launch_log(path):
+    entries = [{"t": NOW - (8 - i) * 60, "id": f"t{i}"} for i in range(8)]
+    path.write_text(json.dumps({"launches": entries, "reset_credits": 2, "credits_at": NOW - 600}))
+
+
+def test_delete_after_startup_credit_load_fails_closed(tmp_path):
+    path = tmp_path / "launches.json"
+    _eight_launch_log(path)
+    budget = cu.LaunchBudget(path)
+    assert budget.load_credits(NOW) == (2, NOW - 600)  # the read at start
+    path.unlink()  # gone before the first reservation
+    assert budget.reserve(NOW, manual=False, first_of_process=True) is False  # not a fresh install
+    assert budget.last_failure == "launch log missing"
+    assert not path.exists()
+    # The same through a monitor, which reads the count when it is made.
+    _eight_launch_log(path)
+    app = _AppServer(cu.AppServerReply(_reading(56.0, NOW, "app-server"), 2, None))
+    monitor, _reads = _monitor(tmp_path, app=app)
+    path.unlink()
+    assert monitor.tick().error == "launch log missing"
+    assert app.calls == [] and not path.exists()
+
+
+def test_delete_after_initial_corrupt_read_fails_closed(tmp_path):
+    path = tmp_path / "launches.json"
+    path.write_text("{ not json")  # written just now: not stale
+    now = time.time()
+    budget = cu.LaunchBudget(path)
+    assert budget.reserve(now, manual=False, first_of_process=True) is False
+    assert budget.last_failure == "launch log unreadable"
+    path.unlink()
+    assert budget.reserve(now, manual=False, first_of_process=True) is False
+    assert budget.last_failure == "launch log missing"
+    assert not path.exists()

@@ -815,17 +815,24 @@ class LaunchBudget:
         self.lock_timeout = lock_timeout
         self.last_failure: str | None = None
         self.last_reservation: str | None = None  # the token of the last reservation written
-        self._seen = False  # this process has read or written the log at this path
+        self._seen = False  # this process has found something at the path, or written it
         self._held: FileLock | None = None  # the lock while this budget holds it
 
     def _load(self) -> tuple[str, dict]:
-        """``("ok", log)``, ``("missing", {})`` or ``("unreadable", {})``."""
+        """``("ok", log)``, ``("missing", {})`` or ``("unreadable", {})``.
+
+        Every read that finds something at the path, a log or not (the
+        reset count read at start included), is this process's first
+        contact with it: from then on, a missing log is a lost one.
+        """
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             return "missing", {}
         except (OSError, ValueError):
+            self._seen = True
             return "unreadable", {}
+        self._seen = True
         if not isinstance(raw, dict) or not isinstance(raw.get("launches"), list):
             return "unreadable", {}
         return "ok", raw
@@ -883,7 +890,6 @@ class LaunchBudget:
                 return []  # nothing in it can be inside the day: start afresh
             self.last_failure = "launch log unreadable"
             return None
-        self._seen = True
         return sorted(
             (e for e in entries if now - e[0] < DAY_S and not dated_ahead(e[0], now)),
             key=lambda e: e[0],
