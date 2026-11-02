@@ -1690,5 +1690,16 @@ def test_rollout_tail_refuses_file_changed_between_lstat_and_open(tmp_path, monk
 
     spy = _OsSpy(after_lstat=substitute)
     monkeypatch.setattr(cu, "os", spy)
-    assert cu.read_rollout_tail(path) is None
+    result = []
+    reader = threading.Thread(target=lambda: result.append(cu.read_rollout_tail(path)), daemon=True)
+    reader.start()
+    reader.join(5)  # a reader stuck in open() fails here, in bounded time, instead of hanging the run
+    if reader.is_alive():
+        if swap == "fifo":
+            try:  # a writer's open lets the stuck reader's open return
+                os.close(os.open(path, os.O_WRONLY | os.O_NONBLOCK))
+            except OSError:
+                pass
+        pytest.fail(f"the reader blocked opening the substituted {swap}")
+    assert result == [None]
     assert spy.bytes_read == 0  # refused before a byte was read

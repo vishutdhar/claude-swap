@@ -2210,30 +2210,33 @@ def test_quit_during_post_reply_cleanup_kills_before_exit(tmp_path, monkeypatch,
 
 
 def test_blocked_codex_monitor_does_not_delay_or_drop_account_refreshes(tmp_path, monkeypatch):
-    # A real monitor whose app-server read hangs (its own 20 s timeout) while
-    # the account rows refresh: every refresh starts at once and none is lost.
+    # A real monitor whose app-server read hangs (the fake sleeps 60 s; the
+    # client gives up after 20 s) while the account rows refresh: every
+    # refresh runs at once, none is lost, and each one's reading reaches the
+    # app (its snapshot, its rows, its title).
     import os
     import sys as _sys
     from pathlib import Path
 
-    fake = Path(__file__).parent / "fixtures" / "fake_codex_app_server.py"
-    log = tmp_path / "server.log"
-    script = tmp_path / "codex-hang"
-    script.write_text(f'#!/bin/sh\nexec "{_sys.executable}" "{fake}" hang "{log}" "$@"\n', encoding="utf-8")
-    script.chmod(0o755)
-    sessions = tmp_path / "sessions"
-    sessions.mkdir()
-    monitor = cu.CodexMonitor(
-        sessions, cu.LaunchBudget(tmp_path / "codex-launches.json"), script, logging.getLogger("claude-swap"),
-        read_rollouts=lambda folder, now: None,
-    )
     monkeypatch.setattr(rumps.rumps, "application_support", lambda _name: str(tmp_path))
     monkeypatch.setattr("claude_swap.snapshot_source.SnapshotSource", _NoFetch)
     monkeypatch.setattr(rumps, "notification", lambda *a, **k: None)
     monkeypatch.setattr(menubar, "_adapt_snapshot", lambda raw: raw)
-    built = menubar.create_app(_FakeSwitcher(tmp_path), codex_monitor=monitor)  # starts the Codex read
-    pid = None
+    log = tmp_path / "server.log"
+    monitor = built = pid = None
+    closed = took = None
     try:
+        fake = Path(__file__).parent / "fixtures" / "fake_codex_app_server.py"
+        script = tmp_path / "codex-hang"
+        script.write_text(f'#!/bin/sh\nexec "{_sys.executable}" "{fake}" hang "{log}" "$@"\n', encoding="utf-8")
+        script.chmod(0o755)
+        sessions = tmp_path / "sessions"
+        sessions.mkdir()
+        monitor = cu.CodexMonitor(
+            sessions, cu.LaunchBudget(tmp_path / "codex-launches.json"), script, logging.getLogger("claude-swap"),
+            read_rollouts=lambda folder, now: None,
+        )
+        built = menubar.create_app(_FakeSwitcher(tmp_path), codex_monitor=monitor)  # starts the Codex read
         deadline = time.monotonic() + 5
         while (not log.exists() or "METHOD initialize" not in log.read_text()) and time.monotonic() < deadline:
             time.sleep(0.02)
@@ -2242,39 +2245,55 @@ def test_blocked_codex_monitor_does_not_delay_or_drop_account_refreshes(tmp_path
         _wait_idle(built)
         takes = []
 
+        def reading(n):
+            # Each read its own numbers, so a reading dropped on the way is seen.
+            return _snap(_entry("1", "a@x.com", active=True, pct=11.0 + n), _entry("2", "b@x.com", pct=31.0 + n))
+
         class Source:
             def take(self, **kw):
                 takes.append(kw)
-                return _BEFORE
+                return reading(len(takes))
 
         built._snapshot_source = Source()
 
         def refreshes_at_once(action):
             before, started = len(takes), time.monotonic()
             action()
-            while (len(takes) == before or built._refreshing) and time.monotonic() - started < 2.0:
+            while (len(takes) == before or built._refreshing) and time.monotonic() - started < 5.0:
                 time.sleep(0.01)
             assert len(takes) == before + 1  # this one ran, and only this one
-            assert time.monotonic() - started < 1.0  # at once, not after the Codex read
+            # Within 3 s: room for a loaded machine, and still far short of the
+            # 20 s a refresh would take if it waited for the Codex read.
+            assert time.monotonic() - started < 3.0
+            pct = 11.0 + len(takes)
+            published = [entry[3] for entry in built.snapshot["accounts"]]
+            assert published == [{"five_hour": {"pct": pct}}, {"five_hour": {"pct": pct + 20.0}}]
+            built.on_sync_tick(None)  # the menu is closed: the tick rebuilds from it
+            assert _account_items(built)[0].view().panel.rows[0].pct_text == f"{pct:.0f}%"
+            assert f"{pct:.0f}%" in built.title
 
         for _ in range(3):
             refreshes_at_once(lambda: built.on_refresh_tick(None))
         refreshes_at_once(built.on_refresh_pressed)
-        built.on_sync_tick(None)  # the press reports back (the menu is closed)
         refreshes_at_once(lambda: built._make_switch_to("2")(None))
         assert built.switcher.switched == ["2"]
         assert [kw["fresh"] for kw in takes] == [False, False, False, True, False]
+        assert not built._press_pending  # the press reported back
         assert monitor.busy  # still stuck all along
     finally:
-        started = time.monotonic()
-        assert monitor.close(timeout=2.0) is True
-        assert time.monotonic() - started < 2.5
-        if pid is not None:
-            try:
-                os.kill(pid, 0)
-                alive = True
-            except ProcessLookupError:
-                alive = False
-            assert not alive
-        built.refresh_timer.stop()
-        built.sync_timer.stop()
+        # Every way out of the body: the monitor closed, the timers stopped.
+        if monitor is not None:
+            started = time.monotonic()
+            closed = monitor.close(timeout=2.0)
+            took = time.monotonic() - started
+        if built is not None:
+            built.refresh_timer.stop()
+            built.sync_timer.stop()
+    assert closed is True
+    assert took < 4.0  # close(2.0) plus its 0.5 s reap allowance, with margin
+    try:
+        os.kill(pid, 0)
+        alive = True
+    except ProcessLookupError:
+        alive = False
+    assert not alive
