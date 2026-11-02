@@ -2354,3 +2354,28 @@ def test_usage_log_gains_the_resets_and_logs_again_when_only_they_change(app, ca
         app._log_usage(_snap(_entry_resets("1", "a@x.com", active=True, left=0)))  # the reset was used
     lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("usage a@x.com")]
     assert lines == ["usage a@x.com: 5h 10% · UR 1", "usage a@x.com: 5h 10% · UR 0"]
+
+
+def test_resets_pill_appears_and_disappears_in_place_without_height_change(app, shown, on_screen):
+    with_grant = _snap(_entry("1", "a@x.com", active=True, pct=55.0), _entry_resets("2", "b@x.com", left=1, pct=66.0))
+    without = _snap(_entry("1", "a@x.com", active=True, pct=56.0), _entry("2", "b@x.com", pct=67.0))
+    source = shown(_Source(with_grant, without))
+    items = list(app.menu._menu.itemArray())
+    views = [i.view() for i in _account_items(app)]
+    heights = [v.frame().size.height for v in views]
+    assert views[1].panel.badge_text is None
+
+    assert _row(app).accessibilityPerformPress()
+    assert _pump(lambda: not _row(app).busy)
+    assert views[1].panel.badge_text == "UR 1"  # the pill appears in the open menu
+    assert (list(app.menu._menu.itemArray()), [i.view() for i in _account_items(app)]) == (items, views)
+    assert [v.frame().size.height for v in views] == heights
+    assert not app._rebuild_pending  # nothing to redo when the menu closes
+
+    assert _row(app).accessibilityPerformPress()
+    assert _pump(lambda: not _row(app).busy)
+    assert views[1].panel.badge_text is None  # and goes again
+    assert (list(app.menu._menu.itemArray()), [i.view() for i in _account_items(app)]) == (items, views)
+    assert [v.frame().size.height for v in views] == heights
+    assert _pcts(app) == ["56%", "67%"]
+    assert len(source.takes) == 2

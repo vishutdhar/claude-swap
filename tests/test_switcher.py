@@ -13125,3 +13125,72 @@ class TestLimitResetsPacingSurvivesADiscardedRead:
                 assert again["1"].sentinel == USAGE_FOREIGN_CREDENTIAL
         assert resets_sent.count("Bearer sk-foreign") == 1
         assert resets_sent.count("Bearer sk-backup") == 1
+
+
+class TestLimitResetsAuthFailuresStayIsolated:
+    """A 401 or 403 from the resets read is about that read only: it never
+    refreshes a token, strikes a slot or backs the usage poll off."""
+
+    def _switcher(self, sample_sequence_data):
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        return s
+
+    @pytest.mark.no_limit_resets_fake
+    @pytest.mark.parametrize("status", [401, 403])
+    def test_resets_401_403_never_refresh_quarantine_or_backoff(
+        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch, status
+    ):
+        monkeypatch.setattr(oauth, "claude_code_user_agent", lambda: "claude-cli/2.1.316 (external, cli)")
+        s = self._switcher(sample_sequence_data)
+        future = int(time.time() * 1000) + 3_600_000
+        # Both credentials could be refreshed: a 401 on a usage read would.
+        live = json.dumps({"claudeAiOauth": {"accessToken": "sk-active", "refreshToken": "rt-a", "expiresAt": future}})
+        backup = json.dumps({"claudeAiOauth": {"accessToken": "sk-backup", "refreshToken": "rt-b", "expiresAt": future}})
+        urls, consumed = [], []
+
+        def fake_urlopen(req, timeout=0):
+            urls.append(req.full_url)
+            if req.full_url == oauth.LIMIT_RESETS_URL:
+                raise urllib.error.HTTPError(req.full_url, status, "refused", hdrs=None, fp=None)
+            if "oauth/usage" not in req.full_url:
+                raise AssertionError(f"unexpected request {req.full_url}")
+            resp = MagicMock()
+            resp.read.return_value = json.dumps({"seven_day": {"utilization": 21.0}}).encode()
+            resp.__enter__ = lambda r: r
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        def consume(*args, **kwargs):
+            consumed.append(args)
+            return oauth.RefreshOutcome(None, "transient")
+
+        with patch.object(
+            ClaudeAccountSwitcher, "_read_active_credentials", return_value=ActiveCredentials(live, False),
+        ), patch.object(
+            ClaudeAccountSwitcher, "_read_account_credentials", return_value=backup,
+        ), patch.object(
+            ClaudeAccountSwitcher, "consume_backup_grant", side_effect=consume,
+        ), patch.object(
+            ClaudeAccountSwitcher, "_write_credentials",
+        ) as write_live, patch.object(
+            ClaudeAccountSwitcher, "_write_account_credentials",
+        ) as write_backup, patch(
+            "claude_swap.oauth.try_refresh_oauth_credentials",
+            side_effect=AssertionError("a resets refusal must never refresh"),
+        ), patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake_urlopen):
+            entries = s._collect_usage_entries(s._build_accounts_info())
+
+        assert urls.count(oauth.LIMIT_RESETS_URL) == 2  # one read per slot, refused
+        assert not any("oauth/token" in u for u in urls)
+        assert consumed == []
+        write_live.assert_not_called()
+        write_backup.assert_not_called()
+        for num in ("1", "2"):
+            entry = entries[num]
+            assert entry.sentinel is None
+            assert (entry.last_error, entry.consecutive_failures, entry.backoff_until) == (None, 0, None)
+            assert entry.auth_dead_strikes == 0 and entry.struck_fingerprint is None
+            assert entry.last_good == {"seven_day": {"pct": 21.0}}
