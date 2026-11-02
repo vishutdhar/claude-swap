@@ -1441,3 +1441,52 @@ def test_save_credits_orders_ties_and_future_counts(tmp_path):
     path, budget = log("too-far.json")  # 301 s ahead: a wrong clock's, not written
     budget.save_credits(2, NOW + 301, now=NOW)
     assert "reset_credits" not in json.loads(path.read_text())
+
+
+def test_repeated_aborts_and_queued_requests_allow_one_startup_launch(tmp_path):
+    path = tmp_path / "launches.json"
+    assert cu.LaunchBudget(path).record(NOW - 60)  # another menu bar launched a minute ago
+    calls = []
+
+    def app(binary, abort=None, child=None):
+        calls.append(1)
+        if len(calls) <= 3:
+            monitor.enabled = False  # the toggle lands before the spawn, again and again
+            return cu.AppServerReply(None, None, "aborted")
+        return cu.AppServerReply(_reading(56.0, NOW, "app-server"), 2, None)
+
+    monitor, _reads = _monitor(tmp_path, app=app)
+    for _ in range(3):
+        monitor.enabled = True
+        monitor.request()
+        monitor.request(manual=True)  # queued behind it, dropped with the toggle
+        monitor.request()
+        _wait_idle(monitor)
+    assert len(calls) == 3
+    monitor.enabled = True
+    for _ in range(3):
+        monitor.request(manual=True)
+        _wait_idle(monitor)
+    assert len(calls) == 4  # one start launch; then Refresh now waits its half hour
+    assert cu.LaunchBudget(path).launches_in_last_day(NOW) == 2  # the other's and this one's
+
+
+def test_later_abort_does_not_restore_consumed_startup_allowance(tmp_path):
+    clock = _Clock()
+    calls = []
+
+    def app(binary, abort=None, child=None):
+        calls.append(1)
+        if len(calls) == 2:
+            monitor.enabled = False
+            return cu.AppServerReply(None, None, "aborted")
+        return cu.AppServerReply(_reading(56.0, clock.now, "app-server"), 2, None)
+
+    monitor, _reads = _monitor(tmp_path, app=app, clock=clock)
+    monitor.tick()  # the start launch: the allowance is used
+    clock.now += 31 * 60
+    monitor.tick(manual=True)  # Refresh now half an hour on, stopped before its spawn
+    assert len(calls) == 2
+    monitor.enabled = True
+    monitor.tick()  # an ordinary tick, within six hours of the start launch
+    assert len(calls) == 2  # the allowance used at start does not come back
