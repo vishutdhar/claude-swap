@@ -112,8 +112,7 @@ class MenuBarSettings:
     show_usage_bars: bool = True  # draw each account as a panel of usage bars
     show_names_only: bool = False  # an aliased account shows its alias without the email
     show_codex: bool = True  # the Codex block after the accounts; off stops every Codex read
-    title_codex: bool = True  # append Codex's weekly pct and usage resets to the title
-    title_resets: bool = True  # append the active account's limit resets ("UR 1") to the title
+    title_codex: bool = True  # append Codex's weekly pct to the title
     codex_alias: str = ""  # the Codex block's name; empty is "Codex" (display only)
 
     @classmethod
@@ -556,22 +555,23 @@ def codex_alias_name(text: str) -> str | None:
 def codex_title_segments(
     settings: MenuBarSettings, codex: CodexState | None, alias: str | None, now: float
 ) -> list[str]:
-    """The title's Codex segments: ``["Codex 56%", "UR 2"]``, or none.
+    """The title's Codex segment: ``["Codex 56%"]``, or none.
 
-    Shown with the block and "Codex in title" on, once there is a reading.
-    The percentage is the longest window's (the weekly one today); a window
-    whose reset time has passed drops it, never rolled forward, and the name
-    and the usage-resets count stay.
+    Shown with the block and "Codex in title" on, while the reading has a
+    current percentage: the longest window's (the weekly one today). With
+    no reading, or once that window's reset time has passed (never rolled
+    forward), there is no segment at all, not a bare name. The usage-resets
+    count is never in the title: the owner reads it in the dropdown.
     """
     if not (settings.show_codex and settings.title_codex) or codex is None or codex.reading is None:
         return []
-    name = _title_name(alias or CODEX_NAME)
     windows = codex.reading.windows
-    window = max(windows, key=lambda w: w.window_minutes) if windows else None
-    passed = window is not None and window.resets_at is not None and _countdown_until(window.resets_at, now) is None
-    head = f"{name} {window.pct:.0f}%" if window is not None and not passed else name
-    badge, _state = ur_badge(codex.reset_credits, codex.credits_known(now))
-    return [head, badge]
+    if not windows:
+        return []
+    window = max(windows, key=lambda w: w.window_minutes)
+    if window.resets_at is not None and _countdown_until(window.resets_at, now) is None:
+        return []
+    return [f"{_title_name(alias or CODEX_NAME)} {window.pct:.0f}%"]
 
 
 def format_title(
@@ -596,7 +596,10 @@ def format_title(
 
 
 def _account_title_segments(active_email, active_usage, settings, now, alias) -> list[str]:
-    """The active account's title segments: name, windows, model limits, limit resets."""
+    """The active account's title segments: name, windows, model limits.
+
+    Never the limit resets: the owner reads those in the dropdown only.
+    """
     segments: list[str] = []
     if settings.show_account_name:
         segments.append(alias if alias else _local_part(active_email))
@@ -617,10 +620,6 @@ def _account_title_segments(active_email, active_usage, settings, now, alias) ->
             window = _rolled_weekly_window(window, now)
             if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)) and window.get("name"):
                 segments.append(f"{window['name']} {window['pct']:.0f}%")
-    if settings.title_resets:
-        badge = limit_resets_badge(active_usage, now)  # right after the pcts, before Codex
-        if badge:
-            segments.append(badge[0])
     return segments
 
 
@@ -2305,10 +2304,6 @@ def create_app(switcher, codex_monitor=None):
             scoped_item.state = 1 if self.settings.title_scoped else 0
             menu.add(scoped_item)
 
-            resets_item = rumps.MenuItem("Limit resets in title", callback=self.on_toggle_title_resets)
-            resets_item.state = 1 if self.settings.title_resets else 0
-            menu.add(resets_item)
-
             bars_item = rumps.MenuItem("Show usage bars", callback=self.on_toggle_usage_bars)
             bars_item.state = 1 if self.settings.show_usage_bars else 0
             menu.add(bars_item)
@@ -2700,10 +2695,6 @@ def create_app(switcher, codex_monitor=None):
 
         def on_toggle_scoped(self, _sender):
             self.settings.title_scoped = not self.settings.title_scoped
-            self._save_and_rebuild()
-
-        def on_toggle_title_resets(self, _sender):
-            self.settings.title_resets = not self.settings.title_resets
             self._save_and_rebuild()
 
         def on_toggle_usage_bars(self, _sender):

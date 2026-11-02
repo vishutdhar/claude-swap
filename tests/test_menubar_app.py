@@ -1836,7 +1836,7 @@ def test_codex_row_after_accounts_when_present(capp, codex):
     assert last.action() is None and last.state() == 0  # not a switch
     assert last.view().panel.kind == "codex" and last.view().is_last
     assert not items[1].view().is_last  # the last account now has its rule
-    assert capp.title.endswith(" · Codex 56% · UR 2")
+    assert capp.title.endswith(" · Codex 56%")  # the row keeps its UR; the title does not
 
 
 def test_codex_row_is_also_a_text_row(capp):
@@ -1913,7 +1913,8 @@ def test_codex_done_marks_dirty_and_rebuilds(capp, codex):
     capp.on_sync_tick(None)
     panel = _account_items(capp)[-1].view().panel
     assert (panel.badge_text, panel.badge_state) == ("UR 0", "over")
-    assert capp.title.endswith("UR 0")
+    assert capp.title.endswith(" · Codex 56%")  # the count is in the dropdown only
+    assert "UR" not in capp.title
 
 
 def test_codex_done_logs_usage_once_per_change(capp, codex, caplog):
@@ -1943,7 +1944,7 @@ def test_rename_menu_has_codex_entry_and_sets_alias(capp, window, tmp_path):
     assert json.loads((tmp_path / "menubar_settings.json").read_text())["codex_alias"] == "Review"
     assert _account_items(capp)[-1].title().startswith("Review · 7d 56%")
     assert _account_items(capp)[-1].view().panel.name_text == "Review"
-    assert capp.title.endswith(" · Review 56% · UR 2")
+    assert capp.title.endswith(" · Review 56%")
     assert [i.title() for i in _submenu(capp, "Rename account").itemArray()][-1] == "Review  (Codex)"
     assert getattr(capp.switcher, "renames", []) == []  # the account store is never touched
     window.answer = (1, "  ")  # empty: back to "Codex"
@@ -2002,7 +2003,7 @@ def test_a_hand_edited_codex_alias_the_rule_refuses_shows_codex(capp):
     capp.snapshot = _snap(_entry("1", "a@x.com", active=True))
     capp.rebuild_menu()
     assert _account_items(capp)[-1].view().panel.name_text == "Codex"
-    assert capp.title.endswith(" · Codex 56% · UR 2")
+    assert capp.title.endswith(" · Codex 56%")
 
 
 def test_the_codex_panel_switches_nothing(capp, queued, on_screen):
@@ -2030,7 +2031,7 @@ def test_in_place_repaint_includes_codex_row(capp, codex, cshown, on_screen):
     assert [i.view() for i in _account_items(capp)] == views  # the same views, redrawn
     assert _pcts(capp)[:2] == ["55%", "66%"]
     assert views[-1].panel.badge_text == "UR 3"
-    assert capp.title.endswith(" · Codex 56% · UR 3")
+    assert capp.title.endswith(" · Codex 56%") and "UR" not in capp.title
 
 
 def test_in_place_repaint_waits_when_the_codex_block_changed_height(capp, codex, cshown, on_screen):
@@ -2141,7 +2142,7 @@ def test_codex_finishing_after_the_account_read_repaints_the_open_menu(capp, cod
     assert list(capp.menu._menu.itemArray()) == items  # in place, nothing swapped
     assert [i.view() for i in _account_items(capp)] == views
     assert _pcts(capp)[:2] == ["55%", "66%"]
-    assert capp.title.endswith(" · Codex 61% · UR 3")
+    assert capp.title.endswith(" · Codex 61%")
     assert capp._dirty  # the rebuild after the close still runs
 
 
@@ -2312,18 +2313,11 @@ def _entry_resets(num, email, active=False, left=1, pct=10.0):
     return (num, email, active, usage, usage, None, False, None)
 
 
-def test_settings_menu_has_the_limit_resets_title_toggle(app, monkeypatch):
-    monkeypatch.setattr(app.settings, "save", lambda _p: None)
+def test_the_title_shows_no_limit_resets_and_the_dropdown_keeps_them(app):
     app.snapshot = _snap(_entry_resets("1", "a@x.com", active=True), _entry("2", "b@x.com"))
     app.rebuild_menu()
-    assert app.title.endswith("10% · UR 1")
-    items = {i.title(): i for i in _submenu(app, "Settings").itemArray()}
-    toggle = items["Limit resets in title"]
-    assert toggle.state() == 1
-    toggle.target().callback_(toggle)
-    assert app.settings.title_resets is False
-    assert "UR" not in app.title
-    # The dropdown keeps the tag: the setting is about the title only.
+    assert app.title.endswith("10%") and "UR" not in app.title
+    assert "Limit resets in title" not in [i.title() for i in _submenu(app, "Settings").itemArray()]
     panels = [i.view().panel for i in _account_items(app)]
     assert [(p.num, p.badge_text) for p in panels] == [("1", "UR 1"), ("2", None)]
 

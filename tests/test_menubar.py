@@ -2262,28 +2262,31 @@ def test_settings_ignore_wrong_type_codex_alias(tmp_path: Path):
 def test_format_title_codex_segment():
     s = menubar.MenuBarSettings(show_account_name=True, title_pct="5h")
     title = menubar.format_title("loc@papaya.asia", _USAGE, s, now=_CODEX_NOW, codex=_codex())
-    assert title == "⇄ loc · 42% · Codex 56% · UR 2"
+    assert title == "⇄ loc · 42% · Codex 56%"
 
 
 def test_format_title_codex_uses_the_longest_window():
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="off")
     both = (_cu.CodexWindow("5h", 12.0, 300, _CODEX_NOW + 3600), _cu.CodexWindow("7d", 56.0, 10080, _CODEX_NOW + 86400))
-    assert menubar.format_title("a@x.com", None, s, now=_CODEX_NOW, codex=_codex(windows=both)) == "⇄ Codex 56% · UR 2"
+    assert menubar.format_title("a@x.com", None, s, now=_CODEX_NOW, codex=_codex(windows=both)) == "⇄ Codex 56%"
 
 
-def test_format_title_codex_passed_reset_drops_pct_keeps_ur():
+def test_format_title_codex_passed_reset_omits_the_segment():
+    # No current pct: no Codex segment at all, not a bare name.
+    s = menubar.MenuBarSettings(show_account_name=True, title_pct="off")
+    title = menubar.format_title("loc@x.com", None, s, now=_CODEX_NOW, codex=_codex(pct=97.0, resets_in=-30))
+    assert title == "⇄ loc"
+    bare = menubar.MenuBarSettings(show_account_name=False, title_pct="off")
+    assert menubar.format_title("a@x.com", None, bare, now=_CODEX_NOW, codex=_codex(resets_in=-30)) == "⇄"
+
+
+@pytest.mark.parametrize("credits, credits_age", [(2, 60.0), (0, 60.0), (None, 60.0), (3, 25 * 3600)])
+def test_format_title_never_shows_the_codex_usage_resets(credits, credits_age):
+    # The owner reads the count in the dropdown only: any count, known,
+    # zero, unknown or stale, leaves the title as the pct alone.
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="off")
-    title = menubar.format_title("a@x.com", None, s, now=_CODEX_NOW, codex=_codex(pct=97.0, resets_in=-30))
-    assert title == "⇄ Codex · UR 2"
-    assert "97" not in title and "0%" not in title
-
-
-def test_format_title_codex_unknown_count():
-    s = menubar.MenuBarSettings(show_account_name=False, title_pct="off")
-    stale = _codex(credits=3, credits_age=25 * 3600)
-    assert menubar.format_title("a@x.com", None, s, now=_CODEX_NOW, codex=stale) == "⇄ Codex 56% · UR ?"
-    never = _codex(credits=None)
-    assert menubar.format_title("a@x.com", None, s, now=_CODEX_NOW, codex=never) == "⇄ Codex 56% · UR ?"
+    state = _codex(credits=credits, credits_age=credits_age)
+    assert menubar.format_title("a@x.com", None, s, now=_CODEX_NOW, codex=state) == "⇄ Codex 56%"
 
 
 def test_format_title_codex_off():
@@ -2300,12 +2303,12 @@ def test_format_title_codex_off():
 def test_format_title_codex_alias():
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="off")
     title = menubar.format_title("a@x.com", None, s, now=_CODEX_NOW, codex=_codex(credits=0), codex_alias="Review")
-    assert title == "⇄ Review 56% · UR 0"
+    assert title == "⇄ Review 56%"
 
 
 def test_format_title_codex_without_an_active_account():
     s = menubar.MenuBarSettings()
-    assert menubar.format_title(None, None, s, now=_CODEX_NOW, codex=_codex()) == "⇄ Codex 56% · UR 2"
+    assert menubar.format_title(None, None, s, now=_CODEX_NOW, codex=_codex()) == "⇄ Codex 56%"
 
 
 @pytest.mark.parametrize("stored, shown", [
@@ -2323,13 +2326,13 @@ def test_long_codex_alias_bounds_status_title_width():
     alias = "review-" + "x" * 60 + "-end"
     assert menubar.codex_alias_name(alias) == alias  # the alias rule is left alone
     title = menubar.format_title("a@x.com", None, s, now=_CODEX_NOW, codex=_codex(), codex_alias=alias)
-    assert title == "⇄ review…x-end 56% · UR 2"  # 12 characters, cut in the middle
+    assert title == "⇄ review…x-end 56%"  # 12 characters, cut in the middle
     passed = menubar.format_title(
         "a@x.com", None, s, now=_CODEX_NOW, codex=_codex(resets_in=-30), codex_alias=alias
     )
-    assert passed == "⇄ review…x-end · UR 2"
+    assert passed == "⇄"  # no current pct: no segment, so no name either
     whole = menubar.format_title("a@x.com", None, s, now=_CODEX_NOW, codex=_codex(), codex_alias="a-twelve-chr")
-    assert whole == "⇄ a-twelve-chr 56% · UR 2"
+    assert whole == "⇄ a-twelve-chr 56%"
 
 
 def test_the_menu_bar_reads_rollouts_from_the_codex_home(tmp_path, monkeypatch):
@@ -2436,43 +2439,40 @@ def test_format_account_label_without_a_grant_is_unchanged():
     )
 
 
-def test_format_title_appends_the_active_accounts_resets_after_its_pcts():
-    s = menubar.MenuBarSettings(show_account_name=True, title_pct="both")
-    assert menubar.format_title("loc@papaya.asia", _with_resets(), s, now=_UR_NOW) == "⇄ loc · 42% · 18% · UR 1"
-    scoped = menubar.MenuBarSettings(show_account_name=False, title_pct="5h", title_scoped=True)
-    usage = {**_with_resets(), "scoped": [{"name": "Fable", "pct": 55.0}]}
-    assert menubar.format_title("loc@papaya.asia", usage, scoped, now=_UR_NOW) == "⇄ 42% · Fable 55% · UR 1"
-
-
-def test_format_title_resets_sit_before_the_codex_segment():
-    s = menubar.MenuBarSettings(show_account_name=True, title_pct="5h")
+@pytest.mark.parametrize("left", [1, 0])
+def test_format_title_never_shows_an_accounts_limit_resets(left):
+    # The owner reads the pill in the dropdown only; the title keeps the pcts.
+    s = menubar.MenuBarSettings(show_account_name=True, title_pct="both", title_scoped=True)
+    usage = {**_with_resets(left=left), "scoped": [{"name": "Fable", "pct": 55.0}]}
+    assert menubar.format_title("loc@papaya.asia", usage, s, now=_UR_NOW) == "⇄ loc · 42% · 18% · Fable 55%"
     codex = _cu.CodexState(
         True,
         _cu.CodexReading((_cu.CodexWindow("7d", 56.0, 10080, _UR_NOW + 86400),), "pro", _UR_NOW - 9, "rollout"),
         2, _UR_NOW - 60, None,
     )
-    title = menubar.format_title("loc@papaya.asia", _with_resets(left=0), s, now=_UR_NOW, codex=codex)
-    assert title == "⇄ loc · 42% · UR 0 · Codex 56% · UR 2"
+    five = menubar.MenuBarSettings(show_account_name=True, title_pct="5h")
+    title = menubar.format_title("loc@papaya.asia", _with_resets(left=left), five, now=_UR_NOW, codex=codex)
+    assert title == "⇄ loc · 42% · Codex 56%"
 
 
-def test_format_title_resets_toggle_and_no_grant():
-    on = menubar.MenuBarSettings(show_account_name=True, title_pct="off")
-    assert on.title_resets is True  # on by default
-    assert menubar.format_title("loc@x.com", _with_resets(), on, now=_UR_NOW) == "⇄ loc · UR 1"
-    off = menubar.MenuBarSettings(show_account_name=True, title_pct="off", title_resets=False)
-    assert menubar.format_title("loc@x.com", _with_resets(), off, now=_UR_NOW) == "⇄ loc"
-    assert menubar.format_title("loc@x.com", _USAGE, on, now=_UR_NOW) == "⇄ loc"  # no grant, no tag
-    assert menubar.format_title("loc@x.com", "token expired", on, now=_UR_NOW) == "⇄ loc"
+def test_there_is_no_limit_resets_title_setting():
+    import dataclasses
+
+    assert "title_resets" not in {f.name for f in dataclasses.fields(menubar.MenuBarSettings)}
 
 
-def test_settings_round_trip_title_resets(tmp_path: Path):
+def test_a_settings_file_written_with_title_resets_still_loads(tmp_path: Path):
+    # A build that had the setting wrote it to the file; it is now an
+    # unknown key, ignored, and the next save leaves it out.
     path = tmp_path / "menubar_settings.json"
-    original = menubar.MenuBarSettings(title_resets=False)
-    original.save(path)
-    assert json.loads(path.read_text(encoding="utf-8"))["title_resets"] is False
-    assert menubar.MenuBarSettings.load(path) == original
-    path.write_text(json.dumps({"title_resets": "no"}), encoding="utf-8")
-    assert menubar.MenuBarSettings.load(path).title_resets is True  # a wrong type keeps the default
+    path.write_text(
+        json.dumps({"title_resets": False, "title_codex": False, "title_pct": "5h"}), encoding="utf-8"
+    )
+    loaded = menubar.MenuBarSettings.load(path)
+    assert (loaded.title_codex, loaded.title_pct) == (False, "5h")
+    assert not hasattr(loaded, "title_resets")
+    loaded.save(path)
+    assert "title_resets" not in json.loads(path.read_text(encoding="utf-8"))
 
 
 def test_format_usage_log_gains_the_resets():
