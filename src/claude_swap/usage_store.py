@@ -29,7 +29,6 @@ batch, not one request.
 from __future__ import annotations
 
 import json
-import math
 import time
 import uuid
 from collections.abc import Callable, Iterable
@@ -150,20 +149,6 @@ class LimitResetsAttempts:
                 return True
         except (LockError, OSError):
             return False
-
-    def stamp(self, account_uuid: str) -> None:
-        """Under the lock: ``account_uuid`` tried now (a later stamp stays). Never raises."""
-        if not account_uuid:
-            return
-        try:
-            with FileLock(self._lock_path, timeout=LIMIT_RESETS_LOCK_WAIT_S):
-                now = self.clock()
-                stamps = self.read()
-                if stamps.get(account_uuid, -math.inf) < now:
-                    stamps[account_uuid] = now
-                    self._write(stamps, now)
-        except (LockError, OSError):
-            pass
 
     def _write(self, stamps: dict[str, float], now: float) -> None:
         kept = {
@@ -1270,17 +1255,6 @@ class UsageStore:
                     # fingerprint from an earlier, already-healed strike.
                     row["struckFingerprint"] = rec.struck_fp
 
-        # The account whose token asked for a resets answer, as the server
-        # named it, is paced too: it may not be the account reserved for
-        # (the slot's stored one) when the slot's credential raced. Its
-        # stamp is the account's, so it is written whatever the lease says.
-        for asker in {
-            rec.limit_resets.account_uuid
-            for rec in outcomes.values()
-            if rec.limit_resets is not None and rec.limit_resets.account_uuid
-        }:
-            self.attempts.stamp(asker)
-
         with self._lock():
             rows = self._read_rows()
             for num in outcomes:
@@ -1401,6 +1375,38 @@ class UsageStore:
                 return self.attempts.reserve(account_uuid, max_age_s)
         except (LockError, OSError):
             return False
+
+
+@dataclass(frozen=True)
+class SlotResetsGate:
+    """The ``oauth.LimitResetsGate`` of one slot's fetch in one pass.
+
+    ``reserve()`` wins the slot's read for its stored account
+    (``UsageStore.reserve_limit_resets``: the usage lease still held, the
+    account due, and stamped). ``admit(uuid)`` lets the resets request go to
+    the account the profile probe named: at once when it is the slot's own
+    (just reserved), else only when that account's read is due too, and
+    then it is stamped (``LimitResetsAttempts.reserve``), so an account read
+    through another slot is paced as well.
+    """
+
+    store: "UsageStore"
+    num: str
+    identity: Identity
+    claim_id: str
+    max_age_s: float
+    account_uuid: str
+
+    def reserve(self) -> bool:
+        return self.store.reserve_limit_resets(
+            self.num, self.identity, self.claim_id, self.max_age_s,
+            account_uuid=self.account_uuid,
+        )
+
+    def admit(self, account_uuid: str) -> bool:
+        if account_uuid == self.account_uuid:
+            return True
+        return self.store.attempts.reserve(account_uuid, self.max_age_s)
 
 
 def _num_or_none(value: object) -> float | None:

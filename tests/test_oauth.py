@@ -1903,9 +1903,38 @@ class TestLimitResetsSafetyNet:
         run.assert_not_called()
 
 
+class _Gate:
+    """An ``oauth.LimitResetsGate`` for tests: answers each step as told (an
+    exception is raised) and notes what it was asked."""
+
+    def __init__(self, reserve=True, admit=True):
+        self._reserve, self._admit, self.asked = reserve, admit, []
+
+    def reserve(self):
+        self.asked.append("reserve")
+        if isinstance(self._reserve, BaseException):
+            raise self._reserve
+        return self._reserve
+
+    def admit(self, account_uuid):
+        self.asked.append(("admit", account_uuid))
+        if isinstance(self._admit, BaseException):
+            raise self._admit
+        return self._admit
+
+
+def _profile_by_token(token):
+    """The profile probe's answer: each token is its own account."""
+    return {"uuid": f"acct-{token}", "email": "x@example.com", "organizationUuid": None}
+
+
 class TestFetchUsageWithLimitResets:
-    """``try_fetch_usage_for_account(limit_resets=True)``: the rare read rides
+    """``try_fetch_usage_for_account(limit_resets=gate)``: the rare read rides
     on a successful usage read, with the token that read used."""
+
+    @pytest.fixture(autouse=True)
+    def _profiles(self, monkeypatch):
+        monkeypatch.setattr(oauth, "fetch_oauth_profile", _profile_by_token)
 
     @staticmethod
     def _creds(access="old-access", refresh="old-refresh", expires_in_ms=3_600_000):
@@ -1930,12 +1959,10 @@ class TestFetchUsageWithLimitResets:
         monkeypatch.setattr(oauth, "request_limit_resets", lambda token: tokens.append(token) or cedar)
         with patch("claude_swap.oauth.request_usage_data", return_value=self._usage()):
             out = oauth.try_fetch_usage_for_account(
-                "1", "a@x.com", self._creds(), is_active=True, limit_resets=lambda: True,
+                "1", "a@x.com", self._creds(), is_active=True, limit_resets=_Gate(),
             )
         assert out.error is None and out.usage["five_hour"]["pct"] == 12.0
-        # Tagged with the credential that asked, for the collector's check.
-        # The suite's profile stub answers nothing: an unattested answer.
-        assert out.limit_resets == oauth.LimitResetsRead(cedar)
+        assert out.limit_resets == oauth.LimitResetsRead(cedar, "acct-old-access", None)
         assert tokens == ["old-access"]
         assert "limit_resets" not in out.usage  # the store merges it, with its own clock
 
@@ -1947,32 +1974,33 @@ class TestFetchUsageWithLimitResets:
         assert out.limit_resets is None and calls == []
 
     def test_a_failed_usage_read_never_reads_resets(self, monkeypatch):
-        calls = []
+        calls, gate = [], _Gate()
         monkeypatch.setattr(oauth, "request_limit_resets", lambda token: calls.append(token))
         err = urllib.error.HTTPError("u", 429, "Too Many", hdrs=None, fp=None)
         with patch("claude_swap.oauth.request_usage_data", side_effect=err):
             out = oauth.try_fetch_usage_for_account(
-                "1", "a@x.com", self._creds(), is_active=True, limit_resets=lambda: True,
+                "1", "a@x.com", self._creds(), is_active=True, limit_resets=gate,
             )
         assert out.error == "http-429" and out.limit_resets is None and calls == []
+        assert gate.asked == []
 
     def test_a_usage_answer_with_no_windows_reads_no_resets(self, monkeypatch):
-        calls = []
+        calls, gate = [], _Gate()
         monkeypatch.setattr(oauth, "request_limit_resets", lambda token: calls.append(token))
         with patch("claude_swap.oauth.request_usage_data", return_value={}):
             out = oauth.try_fetch_usage_for_account(
-                "1", "a@x.com", self._creds(), is_active=True, limit_resets=lambda: True,
+                "1", "a@x.com", self._creds(), is_active=True, limit_resets=gate,
             )
-        assert (out.usage, out.error, out.limit_resets, calls) == (None, None, None, [])
+        assert (out.usage, out.error, out.limit_resets, calls, gate.asked) == (None, None, None, [], [])
 
     def test_a_failed_resets_read_is_recorded_as_tried_and_the_usage_stands(self, monkeypatch):
         monkeypatch.setattr(oauth, "request_limit_resets", lambda token: None)
         with patch("claude_swap.oauth.request_usage_data", return_value=self._usage()):
             out = oauth.try_fetch_usage_for_account(
-                "1", "a@x.com", self._creds(), is_active=True, limit_resets=lambda: True,
+                "1", "a@x.com", self._creds(), is_active=True, limit_resets=_Gate(),
             )
         assert out.error is None and out.usage is not None
-        assert out.limit_resets == oauth.LimitResetsRead(None)
+        assert out.limit_resets == oauth.LimitResetsRead(None, "acct-old-access", None)
 
     def test_a_resets_read_that_raises_never_fails_the_usage_read(self, monkeypatch):
         def boom(token):
@@ -1981,14 +2009,15 @@ class TestFetchUsageWithLimitResets:
         monkeypatch.setattr(oauth, "request_limit_resets", boom)
         with patch("claude_swap.oauth.request_usage_data", return_value=self._usage()):
             out = oauth.try_fetch_usage_for_account(
-                "1", "a@x.com", self._creds(), is_active=True, limit_resets=lambda: True,
+                "1", "a@x.com", self._creds(), is_active=True, limit_resets=_Gate(),
             )
         assert out.error is None and out.usage["seven_day"]["pct"] == 34.0
-        assert out.limit_resets == oauth.LimitResetsRead(None)
+        assert out.limit_resets == oauth.LimitResetsRead(None, "acct-old-access", None)
 
     def test_after_a_401_refresh_the_resets_read_uses_the_new_token(self, monkeypatch):
-        tokens = []
+        tokens, probed = [], []
         monkeypatch.setattr(oauth, "request_limit_resets", lambda token: tokens.append(token) or _cedar())
+        monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: probed.append(token) or _profile_by_token(token))
         calls = []
 
         def usage(token):
@@ -2002,52 +2031,39 @@ class TestFetchUsageWithLimitResets:
             out = oauth.try_fetch_usage_for_account(
                 "2", "b@x.com", self._creds(), is_active=False,
                 refresh_via=lambda *_: oauth.RefreshOutcome(refreshed, None),
-                limit_resets=lambda: True,
+                limit_resets=_Gate(),
             )
         assert calls == ["old-access", "new-access"]
-        assert tokens == ["new-access"]
-        # The refreshed credential asked, so it is the one named.
-        assert out.limit_resets == oauth.LimitResetsRead(_cedar())
+        assert probed == tokens == ["new-access"]
+        assert out.limit_resets == oauth.LimitResetsRead(_cedar(), "acct-new-access", None)
 
 
 class TestLimitResetsGate:
-    """The resets read is sent only when its gate, asked right before the
-    request, says yes; the gate is never asked when no read would follow."""
+    """The resets read's gate, through ``try_fetch_usage_for_account``."""
 
     @staticmethod
     def _creds():
         return json.dumps({"claudeAiOauth": {"accessToken": "tok", "scopes": ["user:inference"]}})
 
-    def test_a_refused_gate_sends_no_read(self, monkeypatch):
-        sent = []
+    @pytest.mark.parametrize("reserve", [False, OSError("store unwritable")])
+    def test_a_refused_or_failing_reservation_sends_nothing(self, monkeypatch, reserve):
+        sent, probed = [], []
         monkeypatch.setattr(oauth, "request_limit_resets", lambda token: sent.append(token))
+        monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: probed.append(token))
         with patch("claude_swap.oauth.request_usage_data", return_value={"seven_day": {"utilization": 1.0}}):
             out = oauth.try_fetch_usage_for_account("1", "a@x.com", self._creds(), is_active=True,
-                                                    limit_resets=lambda: False)
-        assert (out.limit_resets, sent, out.error) == (None, [], None)
-
-    def test_a_gate_that_raises_sends_no_read_and_the_usage_stands(self, monkeypatch):
-        sent = []
-        monkeypatch.setattr(oauth, "request_limit_resets", lambda token: sent.append(token))
-
-        def broken():
-            raise OSError("store unwritable")
-
-        with patch("claude_swap.oauth.request_usage_data", return_value={"seven_day": {"utilization": 1.0}}):
-            out = oauth.try_fetch_usage_for_account("1", "a@x.com", self._creds(), is_active=True,
-                                                    limit_resets=broken)
-        assert (out.limit_resets, sent, out.error) == (None, [], None)
+                                                    limit_resets=_Gate(reserve=reserve))
+        assert (out.limit_resets, sent, probed, out.error) == (None, [], [], None)
         assert out.usage["seven_day"]["pct"] == 1.0
 
     @pytest.mark.parametrize("usage_answer", [{}, urllib.error.HTTPError("u", 429, "x", hdrs=None, fp=None)])
     def test_the_gate_is_not_asked_when_no_read_follows(self, monkeypatch, usage_answer):
-        asked = []
+        gate = _Gate()
         monkeypatch.setattr(oauth, "request_limit_resets", lambda token: None)
         kwargs = {"side_effect": usage_answer} if isinstance(usage_answer, Exception) else {"return_value": usage_answer}
         with patch("claude_swap.oauth.request_usage_data", **kwargs):
-            oauth.try_fetch_usage_for_account("1", "a@x.com", self._creds(), is_active=True,
-                                              limit_resets=lambda: asked.append(1) or True)
-        assert asked == []
+            oauth.try_fetch_usage_for_account("1", "a@x.com", self._creds(), is_active=True, limit_resets=gate)
+        assert gate.asked == []
 
 
 class TestReadLimitResetsFor:
@@ -2056,17 +2072,18 @@ class TestReadLimitResetsFor:
     def test_reads_with_the_credentials_access_token_behind_the_gate(self, monkeypatch):
         tokens = []
         monkeypatch.setattr(oauth, "request_limit_resets", lambda token: tokens.append(token) or _cedar())
+        monkeypatch.setattr(oauth, "fetch_oauth_profile", _profile_by_token)
         creds = json.dumps({"claudeAiOauth": {"accessToken": "tok-live"}})
-        assert oauth.read_limit_resets_for(creds, lambda: True) == oauth.LimitResetsRead(_cedar())
-        assert oauth.read_limit_resets_for(creds, lambda: False) is None
+        assert oauth.read_limit_resets_for(creds, _Gate()) == oauth.LimitResetsRead(_cedar(), "acct-tok-live", None)
+        assert oauth.read_limit_resets_for(creds, _Gate(reserve=False)) is None
         assert tokens == ["tok-live"]
 
     @pytest.mark.parametrize("creds", ["", "not json", json.dumps({"claudeAiOauth": {}})])
     def test_no_token_no_gate_no_read(self, monkeypatch, creds):
-        asked, sent = [], []
+        sent, gate = [], _Gate()
         monkeypatch.setattr(oauth, "request_limit_resets", lambda token: sent.append(token))
-        assert oauth.read_limit_resets_for(creds, lambda: asked.append(1) or True) is None
-        assert (asked, sent) == ([], [])
+        assert oauth.read_limit_resets_for(creds, gate) is None
+        assert (gate.asked, sent) == ([], [])
 
 
 class TestLimitResetsUsableNow:
@@ -2087,61 +2104,55 @@ class TestLimitResetsUsableNow:
 
 
 
-class TestLimitResetsAttestation:
-    """After an answered resets read, the profile probe with the same token
-    says whose account it is; the read carries the server's ids."""
+class TestLimitResetsProbeFirst:
+    """``_read_limit_resets``: reserve, probe, admit, then read, each step
+    only when the one before it allows."""
 
-    def test_the_probe_follows_an_answered_read_with_the_same_token(self, monkeypatch):
+    def _wire(self, monkeypatch, profile, cedar=None):
         calls = []
-        monkeypatch.setattr(oauth, "request_limit_resets", lambda token: calls.append(("resets", token)) or _cedar())
-        monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: calls.append(("profile", token)) or {
-            "uuid": "acct-9", "email": "a@x.com", "organizationUuid": "org-9"})
-        read = oauth._read_limit_resets("tok-1", lambda: True)
-        assert calls == [("resets", "tok-1"), ("profile", "tok-1")]
+        monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: calls.append(("profile", token)) or (
+            profile(token) if callable(profile) else profile))
+        monkeypatch.setattr(oauth, "request_limit_resets", lambda token: calls.append(("resets", token)) or (
+            _cedar() if cedar is None else cedar))
+        return calls
+
+    def test_the_probe_runs_before_the_read_with_the_same_token(self, monkeypatch):
+        calls = self._wire(monkeypatch, {"uuid": "acct-9", "email": "a@x.com", "organizationUuid": "org-9"})
+        gate = _Gate()
+        read = oauth._read_limit_resets("tok-1", gate)
+        assert calls == [("profile", "tok-1"), ("resets", "tok-1")]
+        assert gate.asked == ["reserve", ("admit", "acct-9")]
         assert read == oauth.LimitResetsRead(_cedar(), "acct-9", "org-9")
 
-    def test_no_probe_after_a_read_that_did_not_answer(self, monkeypatch):
-        probed = []
-        monkeypatch.setattr(oauth, "request_limit_resets", lambda token: None)
-        monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: probed.append(token))
-        assert oauth._read_limit_resets("tok-1", lambda: True) == oauth.LimitResetsRead(None)
-        assert probed == []
+    @pytest.mark.parametrize("profile", [None, {}, {"uuid": ""}])
+    def test_no_resets_request_when_the_probe_names_no_account(self, monkeypatch, profile):
+        calls = self._wire(monkeypatch, profile)
+        gate = _Gate()
+        assert oauth._read_limit_resets("tok-1", gate) == oauth.LimitResetsRead(None)
+        assert calls == [("profile", "tok-1")]
+        assert gate.asked == ["reserve"]  # nothing to admit
 
-    @pytest.mark.parametrize("profile", [None, {}])
-    def test_a_probe_that_names_no_account_leaves_the_read_unattested(self, monkeypatch, profile):
-        monkeypatch.setattr(oauth, "request_limit_resets", lambda token: _cedar())
-        monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: profile)
-        read = oauth._read_limit_resets("tok-1", lambda: True)
-        assert (read.cedar_ember, read.account_uuid, read.org_uuid) == (_cedar(), None, None)
-
-    def test_a_probe_that_raises_leaves_the_read_unattested(self, monkeypatch):
-        monkeypatch.setattr(oauth, "request_limit_resets", lambda token: _cedar())
+    def test_a_probe_that_raises_sends_no_resets_request(self, monkeypatch):
+        sent = []
+        monkeypatch.setattr(oauth, "request_limit_resets", lambda token: sent.append(token))
 
         def boom(token):
             raise RuntimeError("broken")
 
         monkeypatch.setattr(oauth, "fetch_oauth_profile", boom)
-        assert oauth._read_limit_resets("tok-1", lambda: True) == oauth.LimitResetsRead(_cedar())
+        assert oauth._read_limit_resets("tok-1", _Gate()) == oauth.LimitResetsRead(None)
+        assert sent == []
 
-    def test_after_a_401_refresh_the_probe_uses_the_new_token(self, monkeypatch):
-        probed = []
-        monkeypatch.setattr(oauth, "request_limit_resets", lambda token: _cedar())
-        monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: probed.append(token) or {
-            "uuid": "acct-2", "email": "b@x.com", "organizationUuid": None})
+    @pytest.mark.parametrize("admit", [False, OSError("unwritable")])
+    def test_an_account_not_admitted_is_not_asked(self, monkeypatch, admit):
+        calls = self._wire(monkeypatch, {"uuid": "acct-9", "email": "a@x.com", "organizationUuid": "org-9"})
+        read = oauth._read_limit_resets("tok-1", _Gate(admit=admit))
+        assert calls == [("profile", "tok-1")]
+        assert read == oauth.LimitResetsRead(None, "acct-9", "org-9")
+
+    def test_a_resets_read_that_did_not_answer_keeps_the_ids(self, monkeypatch):
         calls = []
-
-        def usage(token):
-            calls.append(token)
-            if len(calls) == 1:
-                raise urllib.error.HTTPError("u", 401, "Unauthorized", hdrs=None, fp=None)
-            return {"seven_day": {"utilization": 1.0}}
-
-        old = TestFetchUsageWithLimitResets._creds()
-        new = TestFetchUsageWithLimitResets._creds(access="new-access", refresh="new-refresh")
-        with patch("claude_swap.oauth.request_usage_data", side_effect=usage):
-            out = oauth.try_fetch_usage_for_account(
-                "2", "b@x.com", old, is_active=False,
-                refresh_via=lambda *_: oauth.RefreshOutcome(new, None), limit_resets=lambda: True,
-            )
-        assert probed == ["new-access"]
-        assert (out.limit_resets.account_uuid, out.limit_resets.org_uuid) == ("acct-2", None)
+        monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: {"uuid": "acct-9", "email": "a", "organizationUuid": None})
+        monkeypatch.setattr(oauth, "request_limit_resets", lambda token: calls.append(token))
+        assert oauth._read_limit_resets("tok-1", _Gate()) == oauth.LimitResetsRead(None, "acct-9", None)
+        assert calls == ["tok-1"]

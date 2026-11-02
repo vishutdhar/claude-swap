@@ -14,6 +14,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import Protocol
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -656,47 +657,77 @@ class LimitResetsRead:
 
     cedar_ember: dict | None
     # Whose account the token that asked belongs to, as the server says
-    # (``fetch_oauth_profile`` with the same token, right after an answered
-    # read): the answer is kept for a slot only when these are the slot's
-    # stored ``uuid`` and ``organizationUuid``. None when the probe failed or
-    # no read answered.
+    # (``fetch_oauth_profile`` with the same token, before the resets read):
+    # the answer is kept for a slot only when these are the slot's stored
+    # ``uuid`` and ``organizationUuid``. None when the probe failed.
     account_uuid: str | None = None
     org_uuid: str | None = None
 
 
-def _read_limit_resets(
-    access_token: str, gate: Callable[[], bool]
-) -> LimitResetsRead | None:
-    """``request_limit_resets`` behind its gate, then the profile probe with
-    the same token, neither able to fail the usage read they ride on. None
-    when the gate refuses (or fails): no read was made. A read that did not
-    answer is not probed."""
+class LimitResetsGate(Protocol):
+    """What paces one limit-resets read, asked at each step before a request.
+
+    ``reserve()`` before anything is sent: the slot's own account's read
+    must be due, and it is stamped. ``admit(account_uuid)`` once the profile
+    probe has named the account the token belongs to, before the resets
+    request: that account's read must be due too (it is the slot's own,
+    just reserved, or it is stamped now). False at either step sends
+    nothing more.
+    """
+
+    def reserve(self) -> bool: ...
+
+    def admit(self, account_uuid: str) -> bool: ...
+
+
+def _read_limit_resets(access_token: str, gate: LimitResetsGate) -> LimitResetsRead | None:
+    """The limit-resets read for one token, probe first, none of it able to
+    fail the usage read it rides on.
+
+    1. ``gate.reserve()``: the slot's account is paced (None: nothing sent).
+    2. The profile probe (``fetch_oauth_profile``) with this token: whose
+       account it is. No answer: no resets request.
+    3. ``gate.admit(uuid)``: that account's read must be due, and is
+       stamped, so an account already read this interval through another
+       slot (a swap half published) is not asked again.
+    4. The resets request, with this token.
+
+    The read carries the server's ids for the attestation at record time;
+    its ``cedar_ember`` is None whenever no resets answer was had.
+    """
     try:
-        allowed = gate() is True
+        reserved = gate.reserve() is True
     except Exception as e:
         _logger.debug("Limit resets reservation failed: %r", e)
         return None
-    if not allowed:
+    if not reserved:
         return None
     try:
-        cedar = request_limit_resets(access_token)
-    except Exception as e:  # the contract says never; a bug must not cost the usage
-        _logger.debug("Limit resets read raised: %r", e)
-        return LimitResetsRead(None)
-    if cedar is None:
-        return LimitResetsRead(None)
-    try:
         profile = fetch_oauth_profile(access_token)
-    except Exception as e:  # it never raises either; same reason
+    except Exception as e:  # it never raises; a bug must not cost the usage
         _logger.debug("Limit resets attestation raised: %r", e)
         profile = None
-    if not profile:
-        return LimitResetsRead(cedar)
-    return LimitResetsRead(cedar, profile.get("uuid"), profile.get("organizationUuid"))
+    account_uuid = profile.get("uuid") if isinstance(profile, dict) else None
+    if not account_uuid:
+        return LimitResetsRead(None)
+    org_uuid = profile.get("organizationUuid")
+    try:
+        admitted = gate.admit(account_uuid) is True
+    except Exception as e:
+        _logger.debug("Limit resets admission failed: %r", e)
+        admitted = False
+    if not admitted:
+        return LimitResetsRead(None, account_uuid, org_uuid)
+    try:
+        cedar = request_limit_resets(access_token)
+    except Exception as e:  # the contract says never; same reason
+        _logger.debug("Limit resets read raised: %r", e)
+        cedar = None
+    return LimitResetsRead(cedar, account_uuid, org_uuid)
 
 
 def read_limit_resets_for(
-    credentials: str, gate: Callable[[], bool]
+    credentials: str, gate: LimitResetsGate
 ) -> LimitResetsRead | None:
     """The limit-resets read made with ``credentials``' access token, behind
     its gate; None when the gate refuses or there is no token.
@@ -952,7 +983,7 @@ def try_fetch_usage_for_account(
     is_active: bool,
     persist_credentials: Callable[[str, str, str], None] | None = None,
     refresh_via: Callable[[str, str, str], RefreshOutcome] | None = None,
-    limit_resets: Callable[[], bool] | None = None,
+    limit_resets: LimitResetsGate | None = None,
 ) -> UsageOutcome:
     """Fetch usage for an account, refreshing expired tokens for inactive accounts only.
 
@@ -964,12 +995,12 @@ def try_fetch_usage_for_account(
     unused for the refresh (the gate persists internally).
 
     ``limit_resets`` asks for the rare limit-resets read as well. It is the
-    read's gate (``UsageStore.reserve_limit_resets``), asked right before
-    the request and only after a usage read that succeeded with window
-    data; the read is sent with the token that read used only when the gate
-    answers True, followed by the profile probe with the same token, and is
-    carried in ``UsageOutcome.limit_resets``. Neither the gate, the read nor
-    the probe can fail the usage read.
+    read's gate (``LimitResetsGate``), asked only after a usage read that
+    succeeded with window data; the profile probe and the resets request go
+    out with the token that read used, each only when the gate lets it
+    (``_read_limit_resets``), and the read is carried in
+    ``UsageOutcome.limit_resets``. Neither the gate, the probe nor the read
+    can fail the usage read.
     """
     context = f"for account {account_num}"  # no email: paste-safe for public issues
     oauth = extract_oauth_data(credentials)

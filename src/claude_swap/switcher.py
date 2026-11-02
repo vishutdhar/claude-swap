@@ -12,8 +12,7 @@ import threading
 import sys
 import tempfile
 import time
-import functools
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -93,6 +92,7 @@ from claude_swap.usage_store import (
     LIMIT_RESETS_EVERY_S,
     LIMIT_RESETS_MANUAL_EVERY_S,
     FetchRecord,
+    SlotResetsGate,
     UsageEntry,
     UsageStore,
     with_sentinel,
@@ -4078,7 +4078,7 @@ class ClaudeAccountSwitcher:
         email: str,
         creds: str,
         org_uuid: str = "",
-        limit_resets: Callable[[], bool] | None = None,
+        limit_resets: oauth.LimitResetsGate | None = None,
     ) -> FetchRecord:
         """Usage fetch for the active/default account, refreshing an expired
         token under Claude Code's own lock protocol.
@@ -4830,7 +4830,7 @@ class ClaudeAccountSwitcher:
     def _fetch_account_usage(
         self,
         account_info: tuple[int, str, str, str, bool, str, str],
-        limit_resets: Callable[[], bool] | None = None,
+        limit_resets: oauth.LimitResetsGate | None = None,
     ) -> FetchRecord:
         """One network fetch for one account. Never raises.
 
@@ -4924,7 +4924,7 @@ class ClaudeAccountSwitcher:
     def _run_usage_fetches(
         self,
         infos: list[tuple[int, str, str, str, bool, str, str]],
-        limit_resets: Mapping[str, Callable[[], bool]] | None = None,
+        limit_resets: Mapping[str, oauth.LimitResetsGate] | None = None,
     ) -> dict[str, FetchRecord]:
         """Fetch the given accounts in parallel, staggering request starts so
         N accounts never hit the endpoint in the same instant. A slot with a
@@ -5071,10 +5071,8 @@ class ClaudeAccountSwitcher:
                 if uuid and num in claims
             }
             resets_gates = {
-                num: functools.partial(
-                    store.reserve_limit_resets,
-                    num, identities[num], claims[num], resets_every,
-                    account_uuid=uuids[num],
+                num: SlotResetsGate(
+                    store, num, identities[num], claims[num], resets_every, uuids[num]
                 )
                 for num in store.limit_resets_due(uuids, resets_every)
             }
@@ -5143,8 +5141,9 @@ class ClaudeAccountSwitcher:
         Anything else (another account, a failed probe, a slot with no
         stored uuid, an unreadable roster) is not kept: the slot's previous
         entry stays (the menu checks its ids before showing it) and the
-        reservation stamp stands, so pacing never depends on attribution;
-        the account the server did name is stamped as well.
+        reservation stamp stands, so pacing never depends on attribution
+        (the account the probe named was stamped before its resets request,
+        ``SlotResetsGate.admit``).
         """
         ids = self._slot_account_ids()
         out = dict(records)
@@ -5159,12 +5158,7 @@ class ClaudeAccountSwitcher:
                 and (read.org_uuid or "") == slot_org
             ):
                 continue
-            # The answer is dropped; the account the server named (if any)
-            # stays on the read, so the store paces that account too.
-            out[num] = dataclasses.replace(
-                record,
-                limit_resets=oauth.LimitResetsRead(None, read.account_uuid, read.org_uuid),
-            )
+            out[num] = dataclasses.replace(record, limit_resets=None)
             self._logger.debug(
                 "Limit resets answer for account %s not kept: the server did "
                 "not attest the token as this slot's account.", num,
