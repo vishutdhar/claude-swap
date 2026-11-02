@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -2053,11 +2054,8 @@ def _attested(cedar):
 
 
 def _stamps(store) -> dict:
-    """The per-account resets try stamps, as stored in their own file."""
-    try:
-        return json.loads(store.attempts.path.read_text(encoding="utf-8")).get("attempts", {})
-    except FileNotFoundError:
-        return {}
+    """The per-account resets try stamps (times), as stored in their own file."""
+    return store.attempts.read()
 
 
 def _stamp_of(store, num="1"):
@@ -2227,7 +2225,7 @@ class TestLimitResetsDue:
             clock.advance(60)
             claim = store.claim(["1"], IDENT)["1"]
             assert store.limit_resets_due({"1": "acct-1"}, every) == set()
-            assert store.reserve_limit_resets("1", IDENT["1"], claim, every, account_uuid=UUIDS["1"]) is False
+            assert store.reserve_limit_resets("1", IDENT["1"], claim, every, account_uuid=UUIDS["1"]) is None
         clock.advance(every)
         assert store.limit_resets_due({"1": "acct-1"}, every) == {"1"}
 
@@ -2271,7 +2269,7 @@ class TestLimitResetsDue:
             clock.advance(60)
             claim = store.claim(["1"], IDENT)["1"]
             assert store.limit_resets_due({"1": "acct-1"}, every) == set()
-            assert store.reserve_limit_resets("1", IDENT["1"], claim, every, account_uuid=UUIDS["1"]) is False
+            assert store.reserve_limit_resets("1", IDENT["1"], claim, every, account_uuid=UUIDS["1"]) is None
         clock.advance(every)
         assert store.limit_resets_due({"1": "acct-1"}, every) == {"1"}
 
@@ -2298,29 +2296,29 @@ class TestLimitResetsReservation:
 
     def test_a_reservation_stamps_the_try_before_any_request(self, store, clock):
         claim = self._lease(store)
-        assert store.reserve_limit_resets("1", IDENT["1"], claim, self.EVERY, account_uuid=UUIDS["1"]) is True
+        assert store.reserve_limit_resets("1", IDENT["1"], claim, self.EVERY, account_uuid=UUIDS["1"]) is not None
         assert self._stamp(store) == clock.now
         # The same pass asking again (a retry inside the fetch) is refused.
-        assert store.reserve_limit_resets("1", IDENT["1"], claim, self.EVERY, account_uuid=UUIDS["1"]) is False
+        assert store.reserve_limit_resets("1", IDENT["1"], claim, self.EVERY, account_uuid=UUIDS["1"]) is None
 
     def test_resets_attempt_survives_collector_loss_and_lease_expiry(self, store, clock):
         # Collector A wins the usage lease and the resets reservation, sends
         # the request, and is killed before it records anything.
         claim_a = self._lease(store)
-        assert store.reserve_limit_resets("1", IDENT["1"], claim_a, self.EVERY, account_uuid=UUIDS["1"]) is True
+        assert store.reserve_limit_resets("1", IDENT["1"], claim_a, self.EVERY, account_uuid=UUIDS["1"]) is not None
         clock.advance(usage_store.CLAIM_TTL_S + 1)  # A's lease runs out
         claim_b = self._lease(store)  # collector B takes the slot over
         assert claim_b != claim_a
-        assert store.reserve_limit_resets("1", IDENT["1"], claim_b, self.EVERY, account_uuid=UUIDS["1"]) is False
+        assert store.reserve_limit_resets("1", IDENT["1"], claim_b, self.EVERY, account_uuid=UUIDS["1"]) is None
         clock.advance(self.EVERY)
         claim_c = self._lease(store)
-        assert store.reserve_limit_resets("1", IDENT["1"], claim_c, self.EVERY, account_uuid=UUIDS["1"]) is True
+        assert store.reserve_limit_resets("1", IDENT["1"], claim_c, self.EVERY, account_uuid=UUIDS["1"]) is not None
 
     def test_no_reservation_without_the_usage_lease(self, store, clock):
         claim = self._lease(store)
-        assert store.reserve_limit_resets("1", IDENT["1"], "someone-elses", self.EVERY, account_uuid=UUIDS["1"]) is False
-        assert store.reserve_limit_resets("1", ("other@x.com", ""), claim, self.EVERY, account_uuid=UUIDS["1"]) is False
-        assert store.reserve_limit_resets("2", IDENT["2"], claim, self.EVERY, account_uuid=UUIDS["2"]) is False  # no row, no lease
+        assert store.reserve_limit_resets("1", IDENT["1"], "someone-elses", self.EVERY, account_uuid=UUIDS["1"]) is None
+        assert store.reserve_limit_resets("1", ("other@x.com", ""), claim, self.EVERY, account_uuid=UUIDS["1"]) is None
+        assert store.reserve_limit_resets("2", IDENT["2"], claim, self.EVERY, account_uuid=UUIDS["2"]) is None  # no row, no lease
         assert self._stamp(store) is None
 
     def test_a_lock_that_cannot_be_had_refuses_the_read(self, store, clock, monkeypatch):
@@ -2332,7 +2330,7 @@ class TestLimitResetsReservation:
             raise LockError("held")
 
         monkeypatch.setattr(store, "_lock", busy)
-        assert store.reserve_limit_resets("1", IDENT["1"], claim, self.EVERY, account_uuid=UUIDS["1"]) is False
+        assert store.reserve_limit_resets("1", IDENT["1"], claim, self.EVERY, account_uuid=UUIDS["1"]) is None
 
     def test_recording_an_answer_no_account_was_named_for_does_not_stamp(self, store, clock):
         # The record fills in the result; it stamps only an account the
@@ -2369,7 +2367,9 @@ class TestLimitResetsAttemptsFile:
     def test_the_file_sits_beside_usage_json_with_its_own_lock(self, store, clock):
         _resets_pass(store, "1", _attested(_cedar_with()))
         assert store.attempts.path == store.path.parent / "limit_resets_attempts.json"
-        assert json.loads(store.attempts.path.read_text()) == {"attempts": {"acct-1": clock.now}}
+        stored = json.loads(store.attempts.path.read_text())["attempts"]
+        assert list(stored) == ["acct-1"] and stored["acct-1"]["t"] == clock.now
+        assert re.fullmatch(r"[0-9a-f]{32}", stored["acct-1"]["id"])  # the reservation's own token
         assert "limitResetsAttempts" not in json.loads(store.path.read_text())
         assert all("limitResetsAttemptAt" not in row for row in json.loads(store.path.read_text())["accounts"].values())
 
@@ -2382,7 +2382,7 @@ class TestLimitResetsAttemptsFile:
         clock.advance(1)
         assert store.limit_resets_due({"1": "acct-1"}, self.EVERY) == set()
         claim = store.claim(["1"], IDENT)["1"]
-        assert store.reserve_limit_resets("1", IDENT["1"], claim, self.EVERY, account_uuid="acct-1") is False
+        assert store.reserve_limit_resets("1", IDENT["1"], claim, self.EVERY, account_uuid="acct-1") is None
 
     def test_renew_heal_preserves_resets_attempts(self, store, clock):
         # cswap-renew's heal writes back a usage.json of schemaVersion and the
@@ -2422,7 +2422,7 @@ class TestLimitResetsAttemptsFile:
         clock.advance(60)
         assert store.limit_resets_due({"1": "acct-1"}, self.EVERY) == set()
         claim = store.claim(["1"], moved)["1"]
-        assert store.reserve_limit_resets("1", moved["1"], claim, self.EVERY, account_uuid="acct-1") is False
+        assert store.reserve_limit_resets("1", moved["1"], claim, self.EVERY, account_uuid="acct-1") is None
 
     def test_stamps_older_than_a_week_are_dropped_on_write(self, store, clock):
         _resets_pass(store, "1", _attested(_cedar_with()))
@@ -2447,10 +2447,53 @@ class TestLimitResetsAttemptsFile:
                 return False
 
         monkeypatch.setattr(usage_store, "FileLock", Busy)
-        assert store.attempts.reserve("acct-1", self.EVERY) is False
+        assert store.attempts.reserve("acct-1", self.EVERY) is None
         assert _stamps(store) == {}
 
     def test_a_slot_without_a_stored_uuid_is_never_due(self, store, clock):
         assert store.limit_resets_due({"1": ""}, self.EVERY) == set()
         claim = store.claim(["1"], IDENT)["1"]
-        assert store.reserve_limit_resets("1", IDENT["1"], claim, self.EVERY, account_uuid="") is False
+        assert store.reserve_limit_resets("1", IDENT["1"], claim, self.EVERY, account_uuid="") is None
+
+
+class TestLimitResetsReservationTokens:
+    """Each stamp carries the token of the reservation that wrote it."""
+
+    EVERY = 3600.0
+
+    def test_a_reservation_owns_its_stamp_until_a_newer_one_takes_it(self, store, clock):
+        first = store.attempts.reserve("acct-1", self.EVERY)
+        assert first and store.attempts.holds("acct-1", first)
+        clock.advance(self.EVERY)
+        second = store.attempts.reserve("acct-1", self.EVERY)
+        assert second and second != first
+        assert not store.attempts.holds("acct-1", first)
+        assert store.attempts.holds("acct-1", second)
+        assert not store.attempts.holds("acct-1", None) and not store.attempts.holds("acct-9", second)
+
+    def test_a_bare_number_entry_paces_but_is_never_owned(self, store, clock):
+        store.attempts.path.parent.mkdir(parents=True, exist_ok=True)
+        store.attempts.path.write_text(json.dumps({"attempts": {"acct-1": clock.now}}))
+        assert store.attempts.read() == {"acct-1": clock.now}
+        assert store.attempts.reserve("acct-1", self.EVERY) is None  # still paced by it
+        assert not store.attempts.holds("acct-1", "anything")
+
+    def test_the_slot_gate_admits_its_own_account_only_while_it_holds_the_stamp(self, store, clock):
+        claim = store.claim(["1"], IDENT)["1"]
+        gate = usage_store.SlotResetsGate(store, "1", IDENT["1"], claim, self.EVERY, "acct-1")
+        assert not gate.admit("acct-1")  # nothing reserved yet
+        assert gate.reserve()
+        assert gate.admit("acct-1")
+        clock.advance(self.EVERY)
+        assert store.attempts.reserve("acct-1", self.EVERY)  # a newer collector's reservation
+        assert not gate.admit("acct-1")
+
+    def test_the_slot_gate_reserves_another_account_it_is_handed(self, store, clock):
+        claim = store.claim(["1"], IDENT)["1"]
+        gate = usage_store.SlotResetsGate(store, "1", IDENT["1"], claim, self.EVERY, "acct-1")
+        assert gate.reserve()
+        assert gate.admit("acct-x")  # due: reserved and stamped
+        assert "acct-x" in store.attempts.read()
+        other = usage_store.SlotResetsGate(store, "2", IDENT["2"], store.claim(["2"], IDENT)["2"], self.EVERY, "acct-2")
+        assert other.reserve()
+        assert not other.admit("acct-x")  # already read this interval

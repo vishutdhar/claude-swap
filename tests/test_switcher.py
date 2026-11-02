@@ -13816,7 +13816,7 @@ class TestLimitResetsProfileProbeFailures(_ResetsNetHelpers):
         log = []
         self._pass(s, log, on_profile=another_collector_takes_the_slot)
         ((claim, won),) = taken
-        assert won is False  # the account's try is already stamped
+        assert won is None  # the account's try is already stamped
         row = self._row(s)
         assert row["claimId"] == claim  # the late writer was fenced out
         assert self._left(s) is None  # and its answer not written over the new lease
@@ -13930,3 +13930,37 @@ class TestLimitResetsProbeBeforeRead:
             assert {"uuid-A", "uuid-B"} <= set(_resets_stamps(s))
             s._collect_usage_entries(s._build_accounts_info(), fetch={"2"})
         assert sent == ["sk-a"]  # A's own slot waits out A's interval
+
+
+class TestLimitResetsReservationOwnsItsStamp(_ResetsNetHelpers):
+    """A reservation owns the stamp it wrote: a probe that outlives its
+    interval, while a newer collector reserves the same account, sends
+    nothing."""
+
+    @pytest.mark.no_limit_resets_fake
+    @pytest.mark.no_oauth_profile_fake
+    @pytest.mark.parametrize("fresh, every", [(False, 3600.0), (True, 600.0)], ids=["hourly", "refresh-now"])
+    def test_probe_outlives_resets_interval_and_newer_reservation_blocks_old_request(
+        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch, fresh, every
+    ):
+        monkeypatch.setattr(oauth, "claude_code_user_agent", lambda: "claude-cli/2.1.316 (external, cli)")
+        s = self._switcher(sample_sequence_data)
+        now = [time.time()]
+        s._usage_store.clock = lambda: now[0]
+        ident = ("account2@example.com", "")
+        newer = []
+
+        def stall_past_the_interval(token):
+            if token != "sk-a2" or newer:
+                return
+            # The probe hangs past the interval; meanwhile another collector
+            # takes the slot over, reserves the account and sends its read.
+            now[0] += every + 1
+            claim = s._usage_store.claim(["2"], {"2": ident})["2"]
+            newer.append(s._usage_store.reserve_limit_resets("2", ident, claim, every, account_uuid="uuid-2"))
+
+        log = []
+        self._pass(s, log, fresh=fresh, on_profile=stall_past_the_interval)
+        assert newer and newer[0]  # the newer collector won the account's read
+        assert ("profile", "sk-a2", "claude-swap/1.0") in log
+        assert [t for kind, t, _u in log if kind == "resets" and t == "sk-a2"] == []  # the old one sends nothing

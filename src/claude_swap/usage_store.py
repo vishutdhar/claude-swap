@@ -91,10 +91,15 @@ LIMIT_RESETS_LOCK_WAIT_S = 2.0  # a fetch worker waits no longer for the attempt
 
 
 class LimitResetsAttempts:
-    """When each account last tried its limit-resets read.
+    """When each account last tried its limit-resets read, and which
+    reservation wrote that.
 
     ``cache/limit_resets_attempts.json``: ``{"attempts": {"<account uuid>":
-    epoch}}``. Its own file with its own lock sidecar (``<file>.lock``), as
+    {"t": epoch, "id": token}}}``, the token the reservation's own (as the
+    Codex launch budget tokens its launches), so a reservation can tell
+    whether the stamp is still its own before it sends. A bare number (no
+    released build wrote one) reads as a stamp with no token, which no
+    reservation owns. Its own file with its own lock sidecar (``<file>.lock``), as
     the Codex launch budget keeps its log, and written only here, so
     nothing that rewrites usage.json can erase it, and nothing in it can
     break a usage read. Every value goes through ``finite_float``: a number
@@ -110,50 +115,69 @@ class LimitResetsAttempts:
         self._lock_path = cache_dir / (LIMIT_RESETS_ATTEMPTS_FILE + ".lock")
         self.clock = clock
 
-    def read(self) -> dict[str, float]:
-        """The stamps, by account uuid; an unreadable file is empty. Never raises."""
+    def _entries(self) -> dict[str, tuple[float, str | None]]:
+        """``{uuid: (stamp, reservation token or None)}``; an unreadable file
+        is empty. Never raises."""
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError, RecursionError):
             return {}
         stamps = raw.get("attempts") if isinstance(raw, dict) else None
-        out: dict[str, float] = {}
+        out: dict[str, tuple[float, str | None]] = {}
         if isinstance(stamps, dict):
             for uuid, value in stamps.items():
-                stamp = finite_float(value)
+                if isinstance(value, dict):
+                    stamp = finite_float(value.get("t"))
+                    token = value.get("id")
+                    token = token if isinstance(token, str) and token else None
+                else:
+                    stamp, token = finite_float(value), None
                 if isinstance(uuid, str) and uuid and stamp is not None:
-                    out[uuid] = stamp
+                    out[uuid] = (stamp, token)
         return out
+
+    def read(self) -> dict[str, float]:
+        """The stamps, by account uuid; an unreadable file is empty. Never raises."""
+        return {uuid: stamp for uuid, (stamp, _token) in self._entries().items()}
+
+    def holds(self, account_uuid: str, token: str | None) -> bool:
+        """Whether ``account_uuid``'s stamp is still the one the reservation
+        ``token`` wrote: no newer reservation has taken the account since."""
+        entry = self._entries().get(account_uuid)
+        return token is not None and entry is not None and entry[1] == token
 
     def due(self, account_uuid: str, max_age_s: float, stamps: dict[str, float] | None = None) -> bool:
         """Whether ``account_uuid``'s read is due (``_limit_resets_due``)."""
         stamps = self.read() if stamps is None else stamps
         return _limit_resets_due(stamps.get(account_uuid), self.clock(), max_age_s)
 
-    def reserve(self, account_uuid: str, max_age_s: float) -> bool:
+    def reserve(self, account_uuid: str, max_age_s: float) -> str | None:
         """Under the lock: stamp ``account_uuid`` now when its read is due.
 
-        False when it is not due, or the lock cannot be had, or the file
-        cannot be written: no stamp, no read.
+        Returns the reservation's token, written beside the stamp; None
+        when it is not due, or the lock cannot be had, or the file cannot
+        be written: no stamp, no read.
         """
         if not account_uuid:
-            return False
+            return None
         try:
             with FileLock(self._lock_path, timeout=LIMIT_RESETS_LOCK_WAIT_S):
                 now = self.clock()
-                stamps = self.read()
-                if not _limit_resets_due(stamps.get(account_uuid), now, max_age_s):
-                    return False
-                stamps[account_uuid] = now
-                self._write(stamps, now)
-                return True
+                entries = self._entries()
+                stamp = entries.get(account_uuid, (None, None))[0]
+                if not _limit_resets_due(stamp, now, max_age_s):
+                    return None
+                token = uuid.uuid4().hex
+                entries[account_uuid] = (now, token)
+                self._write(entries, now)
+                return token
         except (LockError, OSError):
-            return False
+            return None
 
-    def _write(self, stamps: dict[str, float], now: float) -> None:
+    def _write(self, entries: dict[str, tuple[float, str | None]], now: float) -> None:
         kept = {
-            uuid: stamp
-            for uuid, stamp in stamps.items()
+            account: {"t": stamp, "id": token}
+            for account, (stamp, token) in entries.items()
             if now - stamp <= LIMIT_RESETS_ATTEMPTS_KEEP_S
         }
         atomic_write_json(self.path, {"attempts": kept})
@@ -1352,7 +1376,7 @@ class UsageStore:
         max_age_s: float,
         *,
         account_uuid: str,
-    ) -> bool:
+    ) -> str | None:
         """Win the right to send one limit-resets read for ``num``, now.
 
         Asked right before the request is sent. Under this store's lock the
@@ -1362,51 +1386,64 @@ class UsageStore:
         ``account_uuid``'s read must be due and is stamped before any byte
         goes out (``LimitResetsAttempts.reserve``), so its next read is
         paced from it whatever becomes of this one's record or of the
-        slot's row. A lock that cannot be had, or a file that cannot be
-        written, refuses: no reservation, no read.
+        slot's row. Returns the reservation's token (see
+        ``LimitResetsAttempts``). A lock that cannot be had, or a file that
+        cannot be written, refuses: no reservation (None), no read.
         """
         if not account_uuid:
-            return False
+            return None
         try:
             with self._lock():
                 row = self._read_rows().get(num)
                 if not self._matches(row, identity) or row.get("claimId") != claim_id:
-                    return False
+                    return None
                 return self.attempts.reserve(account_uuid, max_age_s)
         except (LockError, OSError):
-            return False
+            return None
 
 
-@dataclass(frozen=True)
 class SlotResetsGate:
     """The ``oauth.LimitResetsGate`` of one slot's fetch in one pass.
 
     ``reserve()`` wins the slot's read for its stored account
     (``UsageStore.reserve_limit_resets``: the usage lease still held, the
-    account due, and stamped). ``admit(uuid)`` lets the resets request go to
-    the account the profile probe named: at once when it is the slot's own
-    (just reserved), else only when that account's read is due too, and
-    then it is stamped (``LimitResetsAttempts.reserve``), so an account read
-    through another slot is paced as well.
+    account due, and stamped) and keeps the reservation's token.
+    ``admit(uuid)`` lets the resets request go to the account the profile
+    probe named. When it is the slot's own, only while the stamp is still
+    this reservation's: a probe that outlived the interval while a newer
+    collector reserved the account sends nothing. Any other account must be
+    due too, and is then reserved (``LimitResetsAttempts.reserve``), so an
+    account read through another slot is paced as well.
     """
 
-    store: "UsageStore"
-    num: str
-    identity: Identity
-    claim_id: str
-    max_age_s: float
-    account_uuid: str
+    def __init__(
+        self,
+        store: "UsageStore",
+        num: str,
+        identity: Identity,
+        claim_id: str,
+        max_age_s: float,
+        account_uuid: str,
+    ) -> None:
+        self.store = store
+        self.num = num
+        self.identity = identity
+        self.claim_id = claim_id
+        self.max_age_s = max_age_s
+        self.account_uuid = account_uuid
+        self._token: str | None = None
 
     def reserve(self) -> bool:
-        return self.store.reserve_limit_resets(
+        self._token = self.store.reserve_limit_resets(
             self.num, self.identity, self.claim_id, self.max_age_s,
             account_uuid=self.account_uuid,
         )
+        return self._token is not None
 
     def admit(self, account_uuid: str) -> bool:
         if account_uuid == self.account_uuid:
-            return True
-        return self.store.attempts.reserve(account_uuid, self.max_age_s)
+            return self.store.attempts.holds(account_uuid, self._token)
+        return self.store.attempts.reserve(account_uuid, self.max_age_s) is not None
 
 
 def _num_or_none(value: object) -> float | None:
