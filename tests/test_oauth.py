@@ -1934,7 +1934,8 @@ class TestFetchUsageWithLimitResets:
             )
         assert out.error is None and out.usage["five_hour"]["pct"] == 12.0
         # Tagged with the credential that asked, for the collector's check.
-        assert out.limit_resets == oauth.LimitResetsRead(cedar, oauth.credential_fingerprint(self._creds()))
+        # The suite's profile stub answers nothing: an unattested answer.
+        assert out.limit_resets == oauth.LimitResetsRead(cedar)
         assert tokens == ["old-access"]
         assert "limit_resets" not in out.usage  # the store merges it, with its own clock
 
@@ -1971,7 +1972,7 @@ class TestFetchUsageWithLimitResets:
                 "1", "a@x.com", self._creds(), is_active=True, limit_resets=lambda: True,
             )
         assert out.error is None and out.usage is not None
-        assert out.limit_resets == oauth.LimitResetsRead(None, oauth.credential_fingerprint(self._creds()))
+        assert out.limit_resets == oauth.LimitResetsRead(None)
 
     def test_a_resets_read_that_raises_never_fails_the_usage_read(self, monkeypatch):
         def boom(token):
@@ -1983,7 +1984,7 @@ class TestFetchUsageWithLimitResets:
                 "1", "a@x.com", self._creds(), is_active=True, limit_resets=lambda: True,
             )
         assert out.error is None and out.usage["seven_day"]["pct"] == 34.0
-        assert out.limit_resets == oauth.LimitResetsRead(None, oauth.credential_fingerprint(self._creds()))
+        assert out.limit_resets == oauth.LimitResetsRead(None)
 
     def test_after_a_401_refresh_the_resets_read_uses_the_new_token(self, monkeypatch):
         tokens = []
@@ -2006,8 +2007,7 @@ class TestFetchUsageWithLimitResets:
         assert calls == ["old-access", "new-access"]
         assert tokens == ["new-access"]
         # The refreshed credential asked, so it is the one named.
-        assert out.limit_resets == oauth.LimitResetsRead(_cedar(), oauth.credential_fingerprint(refreshed))
-        assert out.limit_resets.credential_fp != oauth.credential_fingerprint(self._creds())
+        assert out.limit_resets == oauth.LimitResetsRead(_cedar())
 
 
 class TestLimitResetsGate:
@@ -2057,9 +2057,7 @@ class TestReadLimitResetsFor:
         tokens = []
         monkeypatch.setattr(oauth, "request_limit_resets", lambda token: tokens.append(token) or _cedar())
         creds = json.dumps({"claudeAiOauth": {"accessToken": "tok-live"}})
-        assert oauth.read_limit_resets_for(creds, lambda: True) == oauth.LimitResetsRead(
-            _cedar(), oauth.credential_fingerprint(creds)
-        )
+        assert oauth.read_limit_resets_for(creds, lambda: True) == oauth.LimitResetsRead(_cedar())
         assert oauth.read_limit_resets_for(creds, lambda: False) is None
         assert tokens == ["tok-live"]
 
@@ -2086,3 +2084,64 @@ class TestLimitResetsUsableNow:
         assert oauth.summarize_limit_resets(entry, _NOW + 31)["usable_now"] is False  # the usable one ended
         paused = _summary(_cedar([_grant(paused=True, usable_now=True)]))
         assert (paused["paused"], paused["usable_now"]) == (True, False)
+
+
+
+class TestLimitResetsAttestation:
+    """After an answered resets read, the profile probe with the same token
+    says whose account it is; the read carries the server's ids."""
+
+    def test_the_probe_follows_an_answered_read_with_the_same_token(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(oauth, "request_limit_resets", lambda token: calls.append(("resets", token)) or _cedar())
+        monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: calls.append(("profile", token)) or {
+            "uuid": "acct-9", "email": "a@x.com", "organizationUuid": "org-9"})
+        read = oauth._read_limit_resets("tok-1", lambda: True)
+        assert calls == [("resets", "tok-1"), ("profile", "tok-1")]
+        assert read == oauth.LimitResetsRead(_cedar(), "acct-9", "org-9")
+
+    def test_no_probe_after_a_read_that_did_not_answer(self, monkeypatch):
+        probed = []
+        monkeypatch.setattr(oauth, "request_limit_resets", lambda token: None)
+        monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: probed.append(token))
+        assert oauth._read_limit_resets("tok-1", lambda: True) == oauth.LimitResetsRead(None)
+        assert probed == []
+
+    @pytest.mark.parametrize("profile", [None, {}])
+    def test_a_probe_that_names_no_account_leaves_the_read_unattested(self, monkeypatch, profile):
+        monkeypatch.setattr(oauth, "request_limit_resets", lambda token: _cedar())
+        monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: profile)
+        read = oauth._read_limit_resets("tok-1", lambda: True)
+        assert (read.cedar_ember, read.account_uuid, read.org_uuid) == (_cedar(), None, None)
+
+    def test_a_probe_that_raises_leaves_the_read_unattested(self, monkeypatch):
+        monkeypatch.setattr(oauth, "request_limit_resets", lambda token: _cedar())
+
+        def boom(token):
+            raise RuntimeError("broken")
+
+        monkeypatch.setattr(oauth, "fetch_oauth_profile", boom)
+        assert oauth._read_limit_resets("tok-1", lambda: True) == oauth.LimitResetsRead(_cedar())
+
+    def test_after_a_401_refresh_the_probe_uses_the_new_token(self, monkeypatch):
+        probed = []
+        monkeypatch.setattr(oauth, "request_limit_resets", lambda token: _cedar())
+        monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: probed.append(token) or {
+            "uuid": "acct-2", "email": "b@x.com", "organizationUuid": None})
+        calls = []
+
+        def usage(token):
+            calls.append(token)
+            if len(calls) == 1:
+                raise urllib.error.HTTPError("u", 401, "Unauthorized", hdrs=None, fp=None)
+            return {"seven_day": {"utilization": 1.0}}
+
+        old = TestFetchUsageWithLimitResets._creds()
+        new = TestFetchUsageWithLimitResets._creds(access="new-access", refresh="new-refresh")
+        with patch("claude_swap.oauth.request_usage_data", side_effect=usage):
+            out = oauth.try_fetch_usage_for_account(
+                "2", "b@x.com", old, is_active=False,
+                refresh_via=lambda *_: oauth.RefreshOutcome(new, None), limit_resets=lambda: True,
+            )
+        assert probed == ["new-access"]
+        assert (out.limit_resets.account_uuid, out.limit_resets.org_uuid) == ("acct-2", None)

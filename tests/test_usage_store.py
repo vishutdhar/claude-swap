@@ -2043,6 +2043,11 @@ def _cedar_with(left=1, ends_at="2099-01-01T00:00:00+00:00", **grant):
 NO_GRANT = {"eligible": False, "ineligible_reason": "no_grant", "grants": []}
 
 
+def _attested(cedar):
+    """An answered read the server attested (the profile probe named an account)."""
+    return oauth.LimitResetsRead(cedar, "acct-1", "")
+
+
 def _resets_pass(store, num, read, usage=USAGE, every=3600.0):
     """One fetch of ``num`` as the collector makes it: the usage lease, the
     resets read reserved (and so stamped) right before it is sent, then the
@@ -2059,16 +2064,17 @@ class TestLimitResetsRecord:
         return json.loads(store.path.read_text(encoding="utf-8"))["accounts"][num]
 
     def test_a_read_with_a_grant_is_stored_beside_the_windows(self, store, clock):
-        _resets_pass(store, "1", oauth.LimitResetsRead(_cedar_with()))
+        _resets_pass(store, "1", _attested(_cedar_with()))
         row = self._row(store)
         entry = row["lastGood"]["limit_resets"]
         assert entry["grants"][0]["left"] == 1 and entry["fetched_at"] == clock.now
+        assert (entry["account_uuid"], entry["org_uuid"]) == ("acct-1", "")  # the attested ids
         assert {k: v for k, v in row["lastGood"].items() if k != "limit_resets"} == USAGE
         assert row["limitResetsAttemptAt"] == clock.now
         assert store.entries(IDENT)["1"].last_good["limit_resets"] == entry
 
     def test_later_usage_reads_without_a_resets_read_carry_the_entry(self, store, clock):
-        _resets_pass(store, "1", oauth.LimitResetsRead(_cedar_with()))
+        _resets_pass(store, "1", _attested(_cedar_with()))
         first = self._row(store)["lastGood"]["limit_resets"]
         clock.advance(400)
         newer = {"five_hour": {"pct": 30.0}, "seven_day": {"pct": 11.0}}
@@ -2079,7 +2085,7 @@ class TestLimitResetsRecord:
         assert row["limitResetsAttemptAt"] == clock.now - 400
 
     def test_a_failed_resets_read_keeps_the_old_entry_and_notes_the_try(self, store, clock):
-        _resets_pass(store, "1", oauth.LimitResetsRead(_cedar_with()))
+        _resets_pass(store, "1", _attested(_cedar_with()))
         first = self._row(store)["lastGood"]["limit_resets"]
         clock.advance(4000)
         _resets_pass(store, "1", oauth.LimitResetsRead(None))
@@ -2090,22 +2096,22 @@ class TestLimitResetsRecord:
         assert entry.consecutive_failures == 0 and entry.last_error is None  # the usage read stands
 
     def test_a_no_grant_answer_removes_the_entry(self, store, clock):
-        _resets_pass(store, "1", oauth.LimitResetsRead(_cedar_with()))
+        _resets_pass(store, "1", _attested(_cedar_with()))
         clock.advance(4000)
-        _resets_pass(store, "1", oauth.LimitResetsRead(NO_GRANT))
+        _resets_pass(store, "1", _attested(NO_GRANT))
         row = self._row(store)
         assert "limit_resets" not in row["lastGood"]
         assert row["lastGood"] == USAGE
         assert row["limitResetsAttemptAt"] == clock.now
 
     def test_a_no_grant_account_keeps_a_plain_last_good(self, store, clock):
-        _resets_pass(store, "1", oauth.LimitResetsRead(NO_GRANT))
+        _resets_pass(store, "1", _attested(NO_GRANT))
         row = self._row(store)
         assert row["lastGood"] == USAGE  # no key at all for the three accounts without a grant
         assert row["limitResetsAttemptAt"] == clock.now
 
     def test_the_entry_survives_a_usage_429_like_the_windows(self, store, clock):
-        _resets_pass(store, "1", oauth.LimitResetsRead(_cedar_with()))
+        _resets_pass(store, "1", _attested(_cedar_with()))
         before = self._row(store)
         clock.advance(120)
         store.record({"1": FetchRecord(error="http-429", retry_after_s=30.0)}, IDENT)
@@ -2115,12 +2121,12 @@ class TestLimitResetsRecord:
         assert after["lastError"] == "http-429"
 
     def test_a_success_without_windows_drops_the_entry_with_last_good(self, store, clock):
-        _resets_pass(store, "1", oauth.LimitResetsRead(_cedar_with()))
+        _resets_pass(store, "1", _attested(_cedar_with()))
         store.record({"1": FetchRecord(usage=None)}, IDENT)
         assert self._row(store)["lastGood"] is None  # never a dict of resets alone
 
     def test_a_new_account_in_the_slot_inherits_nothing(self, store, clock):
-        _resets_pass(store, "1", oauth.LimitResetsRead(_cedar_with()))
+        _resets_pass(store, "1", _attested(_cedar_with()))
         other = {"1": ("someone@else.com", "")}
         store.record({"1": FetchRecord(usage=USAGE)}, other)
         row = self._row(store)
@@ -2132,10 +2138,10 @@ class TestLimitResetsRecord:
         # is live by it (and long over by the wall clock); one that ended a
         # second earlier is not.
         live = _cedar_with(ends_at="1970-01-12T13:46:41+00:00")  # 1_000_001 s
-        _resets_pass(store, "1", oauth.LimitResetsRead(live))
+        _resets_pass(store, "1", _attested(live))
         assert self._row(store)["lastGood"]["limit_resets"]["grants"][0]["left"] == 1
         ended = _cedar_with(ends_at="1970-01-12T13:46:39+00:00")  # 999_999 s
-        _resets_pass(store, "2", oauth.LimitResetsRead(ended))
+        _resets_pass(store, "2", _attested(ended))
         assert "limit_resets" not in self._row(store, "2")["lastGood"]
 
 
@@ -2154,7 +2160,7 @@ class TestLimitResetsDue:
         assert store.limit_resets_due(["1"], IDENT, usage_store.LIMIT_RESETS_EVERY_S) == {"1"}
 
     def test_paced_hourly_from_the_last_try(self, store, clock):
-        self._seed(store, oauth.LimitResetsRead(NO_GRANT))
+        self._seed(store, _attested(NO_GRANT))
         every = usage_store.LIMIT_RESETS_EVERY_S
         assert every == 3600.0
         clock.advance(every - 1)
@@ -2168,7 +2174,7 @@ class TestLimitResetsDue:
         assert store.limit_resets_due(["1"], IDENT, usage_store.LIMIT_RESETS_EVERY_S) == set()
 
     def test_the_manual_pace_is_ten_minutes(self, store, clock):
-        self._seed(store, oauth.LimitResetsRead(_cedar_with()))
+        self._seed(store, _attested(_cedar_with()))
         manual = usage_store.LIMIT_RESETS_MANUAL_EVERY_S
         assert manual == 600.0
         clock.advance(manual - 1)
@@ -2180,7 +2186,7 @@ class TestLimitResetsDue:
     def test_the_entry_time_never_paces(self, store, clock):
         # Only the reservation's own stamp paces: an entry, however recent,
         # with no try stamp beside it is due.
-        self._seed(store, oauth.LimitResetsRead(_cedar_with()))
+        self._seed(store, _attested(_cedar_with()))
         table = json.loads(store.path.read_text(encoding="utf-8"))
         del table["accounts"]["1"]["limitResetsAttemptAt"]
         store.path.write_text(json.dumps(table), encoding="utf-8")
@@ -2194,7 +2200,7 @@ class TestLimitResetsDue:
         # dated ahead, forward. The fetches after it are paced from the new
         # reservation, not kept due by the entry's time.
         every = usage_store.LIMIT_RESETS_EVERY_S
-        self._seed(store, oauth.LimitResetsRead(_cedar_with()))
+        self._seed(store, _attested(_cedar_with()))
         clock.advance(-7200)
         assert store.limit_resets_due(["1"], IDENT, every) == {"1"}
         _resets_pass(store, "1", oauth.LimitResetsRead(None))
@@ -2211,12 +2217,12 @@ class TestLimitResetsDue:
     def test_a_stamp_a_little_ahead_counts_as_just_made(self, store, clock):
         # Within the slack the other clocks allow (codex_usage.dated_ahead),
         # a stamp ahead of the clock is a try just made, not a wrong clock's.
-        self._seed(store, oauth.LimitResetsRead(NO_GRANT))
+        self._seed(store, _attested(NO_GRANT))
         clock.advance(-200)
         assert store.limit_resets_due(["1"], IDENT, usage_store.LIMIT_RESETS_EVERY_S) == set()
 
     def test_a_stamp_dated_ahead_of_the_clock_is_due(self, store, clock):
-        self._seed(store, oauth.LimitResetsRead(NO_GRANT))
+        self._seed(store, _attested(NO_GRANT))
         clock.advance(-7200)  # the clock was put back two hours
         assert store.limit_resets_due(["1"], IDENT, usage_store.LIMIT_RESETS_EVERY_S) == {"1"}
 
@@ -2233,7 +2239,7 @@ class TestLimitResetsDue:
         # kept) is replaced at the next read, which waits out the interval
         # from the last try like any other: a failing read that carries the
         # old entry forward must not let every fetch try again.
-        self._seed(store, oauth.LimitResetsRead(_cedar_with()))
+        self._seed(store, _attested(_cedar_with()))
         table = json.loads(store.path.read_text(encoding="utf-8"))
         table["accounts"]["1"]["lastGood"]["limit_resets"] = {
             "left": 1, "total": 1, "ends_at": "2099-01-01T00:00:00+00:00", "fetched_at": clock.now,
@@ -2254,7 +2260,7 @@ class TestLimitResetsDue:
         assert store.limit_resets_due(["1"], IDENT, every) == {"1"}
 
     def test_a_row_of_another_account_is_due(self, store, clock):
-        self._seed(store, oauth.LimitResetsRead(NO_GRANT))
+        self._seed(store, _attested(NO_GRANT))
         other = {"1": ("someone@else.com", "")}
         assert store.limit_resets_due(["1"], other, usage_store.LIMIT_RESETS_EVERY_S) == {"1"}
 
@@ -2313,23 +2319,23 @@ class TestLimitResetsReservation:
 
     def test_recording_the_result_does_not_stamp(self, store, clock):
         # The record only fills the result: the try time is the reservation's.
-        store.record({"1": FetchRecord(usage=USAGE, limit_resets=oauth.LimitResetsRead(_cedar_with()))}, IDENT)
+        store.record({"1": FetchRecord(usage=USAGE, limit_resets=_attested(_cedar_with()))}, IDENT)
         assert self._stamp(store) is None
         assert json.loads(store.path.read_text())["accounts"]["1"]["lastGood"]["limit_resets"]
 
 
-class TestDisownedLimitResets:
-    def test_a_disowned_answer_keeps_the_old_entry_and_clears_the_stamp(self, store, clock):
-        _resets_pass(store, "1", oauth.LimitResetsRead(_cedar_with()))
-        before = json.loads(store.path.read_text())["accounts"]["1"]["lastGood"]["limit_resets"]
+
+class TestUnattestedLimitResets:
+    def test_an_answer_no_account_was_attested_for_is_not_kept(self, store, clock):
+        # The profile probe failed (no account named): the answer is kept no
+        # more than a failed read, the previous entry stays and the try stands.
+        _resets_pass(store, "1", _attested(_cedar_with()))
+        before = json.loads(store.path.read_text())["accounts"]["1"]
         clock.advance(4000)
-        claim = store.claim(["1"], IDENT)["1"]
-        assert store.reserve_limit_resets("1", IDENT["1"], claim, 3600.0)
-        other = oauth.LimitResetsRead(_cedar_with(left=5))
-        store.record({"1": FetchRecord(usage=USAGE, limit_resets=other)}, IDENT,
-                     claims={"1": claim}, disowned_resets=["1"])
-        row = json.loads(store.path.read_text())["accounts"]["1"]
-        assert row["lastGood"]["limit_resets"] == before  # not the other account's answer
-        assert "limitResetsAttemptAt" not in row
-        assert store.limit_resets_due(["1"], IDENT, 3600.0) == {"1"}  # read again at once
-        assert row["lastGood"]["five_hour"] == USAGE["five_hour"]  # the usage stands
+        _resets_pass(store, "1", oauth.LimitResetsRead(_cedar_with(left=5)))
+        after = json.loads(store.path.read_text())["accounts"]["1"]
+        assert after["lastGood"]["limit_resets"] == before["lastGood"]["limit_resets"]
+        assert after["limitResetsAttemptAt"] == clock.now
+        clock.advance(4000)
+        _resets_pass(store, "1", oauth.LimitResetsRead(NO_GRANT))  # nor an unattested "no grant"
+        assert json.loads(store.path.read_text())["accounts"]["1"]["lastGood"]["limit_resets"]

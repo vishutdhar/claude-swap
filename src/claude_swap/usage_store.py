@@ -308,13 +308,9 @@ class FetchRecord:
     # behavior).
     struck_fp: str | None = None
     # The limit-resets read made with this success, or None when none was
-    # made. See _with_limit_resets for how it lands in lastGood.
+    # made (or its answer was not attested for this slot and is not kept).
+    # See _with_limit_resets for how it lands in lastGood.
     limit_resets: oauth.LimitResetsRead | None = None
-    # Where the fetch took the credential it read with: "active" (Claude
-    # Code's live store), "session" (the slot's session profile) or "backup"
-    # (the slot's backup copy). Lets the collector re-read the same source
-    # to check a resets answer is still this slot's before it is kept.
-    credential_source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1100,7 +1096,6 @@ class UsageStore:
         claims: dict[str, str] | None = None,
         plans: dict[str, tuple[float | None, float | None]] | None = None,
         post_429_floors: Iterable[str] = (),
-        disowned_resets: Iterable[str] = (),
     ) -> set[str]:
         """Merge outcomes fenced by the leases that produced them.
 
@@ -1120,14 +1115,8 @@ class UsageStore:
         Every success that installs a plan writes the field, null when the
         plan has no floor; a success without a plan leaves the stored plan,
         and so the field (or its absence), as it was.
-
-        ``disowned_resets`` names the slots whose limit-resets answer was
-        found to belong to another account (the collector's attribution
-        check): the answer is not kept, the slot's previous entry stays, and
-        the reservation stamp is cleared so the slot is read again at once.
         """
         post_429_floors = set(post_429_floors)
-        disowned_resets = set(disowned_resets)
         if not outcomes:
             return set()
         now = self.clock()
@@ -1142,16 +1131,12 @@ class UsageStore:
                 return
             row["lastAttemptAt"] = now
             if rec.error is None:
-                # The resets try was stamped when it was reserved; the
-                # record only fills in what it answered. A disowned answer
-                # is dropped and its stamp cleared.
-                disowned = num in disowned_resets
+                # The resets try was stamped when it was reserved, and that
+                # stamp stands whatever the answer: the record only fills
+                # in what it answered.
                 row["lastGood"] = _with_limit_resets(
-                    rec.usage, row.get("lastGood"),
-                    None if disowned else rec.limit_resets, now,
+                    rec.usage, row.get("lastGood"), rec.limit_resets, now
                 )
-                if disowned:
-                    row.pop("limitResetsAttemptAt", None)
                 row["fetchedAt"] = now
                 # Replace the old, possibly due plan in the outcome transaction
                 # so no collector can slip into a record→replan gap.
@@ -1431,20 +1416,29 @@ def _with_limit_resets(
 ) -> dict | None:
     """A success's ``lastGood``: its windows, and the limit-resets entry.
 
-    An answered read replaces the entry: the live grants
-    (``oauth.parse_limit_resets``) with ``fetched_at`` = ``now`` (the
-    store's clock), or no key at all when the account has no live grant. A failed read, or none made, carries the
+    An answered, attested read (one whose ``account_uuid`` the server
+    named) replaces the entry: the live grants (``oauth.parse_limit_resets``)
+    with ``fetched_at`` = ``now`` (the store's clock) and the attested
+    ``account_uuid``/``org_uuid``, which the menu compares with the slot's
+    current ids before it shows the entry; or no key at all when the account
+    has no live grant. A read without an attested account is kept no more
+    than a failed one. A failed read, or none made, carries the
     previous ``lastGood``'s entry forward unchanged, so a usage read in
     between never loses it. A success without window data stays None:
     ``lastGood`` is never an entry with no windows.
     """
     if not isinstance(usage, dict):
         return usage
-    if read is not None and read.cedar_ember is not None:
+    if read is not None and read.cedar_ember is not None and read.account_uuid:
         merged = {k: v for k, v in usage.items() if k != "limit_resets"}
         entry = oauth.parse_limit_resets(read.cedar_ember, now)
         if entry is not None:
-            merged["limit_resets"] = {**entry, "fetched_at": now}
+            merged["limit_resets"] = {
+                **entry,
+                "fetched_at": now,
+                "account_uuid": read.account_uuid,
+                "org_uuid": read.org_uuid or "",
+            }
         return merged
     if "limit_resets" in usage or not isinstance(previous, dict):
         return usage

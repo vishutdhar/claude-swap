@@ -4194,7 +4194,6 @@ class ClaudeAccountSwitcher:
                     error=outcome.error,
                     retry_after_s=outcome.retry_after_s,
                     limit_resets=resets,
-                    credential_source="active",
                 )
             # A locally-valid token the server rejects: revoked out-of-band
             # (measured: a sibling machine rotating a synced lineage kills
@@ -4645,7 +4644,6 @@ class ClaudeAccountSwitcher:
             error=outcome.error,
             retry_after_s=outcome.retry_after_s,
             limit_resets=outcome.limit_resets,
-            credential_source="active",
         )
 
     def _resync_rotated_backup(
@@ -4891,7 +4889,6 @@ class ClaudeAccountSwitcher:
                         error=outcome.error,
                         retry_after_s=outcome.retry_after_s,
                         limit_resets=outcome.limit_resets,
-                        credential_source="session",
                     )
                 if has_live_session:
                     # The live claude refreshes lazily on its next API call;
@@ -4918,7 +4915,6 @@ class ClaudeAccountSwitcher:
             retry_after_s=outcome.retry_after_s,
             struck_fp=outcome.struck_fp,
             limit_resets=outcome.limit_resets,
-            credential_source="backup",
         )
 
     def _run_usage_fetches(
@@ -5062,21 +5058,26 @@ class ClaudeAccountSwitcher:
             resets_every = (
                 LIMIT_RESETS_MANUAL_EVERY_S if fresh else LIMIT_RESETS_EVERY_S
             )
+            # A slot with no stored account uuid (a token-only account, a
+            # legacy row) has nothing to attest an answer against: no read.
+            attestable = {
+                num for num, (uuid, _org) in self._slot_account_ids().items() if uuid
+            }
             resets_gates = {
                 num: functools.partial(
                     store.reserve_limit_resets,
                     num, identities[num], claims[num], resets_every,
                 )
                 for num in store.limit_resets_due(claims, identities, resets_every)
+                if num in attestable
             }
             records = self._run_usage_fetches(
                 [info_by_num[num] for num in claims], limit_resets=resets_gates
             )
-            records, disowned = self._attribute_limit_resets(records, info_by_num)
+            records = self._attest_limit_resets(records)
             plans, floors = self._plans_after_fetch(records, pre, info_by_num)
             accepted = store.record(
-                records, identities, claims, plans, post_429_floors=floors,
-                disowned_resets=disowned,
+                records, identities, claims, plans, post_429_floors=floors
             )
             accepted_records = {
                 num: record for num, record in records.items() if num in accepted
@@ -5101,99 +5102,61 @@ class ClaudeAccountSwitcher:
             for num in info_by_num
         }
 
-    def _attribute_limit_resets(
-        self,
-        records: dict[str, FetchRecord],
-        info_by_num: dict[str, tuple[int, str, str, str, bool, str, str]],
-    ) -> tuple[dict[str, FetchRecord], list[str]]:
-        """Keep each limit-resets answer only while it is still this slot's.
+    def _slot_account_ids(self) -> dict[str, tuple[str, str]]:
+        """Each slot's stored ``(uuid, organizationUuid)``, read now; empty
+        when the roster cannot be read (then nothing is attested)."""
+        try:
+            accounts = (self._get_sequence_data() or {}).get("accounts") or {}
+        except Exception:
+            self._logger.debug("Roster unreadable; no limit resets attested.", exc_info=True)
+            return {}
+        return {
+            str(num): (
+                (account.get("uuid") or "").strip(),
+                (account.get("organizationUuid") or "").strip(),
+            )
+            for num, account in accounts.items()
+            if isinstance(account, dict)
+        }
 
-        Returns the records with every unattributed answer taken out, and
-        the slots whose answer was proven another account's (their
-        reservation is cleared by ``UsageStore.record``). An answer that
-        could not be checked (a read failed) is dropped too, but its slot
-        stays paced: nothing showed it was wrong.
+    def _attest_limit_resets(
+        self, records: dict[str, FetchRecord]
+    ) -> dict[str, FetchRecord]:
+        """Keep a limit-resets answer only for the slot the server says its
+        token belongs to.
+
+        The local sources a fetch takes its credential from (the slot's
+        backup, its session profile, Claude Code's live store) can race
+        with a swap, a ``/login`` or a Keychain failure and hand the fetch
+        another account's credential under this slot's name; the usage read
+        shares those races, which predate this feature. The resets answer
+        does not rely on them: it is kept only when the profile probe made
+        with the same token (``LimitResetsRead.account_uuid``/``org_uuid``)
+        names the slot's stored ``uuid`` and ``organizationUuid``, read now.
+        Anything else (another account, a failed probe, a slot with no
+        stored uuid, an unreadable roster) is not kept: the slot's previous
+        entry stays (the menu checks its ids before showing it) and the
+        reservation stamp stands, so pacing never depends on attribution.
         """
+        ids = self._slot_account_ids()
         out = dict(records)
-        disowned: list[str] = []
         for num, record in records.items():
-            if record.limit_resets is None:
+            read = record.limit_resets
+            if read is None or read.cedar_ember is None:
                 continue
-            verdict = self._limit_resets_attributed(num, info_by_num[num], record)
-            if verdict is True:
+            slot_uuid, slot_org = ids.get(num, ("", ""))
+            if (
+                slot_uuid
+                and read.account_uuid == slot_uuid
+                and (read.org_uuid or "") == slot_org
+            ):
                 continue
             out[num] = dataclasses.replace(record, limit_resets=None)
-            if verdict is False:
-                disowned.append(num)
-                self._logger.debug(
-                    "Limit resets answer for account %s dropped: the slot no "
-                    "longer holds the credential that asked.", num,
-                )
-        return out, disowned
-
-    def _limit_resets_attributed(
-        self,
-        num: str,
-        info: tuple[int, str, str, str, bool, str, str],
-        record: FetchRecord,
-    ) -> bool | None:
-        """Whether a resets answer belongs to slot ``num``: True, False
-        (proven another account's), or None (could not be checked).
-
-        Two snapshot races can hand a fetch another account's credential
-        under this slot's name: a same-email slot swap landing between the
-        metadata read and the (slot, email) backup read, and a session
-        profile replaced between its credential read and its identity check.
-        The usage read shares both (a pre-existing race, out of this
-        change's scope); for the resets answer the request itself is
-        harmless (it asks about the token's own account) and only keeping
-        it under this slot is wrong. So, read after the fetch: the slot's
-        metadata (email and organization) must still be what the fetch
-        started from, and the credential the read used
-        (``LimitResetsRead.credential_fp``) must still be the slot's own,
-        re-read from the same source (``FetchRecord.credential_source``).
-        Checked without any lock: a swap landing after this check cannot
-        make the answer wrong, because the check just proved the credential
-        that asked is the slot's.
-        """
-        _num, email, _org_name, org_uuid, _is_active, _creds, _alias = info
-        fp = record.limit_resets.credential_fp if record.limit_resets else None
-        try:
-            account = ((self._get_sequence_data() or {}).get("accounts") or {}).get(num)
-            if (
-                not isinstance(account, dict)
-                or account.get("email") != email
-                or (account.get("organizationUuid") or "") != (org_uuid or "")
-            ):
-                return False
-            if fp is None:
-                return None
-            source = record.credential_source
-            if source == "active":
-                current = self._read_active_credentials().value
-            elif source == "session":
-                from claude_swap.session import (
-                    read_session_credentials,
-                    session_identity_drifted,
-                )
-
-                session_dir = self._session_dir(num, email)
-                if session_identity_drifted(session_dir, email, org_uuid):
-                    return False
-                current = read_session_credentials(session_dir)
-            elif source == "backup":
-                current = self._read_account_credentials(num, email)
-            else:
-                return None
-        except Exception:
             self._logger.debug(
-                "Limit resets attribution for account %s could not be checked.",
-                num, exc_info=True,
+                "Limit resets answer for account %s not kept: the server did "
+                "not attest the token as this slot's account.", num,
             )
-            return None
-        if not current:
-            return None
-        return oauth.credential_fingerprint(current) == fp
+        return out
 
     def _slot_token_dead(self, num: str, email: str) -> bool:
         """Is this slot quarantined as refresh-token-dead, right now?
