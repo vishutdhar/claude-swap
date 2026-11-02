@@ -28,6 +28,7 @@ from AppKit import (
     NSBezierPath,
     NSBitmapImageFileTypePNG,
     NSColor,
+    NSColorSpace,
     NSCompositingOperationClear,
     NSFont,
     NSFontAttributeName,
@@ -59,6 +60,7 @@ CARD_ALPHA = 0.16  # the active account's accent card
 EXHAUSTED_FILL_ALPHA = 0.62  # an exhausted account's bar fills
 EXHAUSTED_OVER_ALPHA = 0.85  # an exhausted account's red over-limit percent
 TICK_ALPHA = 0.55  # the pace tick, label colour
+UNKNOWN_BADGE_ALPHA = 0.9  # an unknown usage-resets count: the secondary colour at this share of its alpha
 
 
 def live_view_count() -> int:
@@ -115,16 +117,37 @@ def _fill_rounded(rect, radius: float, color) -> None:
     NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(NSMakeRect(*rect), radius, radius).fill()
 
 
-def _stroke_rounded(rect, radius: float, color) -> None:
-    """A rounded outline drawn inside ``rect``, half a line in, so it stays crisp."""
+def _stroke_rounded(rect, radius: float, color, width: float) -> None:
+    """A rounded outline ``width`` wide drawn inside ``rect``, half a line in, so it stays crisp."""
     x, y, w, h = rect
-    half = mp.BADGE_STROKE / 2
+    half = width / 2
     path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
-        NSMakeRect(x + half, y + half, w - mp.BADGE_STROKE, h - mp.BADGE_STROKE), radius, radius
+        NSMakeRect(x + half, y + half, w - width, h - width), radius, radius
     )
-    path.setLineWidth_(mp.BADGE_STROKE)
+    path.setLineWidth_(width)
     color.setStroke()
     path.stroke()
+
+
+def _device_pixel(view) -> float:
+    """One device pixel in points: 0.5 on a Retina screen, 1 on a standard one.
+
+    AppKit answers for the view's screen, or for the main screen when the
+    view has no window. Without a usable answer (none, zero or below, not a
+    number, or more than a point) a whole point stands in, so the badge
+    still draws.
+    """
+    size = view.convertSizeFromBacking_((1.0, 1.0))
+    pixel = size.width if size is not None else None
+    if isinstance(pixel, (int, float)) and 0.0 < pixel <= 1.0:
+        return float(pixel)
+    return 1.0
+
+
+def _fainter(color, share: float):
+    """``color`` as the current appearance draws it, at ``share`` of its own alpha."""
+    resolved = color.colorUsingColorSpace_(NSColorSpace.sRGBColorSpace())
+    return resolved.colorWithAlphaComponent_(resolved.alphaComponent() * share)
 
 
 # ---- layout shared by every panel in one menu -----------------------------------------
@@ -433,7 +456,7 @@ def _draw_panel(view, dirty) -> None:
             NSColor.controlAccentColor().colorWithAlphaComponent_(CARD_ALPHA),
         )
 
-    _draw_header(panel, layout, cols, ink)
+    _draw_header(panel, layout, cols, ink, _device_pixel(view))
     y = mp.TOP_PAD + layout.header_h + mp.HEADER_GAP
     for row in panel.rows:
         _draw_row(row, y, layout, cols, ink)
@@ -453,15 +476,19 @@ def _badge_color(state: str, ink):
     if state == "over":
         return _fill_color("over")
     if state == "unknown":
-        return ink.tertiary
+        # A little fainter than a known count. Not the tertiary colour: on
+        # the menu that falls below the 3:1 a control's outline needs.
+        return _fainter(ink.secondary, UNKNOWN_BADGE_ALPHA)
     return ink.secondary
 
 
-def _draw_header(panel, layout, cols, ink) -> None:
+def _draw_header(panel, layout, cols, ink, pixel: float) -> None:
     """Slot number, name, email; on the right the state words (or the badge) and the age.
 
     The Codex block has no slot number; its plan type sits where the email
-    goes and its usage-resets badge before the age, in a rounded outline.
+    goes and its usage-resets badge before the age: a small tag in the
+    ACTIVE tag's font, on the age text's baseline, in a rounded outline one
+    device pixel (``pixel`` points) wide.
     """
     fonts, top, h = layout.fonts, mp.TOP_PAD, layout.header_h
 
@@ -480,19 +507,24 @@ def _draw_header(panel, layout, cols, ink) -> None:
             pieces.append((_text(word, fonts["meta"], ink.secondary), fonts["meta"], None))
     if panel.badge_text:
         color = _badge_color(panel.badge_state, ink)
-        pieces.append((_text(panel.badge_text, fonts["meta"], color), fonts["meta"], color))
+        pieces.append((_text(panel.badge_text, fonts["tag"], color), fonts["tag"], color))
     if panel.age_text:
         pieces.append((_text(panel.age_text, fonts["meta"], ink.tertiary), fonts["meta"], None))
     widths = [
         t.size().width + (2 * mp.BADGE_PAD_X if pill is not None else 0.0) for t, _f, pill in pieces
     ]
     xs, meta_w = mp.right_run(cols.reset_right, widths, mp.AGE_GAP)
-    for (text, font, pill), x, w in zip(pieces, xs, widths):
-        if pill is not None:
-            pill_h = _line_h(font) + 2 * mp.BADGE_PAD_Y
-            _stroke_rounded((x, top + (h - pill_h) / 2, w, pill_h), mp.BADGE_RADIUS, pill)
-            x += mp.BADGE_PAD_X
-        text.drawAtPoint_((x, centred(font)))
+    baseline = centred(fonts["meta"]) + fonts["meta"].ascender()  # the age text's
+    for (text, font, pill), x in zip(pieces, xs):
+        if pill is None:
+            text.drawAtPoint_((x, centred(font)))
+            continue
+        text_top = baseline - font.ascender()
+        rect = mp.badge_rect(
+            x, text_top, text.size().width, _line_h(font), pixel, line_top=top, line_bottom=top + h
+        )
+        _stroke_rounded(rect, mp.BADGE_RADIUS, pill, mp.BADGE_STROKE_PX * pixel)
+        text.drawAtPoint_((x + mp.BADGE_PAD_X, text_top))
 
     name_font = fonts["title_active"] if panel.is_active else fonts["title"]
     name = _text(panel.name_text, name_font, ink.name, NSLineBreakByTruncatingMiddle)

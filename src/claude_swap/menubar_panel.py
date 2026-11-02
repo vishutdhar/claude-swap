@@ -54,10 +54,10 @@ EMAIL_GAP = 8.0  # name -> email
 EMAIL_MIN_W = 24.0  # an email squeezed below this is left out, not drawn as "…"
 META_GAP = 10.0  # email -> the right-hand state/age text
 AGE_GAP = 8.0  # between the right-hand pieces: state words (or the badge), then the age
-BADGE_PAD_X = 5.0  # the usage-resets pill: text inset from its left and right ends
+BADGE_PAD_X = 3.0  # the usage-resets pill, a tag like ACTIVE: text inset from its ends
 BADGE_PAD_Y = 1.0  # ... and from its top and bottom
-BADGE_RADIUS = 4.0
-BADGE_STROKE = 1.0
+BADGE_RADIUS = 3.0
+BADGE_STROKE_PX = 1.0  # its outline, in device pixels: a hairline on a Retina screen
 TOP_PAD = 7.0
 HEADER_GAP = 4.0
 BOTTOM_PAD = 9.0
@@ -504,6 +504,38 @@ def right_run(right: float, widths: list[float], gap: float) -> tuple[list[float
         x -= gap
     total = right - xs[-1] if xs else 0.0
     return xs[::-1], total
+
+
+def badge_rect(
+    x: float, text_top: float, text_w: float, text_h: float, pixel: float,
+    *, line_top: float, line_bottom: float,
+) -> tuple[float, float, float, float]:
+    """(x, y, w, h) of the usage-resets pill round its text.
+
+    ``x`` is the pill's left end, where ``right_run`` put it, and
+    ``text_top`` the top of the text's line. The text sits ``BADGE_PAD_X``
+    in from each end and ``BADGE_PAD_Y`` from the top and bottom; a text
+    size below zero counts as zero. Each edge then moves to the nearest
+    whole device pixel (``pixel`` points wide, above zero), so a one-pixel
+    outline covers one row of pixels and stays sharp. However tall the
+    font, the pill stays inside the header line, ``line_top`` to
+    ``line_bottom``.
+    """
+    if not (pixel > 0 and math.isfinite(pixel)):
+        raise ValueError(f"a device pixel is a size above zero, not {pixel!r}")
+    text_w, text_h = max(0.0, text_w), max(0.0, text_h)
+
+    def snap(value: float) -> float:
+        return math.floor(value / pixel + 0.5) * pixel
+
+    # The line's own edges, moved inward to whole pixels; a hair of slack
+    # keeps an edge already on a pixel where it is.
+    line_lo = math.ceil(line_top / pixel - 1e-9) * pixel
+    line_hi = math.floor(line_bottom / pixel + 1e-9) * pixel
+    left, right = snap(x), snap(x + text_w + 2 * BADGE_PAD_X)
+    top = min(max(snap(text_top - BADGE_PAD_Y), line_lo), line_hi)
+    bottom = max(min(snap(text_top + text_h + BADGE_PAD_Y), line_hi), top)
+    return left, top, right - left, bottom - top
 
 
 def card_rect(width: float, height: float) -> tuple[float, float, float, float]:

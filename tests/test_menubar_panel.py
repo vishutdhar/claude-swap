@@ -647,6 +647,54 @@ def test_header_spans_never_negative():
     assert (name_w, email_w) == (0.0, 0.0)
 
 
+_LINE = dict(line_top=0.0, line_bottom=100.0)  # a header line the pill never reaches
+
+
+def test_badge_rect_wraps_the_text_in_the_small_pill_padding():
+    # A tag, not a button: three points either side, one above and below.
+    assert (mp.BADGE_PAD_X, mp.BADGE_PAD_Y, mp.BADGE_RADIUS) == (3.0, 1.0, 3.0)
+    assert mp.badge_rect(100.0, text_top=10.0, text_w=20.0, text_h=11.0, pixel=0.5, **_LINE) == (
+        100.0, 9.0, 26.0, 13.0
+    )
+
+
+@pytest.mark.parametrize("pixel", [0.5, 1.0])  # a Retina screen, a standard one
+def test_badge_rect_edges_land_on_the_nearest_whole_device_pixel(pixel):
+    x, text_top, text_w, text_h = 262.37, 10.434, 21.81, 11.0
+    bx, by, bw, bh = mp.badge_rect(x, text_top=text_top, text_w=text_w, text_h=text_h, pixel=pixel, **_LINE)
+    exact = (
+        x, text_top - mp.BADGE_PAD_Y,
+        x + text_w + 2 * mp.BADGE_PAD_X, text_top + text_h + mp.BADGE_PAD_Y,
+    )
+    for edge, want in zip((bx, by, bx + bw, by + bh), exact):
+        assert edge / pixel == pytest.approx(round(edge / pixel))  # a whole pixel
+        assert abs(edge - want) <= pixel / 2 + 1e-9  # the nearest one
+
+
+def test_badge_rect_dimension_contract():
+    # A text size below zero is taken as zero: the pill is then just its
+    # padding, and never has a negative width or height.
+    empty = mp.badge_rect(100.0, text_top=10.0, text_w=0.0, text_h=0.0, pixel=0.5, **_LINE)
+    assert empty == (100.0, 9.0, 2 * mp.BADGE_PAD_X, 2 * mp.BADGE_PAD_Y)
+    assert mp.badge_rect(100.0, text_top=10.0, text_w=-7.0, text_h=-3.0, pixel=0.5, **_LINE) == empty
+    # A device pixel is a positive size; anything else is a caller's mistake.
+    for pixel in (0.0, -0.5, math.nan, math.inf):
+        with pytest.raises(ValueError):
+            mp.badge_rect(100.0, text_top=10.0, text_w=20.0, text_h=11.0, pixel=pixel, **_LINE)
+
+
+@pytest.mark.parametrize("pixel", [1.0, 2 / 3, 0.5, 1 / 3])  # scales 1, 1.5, 2 and 3
+def test_badge_rect_stays_inside_the_header_line(pixel):
+    # Text taller than the line: the pill is cut to the line, on whole pixels.
+    x, y, w, h = mp.badge_rect(
+        100.0, text_top=2.0, text_w=20.0, text_h=40.0, pixel=pixel, line_top=7.0, line_bottom=23.0
+    )
+    assert y >= 7.0 - 1e-9 and y + h <= 23.0 + 1e-9
+    assert y + h - 23.0 > -pixel - 1e-9 and y - 7.0 < pixel + 1e-9  # as far as whole pixels allow
+    for edge in (y, y + h):
+        assert edge / pixel == pytest.approx(round(edge / pixel))
+
+
 def test_right_run_lays_segments_out_from_the_right_edge():
     xs, total = mp.right_run(300.0, [40.0, 30.0], gap=8.0)
     assert xs == [222.0, 270.0]  # left to right, the last one ends at the edge

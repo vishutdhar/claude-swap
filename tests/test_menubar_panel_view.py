@@ -1385,6 +1385,10 @@ def test_a_failing_call_on_the_main_thread_is_logged_not_raised(caplog):
 
 # --- the Codex block ------------------------------------------------------------------
 
+import dataclasses  # noqa: E402
+import math  # noqa: E402
+from typing import NamedTuple  # noqa: E402
+
 from claude_swap import codex_usage as cu  # noqa: E402
 
 
@@ -1443,17 +1447,28 @@ def test_codex_header_draws_name_plan_badge_and_age_not_its_key(monkeypatch):
         assert text in strings
     assert "codex" not in strings  # the key is never drawn as a slot number
     fonts = pv._fonts()
-    assert [f for s, f, _c in calls if s == "UR 2"][0].isEqual_(fonts["meta"])
+    assert [f for s, f, _c in calls if s == "UR 2"][0].isEqual_(fonts["tag"])  # the ACTIVE tag's font
     assert _is(_colour_of(calls, "UR 2"), "secondaryLabelColor")
     assert _is(_colour_of(calls, "Codex"), "labelColor")
     assert strings.index("UR 2") < strings.index("9s ago")  # the badge, then the age
 
 
-@pytest.mark.parametrize("credits, colour", [(0, "systemRedColor"), (None, "tertiaryLabelColor")])
-def test_badge_colour_by_state(monkeypatch, credits, colour):
-    calls = _drawn(monkeypatch, _codex_panel(credits=credits))
-    text = "UR 0" if credits == 0 else "UR ?"
-    assert _is(_colour_of(calls, text), colour)
+def test_badge_colour_by_state(monkeypatch):
+    calls = _drawn(monkeypatch, _codex_panel(credits=0))
+    assert _is(_colour_of(calls, "UR 0"), "systemRedColor")
+
+
+def test_unknown_badge_is_the_secondary_colour_a_little_fainter(monkeypatch):
+    # Not the tertiary colour: that falls below 3:1 on the menu (see the
+    # contrast tests). The drawing resolves the colour for its appearance;
+    # this test resolves it for the same, the app's own.
+    calls = _drawn(monkeypatch, _codex_panel(credits=None))
+    drawn = _colour_of(calls, "UR ?").colorUsingColorSpace_(AppKit.NSColorSpace.sRGBColorSpace())
+    secondary = AppKit.NSColor.secondaryLabelColor().colorUsingColorSpace_(AppKit.NSColorSpace.sRGBColorSpace())
+    assert 0.0 < pv.UNKNOWN_BADGE_ALPHA < 1.0
+    for part in ("redComponent", "greenComponent", "blueComponent"):
+        assert getattr(drawn, part)() == pytest.approx(getattr(secondary, part)())
+    assert drawn.alphaComponent() == pytest.approx(secondary.alphaComponent() * pv.UNKNOWN_BADGE_ALPHA)
 
 
 def test_highlighted_badge_uses_the_selection_colour(monkeypatch):
@@ -1467,9 +1482,9 @@ def test_badge_pill_is_stroked_in_the_badge_colour(monkeypatch):
     strokes = []
     real = pv._stroke_rounded
 
-    def spy(rect, radius, color):
+    def spy(rect, radius, color, *width):
         strokes.append((rect, color))
-        return real(rect, radius, color)
+        return real(rect, radius, color, *width)
 
     monkeypatch.setattr(pv, "_stroke_rounded", spy)
     panel = _codex_panel(credits=0)
@@ -1477,7 +1492,313 @@ def test_badge_pill_is_stroked_in_the_badge_colour(monkeypatch):
     (rect, color) = strokes[-1]
     assert _is(color, "systemRedColor")
     x, y, w, h = rect
-    assert w > pv._width("UR 0", pv._fonts()["meta"]) + mp.BADGE_PAD_X  # the text has room inside
+    assert w > pv._width("UR 0", pv._fonts()["tag"]) + mp.BADGE_PAD_X  # the text has room inside
+
+
+class _Drawn(NamedTuple):
+    font: object
+    x: float
+    y: float
+    in_rect: bool  # drawn into a rect, so cut to it; a whole string is drawn at a point
+
+
+class _Spot:
+    """A string to draw that notes where and how it was drawn, by string."""
+
+    def __init__(self, real, string, font, log):
+        self._real, self._string, self._font, self._log = real, string, font, log
+
+    def size(self):
+        return self._real.size()
+
+    def drawAtPoint_(self, point):
+        self._log[self._string] = _Drawn(self._font, point[0], point[1], False)
+        self._real.drawAtPoint_(point)
+
+    def drawInRect_(self, rect):
+        self._log[self._string] = _Drawn(self._font, rect.origin.x, rect.origin.y, True)
+        self._real.drawInRect_(rect)
+
+
+def _geometry(monkeypatch, view):
+    """Draw ``view`` once: where each string went, and the pill strokes.
+
+    Each stroke is (rect, radius, line width), the width None when the
+    drawing passed none.
+    """
+    spots, strokes = {}, []
+    real_text, real_stroke = pv._text, pv._stroke_rounded
+
+    def text_spy(string, font, color, truncate=None):
+        return _Spot(real_text(string, font, color, truncate), string, font, spots)
+
+    def stroke_spy(rect, radius, color, *width):
+        strokes.append((rect, radius, width[0] if width else None))
+        return real_stroke(rect, radius, color, *width)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(pv, "_text", text_spy)
+        patch.setattr(pv, "_stroke_rounded", stroke_spy)
+        _render(view)
+    return spots, strokes
+
+
+def _header_geometry(monkeypatch, panel, layout=None):
+    """``_geometry`` for a new view of ``panel``; returns the view first."""
+    view = pv.make_panel_view(panel, layout or pv.PanelLayout([panel]))
+    spots, strokes = _geometry(monkeypatch, view)
+    return view, spots, strokes
+
+
+def _changed_rows(a, b):
+    """First and last pixel rows where two same-sized renders differ."""
+    stride = a.bytesPerRow()
+    pa, pb = bytes(a.bitmapData()), bytes(b.bitmapData())
+    rows = [r for r in range(a.pixelsHigh()) if pa[r * stride:(r + 1) * stride] != pb[r * stride:(r + 1) * stride]]
+    return rows[0], rows[-1]
+
+
+def _on_grid(value, pixel):
+    return value / pixel == pytest.approx(round(value / pixel))
+
+
+def test_badge_pill_renders_no_taller_than_the_tag_line_inside_the_header():
+    # Measured on the pixels, not the arithmetic: the rows the badge adds
+    # are its pill and its text.
+    codex = _codex_panel()
+    layout = pv.PanelLayout([codex])
+    view = pv.make_panel_view(codex, layout)
+    shown = _render(view)
+    bare = _render(pv.make_panel_view(dataclasses.replace(codex, badge_text=None), layout))
+    scale = shown.pixelsWide() / view.bounds().size.width
+    first, last = _changed_rows(shown, bare)
+    tag_h = pv._line_h(pv._fonts()["tag"])
+    assert (last + 1 - first) / scale <= tag_h + 2.0  # the ACTIVE tag's line and a point each side
+    assert first / scale >= mp.TOP_PAD
+    assert (last + 1) / scale <= mp.TOP_PAD + layout.header_h  # never taller than the header line
+
+
+def test_badge_text_is_in_the_tag_font_on_the_age_text_baseline(monkeypatch):
+    _view, spots, _strokes = _header_geometry(monkeypatch, _codex_panel())
+    badge, age = spots["UR 2"], spots["9s ago"]
+    assert badge.font.isEqual_(pv._fonts()["tag"])  # the ACTIVE tag's cap height
+    assert badge.y + badge.font.ascender() == pytest.approx(age.y + age.font.ascender())
+
+
+def test_badge_pill_is_a_one_pixel_outline_round_its_text_an_age_gap_before_the_age(monkeypatch):
+    view, spots, strokes = _header_geometry(monkeypatch, _codex_panel())
+    pixel = view.convertSizeFromBacking_((1.0, 1.0)).width
+    (((x, y, w, h), radius, width),) = strokes
+    assert (radius, width) == (mp.BADGE_RADIUS, pixel)  # one device pixel: a hairline on Retina
+    badge = spots["UR 2"]
+    text_w = pv._width("UR 2", badge.font)
+    # The padding and the gap hold to the nearest pixel, where the outline is snapped.
+    assert badge.x - x == pytest.approx(mp.BADGE_PAD_X, abs=pixel / 2)
+    assert x + w - (badge.x + text_w) == pytest.approx(mp.BADGE_PAD_X, abs=pixel / 2)
+    assert badge.y - y == pytest.approx(mp.BADGE_PAD_Y, abs=pixel / 2)
+    assert spots["9s ago"].x - (x + w) == pytest.approx(mp.AGE_GAP, abs=pixel / 2)
+
+
+@pytest.mark.parametrize("scale", [1, 1.5, 2, 3])
+@pytest.mark.parametrize("credits, text", [(0, "UR 0"), (None, "UR ?"), (12, "UR 12"), (999, "UR 999")])
+def test_badge_geometry_by_state_and_scale(monkeypatch, credits, text, scale):
+    pixel = 1.0 / scale
+    monkeypatch.setattr(pv, "_device_pixel", lambda _view: pixel)
+    view, spots, strokes = _header_geometry(monkeypatch, _codex_panel(credits=credits))
+    (((x, y, w, h), _radius, width),) = strokes
+    assert width == pixel
+    for edge in (x, y, x + w, y + h):
+        assert _on_grid(edge, pixel)
+    line_top, line_bottom = mp.TOP_PAD, mp.TOP_PAD + view.layout.header_h
+    assert line_top - 1e-9 <= y and y + h <= line_bottom + 1e-9  # inside the header line
+    badge = spots[text]
+    assert x <= badge.x and badge.x + pv._width(text, badge.font) <= x + w  # the text inside its pill
+    assert spots["9s ago"].x - (x + w) == pytest.approx(mp.AGE_GAP, abs=pixel / 2)
+
+
+def test_badge_header_containment_with_oversized_font(monkeypatch):
+    panel = _codex_panel()
+    layout = pv.PanelLayout([panel])
+    layout.fonts["tag"] = AppKit.NSFont.systemFontOfSize_weight_(30.0, AppKit.NSFontWeightSemibold)
+    assert pv._line_h(layout.fonts["tag"]) + 2 * mp.BADGE_PAD_Y > layout.header_h  # it cannot fit
+    _view, _spots, strokes = _header_geometry(monkeypatch, panel, layout)
+    (((_x, y, _w, h), _radius, _width),) = strokes
+    assert h <= layout.header_h
+    assert mp.TOP_PAD <= y and y + h <= mp.TOP_PAD + layout.header_h
+
+
+# --- the pill as rasterised ----------------------------------------------------------
+
+def _render_at(view, scale, appearance):
+    """``view`` drawn at ``scale`` pixels a point over its appearance's window background.
+
+    The drawing reads its pixel size from AppKit, which answers for the
+    main screen when a view has no window; a caller drawing at another
+    scale tells the drawing the scale it draws at.
+    """
+    bounds = view.bounds()
+    rep = AppKit.NSBitmapImageRep.alloc().initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel_(
+        None, round(bounds.size.width * scale), round(bounds.size.height * scale),
+        8, 4, True, False, AppKit.NSDeviceRGBColorSpace, 0, 0,
+    )
+    rep.setSize_(bounds.size)
+    name = AppKit.NSAppearanceNameDarkAqua if appearance == "darkAqua" else AppKit.NSAppearanceNameAqua
+    look = AppKit.NSAppearance.appearanceNamed_(name)
+    view.setAppearance_(look)
+    previous = AppKit.NSAppearance.currentDrawingAppearance()
+    AppKit.NSAppearance.setCurrentAppearance_(look)
+    try:
+        AppKit.NSGraphicsContext.saveGraphicsState()
+        AppKit.NSGraphicsContext.setCurrentContext_(AppKit.NSGraphicsContext.graphicsContextWithBitmapImageRep_(rep))
+        AppKit.NSColor.windowBackgroundColor().setFill()
+        AppKit.NSBezierPath.fillRect_(bounds)
+        AppKit.NSGraphicsContext.restoreGraphicsState()
+        view.cacheDisplayInRect_toBitmapImageRep_(bounds, rep)
+    finally:
+        AppKit.NSAppearance.setCurrentAppearance_(previous)
+    return rep
+
+
+class _Pixels:
+    def __init__(self, rep):
+        self.width, self.height = rep.pixelsWide(), rep.pixelsHigh()
+        self._stride, self._step = rep.bytesPerRow(), rep.bitsPerPixel() // 8
+        self._data = bytes(rep.bitmapData())
+
+    def at(self, col, row):
+        i = row * self._stride + col * self._step
+        return tuple(self._data[i:i + 3])
+
+
+def _badge_pixels(monkeypatch, credits, scale, appearance):
+    """The Codex panel drawn at ``scale`` with its badge, and without: the badge's pixels.
+
+    Returns (shown, bare, changed): both renders and the set of (col, row)
+    the badge changed.
+    """
+    monkeypatch.setattr(pv, "_device_pixel", lambda _view: 1.0 / scale)
+    panel = _codex_panel(credits=credits)
+    layout = pv.PanelLayout([panel])
+    shown = _Pixels(_render_at(pv.make_panel_view(panel, layout), scale, appearance))
+    bare = _Pixels(_render_at(pv.make_panel_view(dataclasses.replace(panel, badge_text=None), layout), scale, appearance))
+    changed = {
+        (c, r) for r in range(shown.height) for c in range(shown.width) if shown.at(c, r) != bare.at(c, r)
+    }
+    return shown, bare, changed
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+@pytest.mark.parametrize("appearance", ["darkAqua", "aqua"])
+def test_badge_stroke_pixels_by_appearance_and_scale(monkeypatch, appearance, scale):
+    shown, _bare, changed = _badge_pixels(monkeypatch, 2, scale, appearance)
+    assert changed  # the badge is drawn at all
+    left, right = min(c for c, _r in changed), max(c for c, _r in changed)
+    top, bottom = min(r for _c, r in changed), max(r for _c, r in changed)
+    mid_col, mid_row = (left + right) // 2, (top + bottom) // 2
+
+    def thickness(cells):  # inked pixels from the outline inward, up to the padding
+        count = 0
+        for cell in cells:
+            if cell not in changed:
+                break
+            count += 1
+        return count
+
+    # One device pixel on each side, and each a full pixel of one colour:
+    # a line between two pixels would ink two, each at half strength.
+    assert thickness((mid_col, r) for r in range(top, bottom)) == 1
+    assert thickness((mid_col, r) for r in range(bottom, top, -1)) == 1
+    assert thickness((c, mid_row) for c in range(left, right)) == 1
+    assert thickness((c, mid_row) for c in range(right, left, -1)) == 1
+    edges = {shown.at(mid_col, top), shown.at(mid_col, bottom), shown.at(left, mid_row), shown.at(right, mid_row)}
+    assert len(edges) == 1
+
+
+def _contrast(a, b):
+    """WCAG contrast ratio of two sRGB colours, channels 0 to 255."""
+    def luminance(rgb):
+        def channel(v):
+            v /= 255.0
+            return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+        r, g, b = (channel(v) for v in rgb)
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+    hi, lo = sorted((luminance(a), luminance(b)), reverse=True)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+# WCAG 2.2 success criterion 1.4.11 (non-text contrast): a control's
+# outline, or state shown by graphics, reads at 3:1 against what is behind it.
+BADGE_MIN_CONTRAST = 3.0
+
+
+def _badge_contrast(monkeypatch, credits, appearance):
+    """The strongest contrast a badge pixel makes with the panel behind it, at 2x."""
+    shown, bare, changed = _badge_pixels(monkeypatch, credits, 2, appearance)
+    return max(_contrast(shown.at(c, r), bare.at(c, r)) for c, r in changed)
+
+
+@pytest.mark.parametrize("appearance", ["darkAqua", "aqua"])
+def test_unknown_badge_contrast(monkeypatch, appearance):
+    unknown = _badge_contrast(monkeypatch, None, appearance)
+    assert unknown >= BADGE_MIN_CONTRAST
+    assert unknown < _badge_contrast(monkeypatch, 2, appearance)  # still fainter than a known count
+
+
+@pytest.mark.parametrize("appearance", ["darkAqua", "aqua"])
+@pytest.mark.parametrize("credits", [2, 0])
+def test_known_badges_meet_the_same_contrast(monkeypatch, credits, appearance):
+    assert _badge_contrast(monkeypatch, credits, appearance) >= BADGE_MIN_CONTRAST
+
+
+def test_badge_renders_without_window_and_with_zero_conversion(monkeypatch):
+    failures = []
+    panel = _codex_panel()
+    layout = pv.PanelLayout([panel])
+
+    def view():
+        return pv.make_panel_view(panel, layout, on_draw_failure=lambda: failures.append(panel))
+
+    # No window: AppKit answers for the main screen, and the outline is that pixel.
+    windowless = view()
+    assert windowless.window() is None
+    spots, strokes = _geometry(monkeypatch, windowless)
+    ((_rect, _radius, width),) = strokes
+    assert width == windowless.convertSizeFromBacking_((1.0, 1.0)).width
+    assert "UR 2" in spots
+
+    # No usable answer: a whole point stands in for the pixel, and the badge is still drawn.
+    for answer in (AppKit.NSMakeSize(0.0, 0.0), None, AppKit.NSMakeSize(math.nan, math.nan),
+                   AppKit.NSMakeSize(-1.0, -1.0), AppKit.NSMakeSize(math.inf, math.inf)):
+        broken = view()
+        broken.convertSizeFromBacking_ = lambda _size, answer=answer: answer
+        spots, strokes = _geometry(monkeypatch, broken)
+        (((x, y, w, h), _radius, width),) = strokes
+        assert width == 1.0
+        assert all(edge == round(edge) for edge in (x, y, x + w, y + h))
+        assert "UR 2" in spots
+    assert failures == []  # never the plain text fallback
+
+
+def test_smaller_badge_restores_name_space_at_truncation_boundary(monkeypatch):
+    # The pill before it became a tag: the meta font and five points at each
+    # end. A name that the old pill cut is drawn whole now.
+    fonts = pv._fonts()
+    age_w = pv._width("9s ago", fonts["meta"])
+    old_meta_w = pv._width("UR 2", fonts["meta"]) + 2 * 5.0 + mp.AGE_GAP + age_w
+    new_meta_w = pv._width("UR 2", fonts["tag"]) + 2 * mp.BADGE_PAD_X + mp.AGE_GAP + age_w
+    cols = pv.PanelLayout([_codex_panel()]).columns
+
+    def room(meta_w):  # the widest name the header keeps whole
+        return mp.header_spans(cols, 10_000.0, meta_w)[1]
+
+    name = next(
+        s for s in ("n" * a + "i" * b for a in range(1, 60) for b in range(4))
+        if room(old_meta_w) < pv._width(s, fonts["title"]) <= room(new_meta_w)
+    )
+    panel = _codex_panel(alias=name, names_only=True)  # names only: no plan type beside it
+    _view, spots, _strokes = _header_geometry(monkeypatch, panel)
+    assert not spots[name].in_rect  # drawn whole at its point, not cut into a rect
 
 
 def test_codex_panel_does_not_widen_the_gutter():
