@@ -1569,3 +1569,67 @@ def test_release_with_real_token_preserves_corrupt_history(tmp_path):
     assert budget.last_reservation is None
     budget.release(token, now=NOW + 60)
     assert path.read_text() == text  # a log that cannot be trusted is never written over
+
+
+# --- where the self-heal stops ---------------------------------------------------------
+
+def _set_mtime(path, when):
+    os.utime(path, ns=(int(when) * 10**9, int(when) * 10**9))
+
+
+def test_self_heal_mtime_boundaries(tmp_path):
+    def corrupt(name, mtime):
+        path = tmp_path / name
+        path.write_text("{ not json")
+        _set_mtime(path, mtime)
+        return path
+
+    exact = corrupt("exact.json", NOW - 86400)  # exactly a day: could still hold a launch
+    assert cu.LaunchBudget(exact).reserve(NOW, manual=False, first_of_process=True) is False
+    assert exact.read_text() == "{ not json"
+    past = corrupt("past.json", NOW - 86401)  # a second more: cannot
+    assert cu.LaunchBudget(past).reserve(NOW, manual=False, first_of_process=True) is True
+    ahead = corrupt("ahead.json", NOW + 25 * HOUR)  # dated ahead of the clock: never stale
+    assert cu.LaunchBudget(ahead).reserve(NOW, manual=False, first_of_process=True) is False
+    assert ahead.read_text() == "{ not json"
+
+
+def test_valid_history_bypasses_self_heal(tmp_path):
+    full = tmp_path / "full.json"  # valid, eight launches this day, but touched back a day
+    entries = [{"t": NOW - (8 - i) * 60, "id": f"t{i}"} for i in range(8)]
+    full.write_text(json.dumps({"launches": entries}))
+    _set_mtime(full, NOW - 25 * HOUR)
+    text = full.read_text()
+    budget = cu.LaunchBudget(full)
+    assert budget.launches_in_last_day(NOW) == 8  # its launches count: it is a valid log
+    assert budget.reserve(NOW, manual=True, first_of_process=True) is False
+    assert budget.last_failure is None  # refused by the cap, not as a broken log
+    assert full.read_text() == text
+
+    empty = tmp_path / "empty.json"  # valid and empty, touched back a day
+    empty.write_text(json.dumps({"launches": [], "reset_credits": 3, "credits_at": NOW - 100}))
+    _set_mtime(empty, NOW - 25 * HOUR)
+    text = empty.read_text()
+    budget = cu.LaunchBudget(empty)
+    assert budget.launches_in_last_day(NOW) == 0
+    assert budget.load_credits(NOW) == (3, NOW - 100)
+    assert empty.read_text() == text  # reading never writes
+    assert budget.reserve(NOW, manual=False, first_of_process=True)
+    assert _logged(empty) == {"launches": [NOW], "reset_credits": 3, "credits_at": NOW - 100}
+
+
+def test_mixed_legacy_corruption_fails_closed(tmp_path):
+    content = json.dumps({"launches": [NOW - 120, NOW - 60, "x"]})  # two old-style entries, one broken
+    young = tmp_path / "young.json"
+    young.write_text(content)
+    _set_mtime(young, NOW - HOUR)
+    budget = cu.LaunchBudget(young)
+    assert budget.reserve(NOW, manual=False, first_of_process=True) is False
+    assert budget.last_failure == "launch log unreadable"
+    assert budget.launches_in_last_day(NOW) == budget.daily_cap
+    assert young.read_text() == content
+    stale = tmp_path / "stale.json"
+    stale.write_text(content)
+    _set_mtime(stale, NOW - 25 * HOUR)
+    assert cu.LaunchBudget(stale).reserve(NOW, manual=False, first_of_process=True)  # heals only when stale
+    assert _logged(stale)["launches"] == [NOW]
