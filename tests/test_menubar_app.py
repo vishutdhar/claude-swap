@@ -2297,3 +2297,61 @@ def test_blocked_codex_monitor_does_not_delay_or_drop_account_refreshes(tmp_path
     except ProcessLookupError:
         alive = False
     assert not alive
+
+
+# --- limit resets on the Claude accounts (the UR tag) --------------------------------
+
+_GRANT = {
+    "left": 1, "total": 1, "ends_at": "2099-01-01T00:00:00+00:00", "label": "Free limit reset",
+    "usable_now": True, "eligible": True, "paused": False, "fetched_at": 1.0,
+}
+
+
+def _entry_resets(num, email, active=False, left=1, pct=10.0):
+    usage = {"five_hour": {"pct": pct}, "limit_resets": {**_GRANT, "left": left}}
+    return (num, email, active, usage, usage, None, False, None)
+
+
+def test_settings_menu_has_the_limit_resets_title_toggle(app, monkeypatch):
+    monkeypatch.setattr(app.settings, "save", lambda _p: None)
+    app.snapshot = _snap(_entry_resets("1", "a@x.com", active=True), _entry("2", "b@x.com"))
+    app.rebuild_menu()
+    assert app.title.endswith("10% · UR 1")
+    items = {i.title(): i for i in _submenu(app, "Settings").itemArray()}
+    toggle = items["Limit resets in title"]
+    assert toggle.state() == 1
+    toggle.target().callback_(toggle)
+    assert app.settings.title_resets is False
+    assert "UR" not in app.title
+    # The dropdown keeps the tag: the setting is about the title only.
+    panels = [i.view().panel for i in _account_items(app)]
+    assert [(p.num, p.badge_text) for p in panels] == [("1", "UR 1"), ("2", None)]
+
+
+def test_account_panels_carry_the_resets_pill_only_with_a_grant(app):
+    app.settings.show_usage_bars = True
+    app.snapshot = _snap(
+        _entry_resets("1", "a@x.com", active=True, left=0),
+        _entry("2", "b@x.com"),
+        _entry_resets("3", "c@x.com"),
+    )
+    app.rebuild_menu()
+    got = [(i.view().panel.badge_text, i.view().panel.badge_state) for i in _account_items(app)]
+    assert got == [("UR 0", "over"), (None, "ok"), ("UR 1", "ok")]
+
+
+def test_text_rows_carry_the_resets_too(app):
+    app.settings.show_usage_bars = False
+    app.snapshot = _snap(_entry_resets("1", "a@x.com", active=True), _entry("2", "b@x.com"))
+    app.rebuild_menu()
+    titles = [i.title() for i in _account_items(app)]
+    assert titles[0].endswith("5h 10% · UR 1") and "UR" not in titles[1]
+
+
+def test_usage_log_gains_the_resets_and_logs_again_when_only_they_change(app, caplog):
+    with caplog.at_level(logging.INFO, logger="claude-swap"):
+        app._log_usage(_snap(_entry_resets("1", "a@x.com", active=True, left=1)))
+        app._log_usage(_snap(_entry_resets("1", "a@x.com", active=True, left=1)))  # same: not again
+        app._log_usage(_snap(_entry_resets("1", "a@x.com", active=True, left=0)))  # the reset was used
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("usage a@x.com")]
+    assert lines == ["usage a@x.com: 5h 10% · UR 1", "usage a@x.com: 5h 10% · UR 0"]

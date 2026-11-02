@@ -31,6 +31,8 @@ from claude_swap.menubar import (
     account_identity,
     format_account_label,
     guard_hold,
+    limit_resets_badge,
+    limit_resets_spoken,
     out_of_rotation_word,
     sentinel_note,
 )
@@ -138,8 +140,14 @@ class AccountPanel:
     # "account", or "codex" for the Codex block: no slot number, not a switch,
     # and ``email`` holds the plan type.
     kind: str = "account"
-    badge_text: str | None = None  # the Codex block's "UR 2" pill, drawn before the age
+    # The usage-resets pill, drawn first on the right: the Codex block's
+    # banked resets ("UR 2"), or an account's limit resets ("UR 1"), before
+    # ACTIVE and the other state words. None draws no pill.
+    badge_text: str | None = None
     badge_state: str = "ok"  # one of BADGE_STATES
+    # What VoiceOver says for an account's pill ("1 limit reset, use by
+    # Nov 30"); None for the Codex block, whose pill is spoken from its count.
+    badge_spoken: str | None = None
 
     @property
     def state_text(self) -> str:
@@ -286,6 +294,8 @@ def build_account_panel(entry: tuple, now: float, names_only: bool = False, hold
     """
     # Fields past the eighth are for other readers; a wider row still builds.
     num, email, is_active, display, _last_good, alias, disabled, fetched_at, *_extra = entry
+    # The display usage, as the text row reads it: a sentinel shows no pill.
+    badge = limit_resets_badge(display, now)
     words, spoken = [], []
     if is_active:
         words.append("active")
@@ -313,6 +323,9 @@ def build_account_panel(entry: tuple, now: float, names_only: bool = False, hold
         ),
         alias=alias,
         show_email=not (names_only and alias),  # account_identity's names-only rule
+        badge_text=badge[0] if badge else None,
+        badge_state=badge[1] if badge else "ok",
+        badge_spoken=limit_resets_spoken(display, now) if badge else None,
     )
 
 
@@ -609,7 +622,8 @@ def accessibility_label(panel: AccountPanel) -> str:
     """What VoiceOver reads for a panel: who, their state, then every window.
 
     The Codex block says its name (with "Codex" after an alias), its plan,
-    the age, each window, and then the banked usage resets.
+    the age, each window, and then the banked usage resets. An account
+    holding a limit reset ends with it: "1 limit reset, use by Nov 30".
     """
     # Always the full identity, whatever the display setting: a listener
     # has no other way to tell which email an alias belongs to.
@@ -639,4 +653,6 @@ def accessibility_label(panel: AccountPanel) -> str:
         sentences.append(", ".join(parts))
     if panel.kind == "codex":
         sentences.append(_spoken_badge(panel))
+    elif panel.badge_spoken:
+        sentences.append(panel.badge_spoken)
     return ". ".join(sentences) + "."

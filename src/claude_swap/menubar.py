@@ -31,8 +31,8 @@ from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
 
-from claude_swap import pace
-from claude_swap.codex_usage import CodexState, ur_badge
+from claude_swap import oauth, pace
+from claude_swap.codex_usage import MAX_RESET_CREDITS, CodexState, ur_badge
 from claude_swap.exceptions import (
     AccountNotFoundError,
     ClaudeSwitchError,
@@ -113,6 +113,7 @@ class MenuBarSettings:
     show_names_only: bool = False  # an aliased account shows its alias without the email
     show_codex: bool = True  # the Codex block after the accounts; off stops every Codex read
     title_codex: bool = True  # append Codex's weekly pct and usage resets to the title
+    title_resets: bool = True  # append the active account's limit resets ("UR 1") to the title
     codex_alias: str = ""  # the Codex block's name; empty is "Codex" (display only)
 
     @classmethod
@@ -419,13 +420,16 @@ def format_account_label(
     """Build one account row's menu label.
 
     A disabled account says why, from ``holds`` (the snapshot's read of the
-    rotation guard's marker): "(held · 28m)" or "(paused)".
+    rotation guard's marker): "(held · 28m)" or "(paused)". An account
+    holding a limit reset ends with its tag: "... · UR 1".
     """
     if now is None:
         now = time.time()
     marker = f"  ({out_of_rotation_word(guard_hold(holds, num, email), now)})" if disabled else ""
     identity = account_identity(email, alias, names_only=names_only)
-    return f"{num}  {identity}{marker}  {usage_summary(usage, now, fetched_at)}"
+    label = f"{num}  {identity}{marker}  {usage_summary(usage, now, fetched_at)}"
+    badge = limit_resets_badge(usage, now)
+    return f"{label} · {badge[0]}" if badge else label
 
 
 def account_identity(email: str, alias: str | None = None, names_only: bool = False) -> str:
@@ -447,6 +451,76 @@ def _local_part(email: str, limit: int = 12) -> str:
     if len(local) > limit:
         return local[: limit - 1] + "*"
     return local
+
+
+# ---- limit resets (the UR tag on an account) ---------------------------------
+#
+# An account whose usage carries a ``limit_resets`` entry (oauth.parse_limit_resets,
+# kept by the usage store) holds a banked limit reset. The tag shows how
+# many are left, "UR 1", in the same pill the Codex block uses. Accounts
+# without a grant show nothing, so the menu does not fill with red zeros.
+
+def limit_resets_entry(usage: dict | str | None, now: float) -> dict | None:
+    """An account's live limit-resets entry, or None.
+
+    None for a sentinel or no usage, an entry with no readable count (a
+    whole number) or end time, and a grant that has ended by ``now``.
+    """
+    if not isinstance(usage, dict):
+        return None
+    entry = usage.get("limit_resets")
+    if not isinstance(entry, dict):
+        return None
+    left = entry.get("left")
+    if isinstance(left, bool) or not isinstance(left, int) or not 0 <= left <= MAX_RESET_CREDITS:
+        return None
+    ends = oauth.iso_epoch(entry.get("ends_at"))
+    if ends is None or ends <= now:
+        return None
+    return entry
+
+
+def limit_resets_badge(usage: dict | str | None, now: float) -> tuple[str, str] | None:
+    """The account's UR pill: ("UR 1", "ok"), ("UR 0", "over") or ("UR 1", "unknown").
+
+    Red ("over") at zero: the reset was used. Dimmed ("unknown") while the
+    grant is paused, which wins over a zero (a paused reset is not a used
+    one), or not usable right now. None without a live grant.
+    """
+    entry = limit_resets_entry(usage, now)
+    if entry is None:
+        return None
+    left = entry["left"]
+    text = f"UR {left}"
+    if entry.get("paused") is True:
+        return text, "unknown"
+    if left == 0:
+        return text, "over"
+    if entry.get("usable_now") is not True:
+        return text, "unknown"
+    return text, "ok"
+
+
+def limit_resets_spoken(usage: dict | str | None, now: float) -> str | None:
+    """What VoiceOver says for the pill: "1 limit reset, use by Nov 30".
+
+    The date is the grant's end in local time. A used grant is "no limit
+    resets left"; a paused or not-yet-usable one says so before the date.
+    """
+    entry = limit_resets_entry(usage, now)
+    if entry is None:
+        return None
+    left, paused = entry["left"], entry.get("paused") is True
+    if left == 0 and not paused:
+        return "no limit resets left"
+    parts = [f"{left} limit reset{'' if left == 1 else 's'}"]
+    if paused:
+        parts.append("paused")
+    elif entry.get("usable_now") is not True:
+        parts.append("not usable now")
+    ends = datetime.fromtimestamp(oauth.iso_epoch(entry["ends_at"]), timezone.utc).astimezone()
+    parts.append(f"use by {ends:%b} {ends.day}")
+    return ", ".join(parts)
 
 
 CODEX_NAME = "Codex"
@@ -522,7 +596,7 @@ def format_title(
 
 
 def _account_title_segments(active_email, active_usage, settings, now, alias) -> list[str]:
-    """The active account's title segments: name, windows, model limits."""
+    """The active account's title segments: name, windows, model limits, limit resets."""
     segments: list[str] = []
     if settings.show_account_name:
         segments.append(alias if alias else _local_part(active_email))
@@ -543,6 +617,10 @@ def _account_title_segments(active_email, active_usage, settings, now, alias) ->
             window = _rolled_weekly_window(window, now)
             if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)) and window.get("name"):
                 segments.append(f"{window['name']} {window['pct']:.0f}%")
+    if settings.title_resets:
+        badge = limit_resets_badge(active_usage, now)  # right after the pcts, before Codex
+        if badge:
+            segments.append(badge[0])
     return segments
 
 
@@ -593,13 +671,13 @@ def format_codex_usage_log(state: CodexState | None, now: float) -> str | None:
     return "usage codex: " + " · ".join(parts)
 
 
-def format_usage_log(email: str, usage: dict | str | None) -> str | None:
+def format_usage_log(email: str, usage: dict | str | None, now: float | None = None) -> str | None:
     """A log line of an account's session (5h) and weekly (7d) limits.
 
     Uses each window's absolute reset ``clock`` rather than a live countdown,
     since log lines are already timestamped. Returns ``None`` when no numeric
     window is available (sentinels, ``None``, or spend-only) so callers can skip
-    logging nothing.
+    logging nothing. An account holding a limit reset ends with "· UR 1".
     """
     parts: list[str] = []
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
@@ -614,6 +692,9 @@ def format_usage_log(email: str, usage: dict | str | None) -> str | None:
         parts.append(seg)
     if not parts:
         return None
+    badge = limit_resets_badge(usage, time.time() if now is None else now)
+    if badge:
+        parts.append(badge[0])
     return f"usage {email}: " + " · ".join(parts)
 
 
@@ -1409,7 +1490,7 @@ def create_app(switcher, codex_monitor=None):
             self._refreshing = False
             self._config_path = switcher._get_claude_config_path()
             self._config_mtime = 0.0
-            self._last_usage_log: dict = {}  # account num -> last-logged (5h, 7d) key
+            self._last_usage_log: dict = {}  # account num -> last-logged ((5h, 7d), UR tag) key
             # Auto-switch engine (the same one `cswap auto` runs), hosted in a
             # background thread while enabled.
             self._engine = None
@@ -1681,11 +1762,14 @@ def create_app(switcher, codex_monitor=None):
             but de-dupes per account on the (5h, 7d) percentages so an idle
             machine doesn't churn the rotating log with identical lines.
             """
+            now = time.time()
             for num, email, _is_active, _display, last_good, _alias, _disabled, _fetched_at, *_extra in snap["accounts"]:
-                key = _usage_log_key(last_good)
-                if key == (None, None) or self._last_usage_log.get(num) == key:
+                pcts = _usage_log_key(last_good)
+                badge = limit_resets_badge(last_good, now)
+                key = (pcts, badge[0] if badge else None)  # a used reset is logged too
+                if pcts == (None, None) or self._last_usage_log.get(num) == key:
                     continue
-                line = format_usage_log(email, last_good)
+                line = format_usage_log(email, last_good, now)
                 if line:
                     self.switcher._logger.info(line)
                     self._last_usage_log[num] = key
@@ -2221,6 +2305,10 @@ def create_app(switcher, codex_monitor=None):
             scoped_item.state = 1 if self.settings.title_scoped else 0
             menu.add(scoped_item)
 
+            resets_item = rumps.MenuItem("Limit resets in title", callback=self.on_toggle_title_resets)
+            resets_item.state = 1 if self.settings.title_resets else 0
+            menu.add(resets_item)
+
             bars_item = rumps.MenuItem("Show usage bars", callback=self.on_toggle_usage_bars)
             bars_item.state = 1 if self.settings.show_usage_bars else 0
             menu.add(bars_item)
@@ -2612,6 +2700,10 @@ def create_app(switcher, codex_monitor=None):
 
         def on_toggle_scoped(self, _sender):
             self.settings.title_scoped = not self.settings.title_scoped
+            self._save_and_rebuild()
+
+        def on_toggle_title_resets(self, _sender):
+            self.settings.title_resets = not self.settings.title_resets
             self._save_and_rebuild()
 
         def on_toggle_usage_bars(self, _sender):

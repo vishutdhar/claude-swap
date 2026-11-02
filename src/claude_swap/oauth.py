@@ -518,7 +518,7 @@ def _grant_count(value) -> int | None:
     return int(number)
 
 
-def _iso_epoch(value) -> float | None:
+def iso_epoch(value) -> float | None:
     """An ISO 8601 time as an epoch; one without a zone is UTC. None if unreadable."""
     if not isinstance(value, str) or not value:
         return None
@@ -555,7 +555,7 @@ def parse_limit_resets(cedar_ember, now: float) -> dict | None:
     for grant in grants:
         if not isinstance(grant, dict):
             continue
-        ends = _iso_epoch(grant.get("ends_at"))
+        ends = iso_epoch(grant.get("ends_at"))
         left = _grant_count(grant.get("resets_left"))
         if ends is None or ends <= now or left is None:
             continue

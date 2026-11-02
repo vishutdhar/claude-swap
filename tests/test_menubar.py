@@ -2337,3 +2337,160 @@ def test_the_menu_bar_reads_rollouts_from_the_codex_home(tmp_path, monkeypatch):
     assert menubar.default_codex_monitor(tmp_path, log).sessions_dir == Path.home() / ".codex" / "sessions"
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "alt-home"))
     assert menubar.default_codex_monitor(tmp_path, log).sessions_dir == tmp_path / "alt-home" / "sessions"
+
+
+# --- limit resets on the Claude accounts (the UR tag) --------------------------------
+
+import time as _time  # noqa: E402
+
+_UR_NOW = _dt.datetime(2026, 11, 2, 12, 0, tzinfo=_dt.timezone.utc).timestamp()
+
+
+def _resets(left=1, ends_at="2026-11-20T12:00:00+00:00", usable=True, paused=False):
+    return {
+        "left": left, "total": left if type(left) is int and left > 1 else 1, "ends_at": ends_at,
+        "label": "Free limit reset",
+        "usable_now": usable, "eligible": True, "paused": paused, "fetched_at": _UR_NOW - 60,
+    }
+
+
+def _with_resets(usage=None, **kwargs):
+    return {**(_USAGE if usage is None else usage), "limit_resets": _resets(**kwargs)}
+
+
+@pytest.fixture
+def new_york(monkeypatch):
+    """Local time in New York, as on the owner's Mac, for the spoken date."""
+    monkeypatch.setenv("TZ", "America/New_York")
+    _time.tzset()
+    yield
+    monkeypatch.undo()
+    _time.tzset()
+
+
+@pytest.mark.parametrize("kwargs, badge", [
+    ({}, ("UR 1", "ok")),
+    ({"left": 2}, ("UR 2", "ok")),
+    ({"left": 0, "usable": False}, ("UR 0", "over")),  # used: red, like the Codex zero
+    ({"usable": False}, ("UR 1", "unknown")),  # held but not usable right now: dimmed
+    ({"paused": True, "usable": False}, ("UR 1", "unknown")),
+    ({"left": 0, "paused": True}, ("UR 0", "unknown")),  # a paused reset is not a used one
+])
+def test_limit_resets_badge_states(kwargs, badge):
+    assert menubar.limit_resets_badge(_with_resets(**kwargs), _UR_NOW) == badge
+
+
+@pytest.mark.parametrize("usage", [
+    None, "token expired", {}, _USAGE,
+    {**_USAGE, "limit_resets": None},
+    {**_USAGE, "limit_resets": "UR 1"},
+    {**_USAGE, "limit_resets": {"fetched_at": 1.0}},  # no grant reading at all
+])
+def test_no_badge_without_a_grant(usage):
+    assert menubar.limit_resets_badge(usage, _UR_NOW) is None
+    assert menubar.limit_resets_spoken(usage, _UR_NOW) is None
+
+
+@pytest.mark.parametrize("left", [True, -1, 1.5, "1", None, 10**7])
+def test_no_badge_for_an_unreadable_count(left):
+    assert menubar.limit_resets_badge(_with_resets(left=left), _UR_NOW) is None
+
+
+@pytest.mark.parametrize("ends_at", [None, "", "soon", 5, "2026-11-02T11:59:59+00:00", "2026-11-02T12:00:00+00:00"])
+def test_no_badge_once_the_grant_has_ended_or_cannot_be_dated(ends_at):
+    assert menubar.limit_resets_badge(_with_resets(ends_at=ends_at), _UR_NOW) is None
+
+
+def test_badge_while_the_grant_is_still_live():
+    usage = _with_resets(ends_at="2026-11-02T12:00:01+00:00")
+    assert menubar.limit_resets_badge(usage, _UR_NOW) == ("UR 1", "ok")
+
+
+def test_limit_resets_spoken_says_the_local_use_by_date(new_york):
+    # The grant the server reported on 2026-11-02: ends 04:59 UTC on Dec 1,
+    # which is 11:59 PM on Nov 30 in New York (claude.ai: "Expires Nov 30").
+    usage = _with_resets(ends_at="2026-12-01T04:59:00+00:00")
+    assert menubar.limit_resets_spoken(usage, _UR_NOW) == "1 limit reset, use by Nov 30"
+
+
+@pytest.mark.parametrize("kwargs, spoken", [
+    ({"left": 2}, "2 limit resets, use by Nov 20"),
+    ({"left": 0, "usable": False}, "no limit resets left"),
+    ({"usable": False}, "1 limit reset, not usable now, use by Nov 20"),
+    ({"paused": True, "usable": False}, "1 limit reset, paused, use by Nov 20"),
+])
+def test_limit_resets_spoken_states(new_york, kwargs, spoken):
+    assert menubar.limit_resets_spoken(_with_resets(**kwargs), _UR_NOW) == spoken
+
+
+def test_format_account_label_appends_the_resets_after_the_windows():
+    label = menubar.format_account_label(2, "loc@papaya.asia", _with_resets(), _UR_NOW)
+    assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30% · UR 1"
+    zero = menubar.format_account_label(2, "loc@papaya.asia", _with_resets(left=0), _UR_NOW)
+    assert zero.endswith("$ 30% · UR 0")
+
+
+def test_format_account_label_without_a_grant_is_unchanged():
+    assert menubar.format_account_label(2, "loc@papaya.asia", _USAGE, _UR_NOW) == (
+        "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30%"
+    )
+
+
+def test_format_title_appends_the_active_accounts_resets_after_its_pcts():
+    s = menubar.MenuBarSettings(show_account_name=True, title_pct="both")
+    assert menubar.format_title("loc@papaya.asia", _with_resets(), s, now=_UR_NOW) == "⇄ loc · 42% · 18% · UR 1"
+    scoped = menubar.MenuBarSettings(show_account_name=False, title_pct="5h", title_scoped=True)
+    usage = {**_with_resets(), "scoped": [{"name": "Fable", "pct": 55.0}]}
+    assert menubar.format_title("loc@papaya.asia", usage, scoped, now=_UR_NOW) == "⇄ 42% · Fable 55% · UR 1"
+
+
+def test_format_title_resets_sit_before_the_codex_segment():
+    s = menubar.MenuBarSettings(show_account_name=True, title_pct="5h")
+    codex = _cu.CodexState(
+        True,
+        _cu.CodexReading((_cu.CodexWindow("7d", 56.0, 10080, _UR_NOW + 86400),), "pro", _UR_NOW - 9, "rollout"),
+        2, _UR_NOW - 60, None,
+    )
+    title = menubar.format_title("loc@papaya.asia", _with_resets(left=0), s, now=_UR_NOW, codex=codex)
+    assert title == "⇄ loc · 42% · UR 0 · Codex 56% · UR 2"
+
+
+def test_format_title_resets_toggle_and_no_grant():
+    on = menubar.MenuBarSettings(show_account_name=True, title_pct="off")
+    assert on.title_resets is True  # on by default
+    assert menubar.format_title("loc@x.com", _with_resets(), on, now=_UR_NOW) == "⇄ loc · UR 1"
+    off = menubar.MenuBarSettings(show_account_name=True, title_pct="off", title_resets=False)
+    assert menubar.format_title("loc@x.com", _with_resets(), off, now=_UR_NOW) == "⇄ loc"
+    assert menubar.format_title("loc@x.com", _USAGE, on, now=_UR_NOW) == "⇄ loc"  # no grant, no tag
+    assert menubar.format_title("loc@x.com", "token expired", on, now=_UR_NOW) == "⇄ loc"
+
+
+def test_settings_round_trip_title_resets(tmp_path: Path):
+    path = tmp_path / "menubar_settings.json"
+    original = menubar.MenuBarSettings(title_resets=False)
+    original.save(path)
+    assert json.loads(path.read_text(encoding="utf-8"))["title_resets"] is False
+    assert menubar.MenuBarSettings.load(path) == original
+    path.write_text(json.dumps({"title_resets": "no"}), encoding="utf-8")
+    assert menubar.MenuBarSettings.load(path).title_resets is True  # a wrong type keeps the default
+
+
+def test_format_usage_log_gains_the_resets():
+    usage = {
+        "five_hour": {"pct": 35.0, "clock": "06:59"},
+        "seven_day": {"pct": 55.0, "clock": "Jul 3"},
+        "limit_resets": _resets(),
+    }
+    assert menubar.format_usage_log("a@x.com", usage, _UR_NOW) == (
+        "usage a@x.com: 5h 35% (resets 06:59) · 7d 55% (resets Jul 3) · UR 1"
+    )
+    assert menubar.format_usage_log("a@x.com", {"limit_resets": _resets()}, _UR_NOW) is None  # no window
+
+
+def test_adapt_snapshot_hands_the_resets_entry_to_the_menu():
+    lg = _with_resets({"seven_day": {"pct": 20.0}})
+    accts = [_FakeAcct("1", "a@x.com", True, _FakeEntry(last_good=lg, fetched_at=123.0))]
+    snap = menubar._adapt_snapshot(_FakeSnap(accts))
+    (entry,) = snap["accounts"]
+    assert entry[3]["limit_resets"] == lg["limit_resets"]  # the display usage the rows read
+    assert snap["active_usage"]["limit_resets"] == lg["limit_resets"]  # and the title

@@ -483,12 +483,14 @@ def _badge_color(state: str, ink):
 
 
 def _draw_header(panel, layout, cols, ink, pixel: float) -> None:
-    """Slot number, name, email; on the right the state words (or the badge) and the age.
+    """Slot number, name, email; on the right the badge, the state words and the age.
 
-    The Codex block has no slot number; its plan type sits where the email
-    goes and its usage-resets badge before the age: a small tag in the
-    ACTIVE tag's font, on the age text's baseline, in a rounded outline one
-    device pixel (``pixel`` points) wide.
+    The badge is the usage-resets pill: an account's limit resets before
+    ACTIVE (or held, or paused), the Codex block's banked resets before the
+    age. The Codex block has no slot number and its plan type sits where
+    the email goes. The pill is a small tag in the ACTIVE tag's font, on
+    the age text's baseline, in a rounded outline one device pixel
+    (``pixel`` points) wide.
     """
     fonts, top, h = layout.fonts, mp.TOP_PAD, layout.header_h
 
@@ -499,15 +501,15 @@ def _draw_header(panel, layout, cols, ink, pixel: float) -> None:
         _text(str(panel.num), fonts["num"], ink.tertiary).drawAtPoint_((mp.LEFT_INSET, centred(fonts["num"])))
 
     pieces = []  # (text, font, pill colour or None), in reading order
+    if panel.badge_text:  # first: before ACTIVE or held on an account, before the age on Codex
+        color = _badge_color(panel.badge_state, ink)
+        pieces.append((_text(panel.badge_text, fonts["tag"], color), fonts["tag"], color))
     for word in panel.state_words:  # "held · 28m" stays one piece
         if word == "active":
             accent = ink.secondary if ink.highlighted else NSColor.controlAccentColor()
             pieces.append((_text("ACTIVE", fonts["tag"], accent), fonts["tag"], None))
         else:
             pieces.append((_text(word, fonts["meta"], ink.secondary), fonts["meta"], None))
-    if panel.badge_text:
-        color = _badge_color(panel.badge_state, ink)
-        pieces.append((_text(panel.badge_text, fonts["tag"], color), fonts["tag"], color))
     if panel.age_text:
         pieces.append((_text(panel.age_text, fonts["meta"], ink.tertiary), fonts["meta"], None))
     widths = [
