@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import time
 import urllib.error
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
@@ -1597,6 +1599,59 @@ class TestClaudeCodeVersion:
         fake.chmod(0o755)
         assert _REAL_RUN_CLAUDE_VERSION(str(fake)).strip() == "2.1.512 (Claude Code)"
         assert _REAL_RUN_CLAUDE_VERSION(str(tmp_path / "absent")) is None
+
+    def test_version_discovery_handles_dangling_symlinks(self, tmp_path):
+        # The installs are files named by version (a folder counts too). A
+        # version-named link whose target is gone, or is neither a file nor
+        # a folder, is no install and is skipped.
+        versions = tmp_path / "versions"
+        versions.mkdir()
+        (versions / "2.1.400").write_text("")
+        (versions / "2.1.450").mkdir()
+        (tmp_path / "real").write_text("")
+        (versions / "2.1.500").symlink_to(tmp_path / "real")
+        (versions / "2.1.999").symlink_to(tmp_path / "gone")
+        os.mkfifo(tmp_path / "pipe")
+        (versions / "2.1.998").symlink_to(tmp_path / "pipe")
+        assert oauth.claude_code_version(versions, run=lambda: "9.9.9") == "2.1.500"
+        only_dangling = tmp_path / "only"
+        only_dangling.mkdir()
+        (only_dangling / "2.1.999").symlink_to(tmp_path / "gone")
+        assert oauth.claude_code_version(only_dangling, run=lambda: "2.1.401") == "2.1.401"
+
+    def test_version_timeout_falls_back(self, tmp_path, monkeypatch):
+        hung = tmp_path / "claude"
+        hung.write_text("#!/bin/sh\nexec sleep 30\n")
+        hung.chmod(0o755)
+        monkeypatch.setattr(oauth, "CLAUDE_VERSION_TIMEOUT_S", 0.3)
+        started = time.monotonic()
+        assert _REAL_RUN_CLAUDE_VERSION(str(hung)) is None
+        assert time.monotonic() - started < 5.0  # the hung binary is not waited out
+        version = oauth.claude_code_version(tmp_path / "none", run=lambda: _REAL_RUN_CLAUDE_VERSION(str(hung)))
+        assert version == oauth.CLAUDE_CODE_VERSION_FALLBACK
+
+    def test_version_lookup_uses_path_then_local_bin(self, tmp_path, monkeypatch):
+        def fake_claude(folder, version):
+            folder.mkdir(parents=True, exist_ok=True)
+            binary = folder / "claude"
+            binary.write_text(f'#!/bin/sh\necho "{version} (Claude Code)"\n')
+            binary.chmod(0o755)
+            return binary
+
+        on_path = fake_claude(tmp_path / "path-bin", "2.1.601")
+        home = tmp_path / "home"
+        local = fake_claude(home / ".local" / "bin", "2.1.602")
+        monkeypatch.setattr("pathlib.Path.home", lambda: home)  # the suite pins Path.home itself
+        asked = []
+        monkeypatch.setattr(oauth.shutil, "which", lambda name: asked.append(name) or str(on_path))
+        assert _REAL_RUN_CLAUDE_VERSION().split()[0] == "2.1.601"  # the PATH answer first
+        assert asked == ["claude"]
+        monkeypatch.setattr(oauth.shutil, "which", lambda name: None)
+        assert _REAL_RUN_CLAUDE_VERSION().split()[0] == "2.1.602"  # then ~/.local/bin
+        local.unlink()
+        with patch("claude_swap.oauth.subprocess.run") as run:
+            assert _REAL_RUN_CLAUDE_VERSION() is None  # neither: nothing is started
+        run.assert_not_called()
 
     def test_user_agent_is_claude_codes_own_and_read_once(self, monkeypatch):
         calls = []

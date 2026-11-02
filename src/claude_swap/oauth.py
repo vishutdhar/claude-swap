@@ -412,6 +412,16 @@ def _version_key(version: str) -> tuple[int, ...]:
     return tuple(int(part) for part in version.split("."))
 
 
+def _installed(entry: os.DirEntry) -> bool:
+    """Whether a versions-folder entry is an install: a file (as Claude Code
+    keeps them) or a folder, its links followed. A link whose target is
+    gone, or is anything else, is not."""
+    try:
+        return entry.is_file() or entry.is_dir()
+    except OSError:
+        return False
+
+
 def _run_claude_version(binary: str | None = None) -> str | None:
     """What ``claude --version`` prints, or None when it cannot be run.
 
@@ -444,15 +454,20 @@ def claude_code_version(
 ) -> str:
     """The installed Claude Code's version, for the resets read's User-Agent.
 
-    The newest version-named entry under ``~/.local/share/claude/versions``
-    (compared by number: 2.1.316 is newer than 2.1.99), else the first word
-    of ``claude --version``, else ``CLAUDE_CODE_VERSION_FALLBACK``. Only a
-    plain dotted number is ever returned.
+    The newest version-named install under ``~/.local/share/claude/versions``
+    (compared by number: 2.1.316 is newer than 2.1.99; a dangling link is
+    skipped), else the first word of ``claude --version``, else
+    ``CLAUDE_CODE_VERSION_FALLBACK``. Only a plain dotted number is ever
+    returned.
     """
     folder = versions_dir if versions_dir is not None else Path.home() / CLAUDE_CODE_VERSIONS_DIR
     try:
         with os.scandir(folder) as entries:
-            names = [entry.name for entry in entries if _VERSION_RE.fullmatch(entry.name)]
+            names = [
+                entry.name
+                for entry in entries
+                if _VERSION_RE.fullmatch(entry.name) and _installed(entry)
+            ]
     except OSError:
         names = []
     if names:
