@@ -12881,6 +12881,11 @@ class TestSessionShellGuardCoversEveryMutator:
             s.unset_alias("2")
 
 
+def _resets_stamps(s) -> dict:
+    """The per-account limit-resets try stamps in a switcher's usage cache."""
+    return json.loads(s._usage_store.path.read_text()).get("limitResetsAttempts", {})
+
+
 class TestLimitResetsInTheFetchPass:
     """The rare limit-resets read rides on the per-account usage fetch:
     asked for only when a slot's last try is an hour old (ten minutes for
@@ -12931,8 +12936,11 @@ class TestLimitResetsInTheFetchPass:
         """Move every stored time ``seconds`` into the past; with
         ``poll_due`` also make every row stale and due for a plain pass."""
         table = json.loads(s._usage_store.path.read_text())
+        stamps = table.get("limitResetsAttempts") or {}
+        for uuid in stamps:
+            stamps[uuid] -= seconds
         for row in table["accounts"].values():
-            for key in ("fetchedAt", "limitResetsAttemptAt", "lastAttemptAt"):
+            for key in ("fetchedAt", "lastAttemptAt"):
                 if isinstance(row.get(key), (int, float)):
                     row[key] -= seconds
             if isinstance(row.get("lastGood"), dict) and "limit_resets" in row["lastGood"]:
@@ -13088,7 +13096,9 @@ class TestLimitResetsInTheFetchPass:
             assert entries[num].last_error is None and entries[num].consecutive_failures == 0
             assert entries[num].last_good == {"seven_day": {"pct": 21.0}}
         # The failed try still paces the next one.
-        assert s._usage_store.limit_resets_due(["1", "2"], self.IDENT, 3600.0) == set()
+        assert s._usage_store.limit_resets_due(
+            ["1", "2"], self.IDENT, 3600.0, account_uuids={"1": "uuid-1", "2": "uuid-2"}
+        ) == set()
 
 
 class TestLimitResetsPacingSurvivesADiscardedRead:
@@ -13147,8 +13157,7 @@ class TestLimitResetsPacingSurvivesADiscardedRead:
         # not stamped: once its own credential is back, it is read at once.
         assert "Bearer sk-foreign" not in resets_sent
         assert resets_sent == ["Bearer sk-backup"]
-        row = json.loads(s._usage_store.path.read_text())["accounts"]["1"]
-        assert "limitResetsAttemptAt" not in row
+        assert "uuid-1" not in _resets_stamps(s)  # the slot's account is not stamped
 
 
 class TestLimitResetsAuthFailuresStayIsolated:
@@ -13281,7 +13290,7 @@ class TestActivePathResets:
         assert "Bearer sk-active" not in sent
         assert sent == ["Bearer sk-backup"]  # the other slot is read as usual
         row = json.loads(s._usage_store.path.read_text())["accounts"]["1"]
-        assert "limitResetsAttemptAt" not in row
+        assert "uuid-1" not in _resets_stamps(s)
 
     @pytest.mark.no_limit_resets_fake
     def test_active_lease_taken_over_during_probe_never_sends_resets(
@@ -13299,7 +13308,7 @@ class TestActivePathResets:
         assert taken  # the lease moved while the probe ran
         assert "Bearer sk-active" not in sent
         row = json.loads(s._usage_store.path.read_text())["accounts"]["1"]
-        assert "limitResetsAttemptAt" not in row
+        assert "uuid-1" not in _resets_stamps(s)
         assert row["claimId"] == taken[0]  # the other collector's lease is untouched
 
 
@@ -13389,8 +13398,11 @@ class TestLimitResetsProfileAttestation:
 
     def _age(self, s, seconds):
         table = json.loads(s._usage_store.path.read_text())
+        stamps = table.get("limitResetsAttempts") or {}
+        for uuid in stamps:
+            stamps[uuid] -= seconds
         for row in table["accounts"].values():
-            for key in ("fetchedAt", "limitResetsAttemptAt", "lastAttemptAt"):
+            for key in ("fetchedAt", "lastAttemptAt"):
                 if isinstance(row.get(key), (int, float)):
                     row[key] -= seconds
             row["nextPollAt"] = None
@@ -13425,20 +13437,20 @@ class TestLimitResetsProfileAttestation:
         self._pass(s, log)  # slot 2 is A: A's one reset is kept
         assert self._left(s) == 1
         self._age(s, 3600)
-        before = self._row(s)["limitResetsAttemptAt"]
+        before = _resets_stamps(s)["uuid-2"]
         # A same-email swap has written B's credential but not yet B's
         # metadata: every local read says slot 2 is A and holds B's token.
         self._pass(s, log, backup_for_2="sk-b")
         assert ("resets", "sk-b", "claude-cli/2.1.316 (external, cli)") in log
         assert self._left(s) == 1  # B's three resets were never kept as A's
-        stamp = self._row(s)["limitResetsAttemptAt"]
+        stamp = _resets_stamps(s)["uuid-2"]
         assert stamp > before  # the try paces the next one
         # The swap rolls back: A's credential again. The slot waits out its
         # interval and still shows A's own entry.
         log.clear()
         self._pass(s, log, fresh=True)
         assert [k for k, _t, _u in log if k == "resets"] == []
-        assert self._left(s) == 1 and self._row(s)["limitResetsAttemptAt"] == stamp
+        assert self._left(s) == 1 and _resets_stamps(s)["uuid-2"] == stamp
 
     @pytest.mark.no_limit_resets_fake
     @pytest.mark.no_oauth_profile_fake
@@ -13455,7 +13467,7 @@ class TestLimitResetsProfileAttestation:
         # plaintext fallback still holds B: every session read returns B.
         self._pass(s, log, session=lambda: "sk-b")
         assert self._left(s) == 1
-        assert isinstance(self._row(s).get("limitResetsAttemptAt"), float)
+        assert isinstance(_resets_stamps(s).get("uuid-2"), float)
 
     @pytest.mark.no_limit_resets_fake
     @pytest.mark.no_oauth_profile_fake
@@ -13470,7 +13482,7 @@ class TestLimitResetsProfileAttestation:
         self._pass(s, log, session=lambda: "sk-b")
         assert ("profile", "sk-b", "claude-swap/1.0") in log
         assert self._left(s) is None  # nothing recorded for slot 2
-        assert isinstance(self._row(s).get("limitResetsAttemptAt"), float)  # and still paced
+        assert isinstance(_resets_stamps(s).get("uuid-2"), float)  # and still paced
 
     @pytest.mark.no_limit_resets_fake
     @pytest.mark.no_oauth_profile_fake
@@ -13497,11 +13509,11 @@ class TestLimitResetsProfileAttestation:
         self._pass(s, log)
         assert self._left(s) == 1
         self._age(s, 3600)
-        before = self._row(s)
+        before, stamp = self._row(s), _resets_stamps(s)["uuid-2"]
         self._pass(s, log, backup_for_2="sk-b", profile_fails=True)
         after = self._row(s)
         assert after["lastGood"]["limit_resets"] == before["lastGood"]["limit_resets"]
-        assert after["limitResetsAttemptAt"] > before["limitResetsAttemptAt"]
+        assert _resets_stamps(s)["uuid-2"] > stamp
         assert after["lastError"] is None  # the usage read stands
 
     @pytest.mark.no_limit_resets_fake
@@ -13516,7 +13528,7 @@ class TestLimitResetsProfileAttestation:
         log = []
         self._pass(s, log)
         assert [t for kind, t, _u in log if kind == "resets"] == ["sk-active"]
-        assert "limitResetsAttemptAt" not in self._row(s)
+        assert set(_resets_stamps(s)) == {"uuid-1"}  # only the active slot's account
 
 
 class TestAttestLimitResetsRule:
@@ -13542,13 +13554,19 @@ class TestAttestLimitResetsRule:
             "4": rec("uuid-9", None),  # another account (and an unknown slot)
         }
         kept = s._attest_limit_resets(cases)
-        assert kept["1"].limit_resets is not None
-        assert [kept[n].limit_resets for n in ("2", "3", "4")] == [None, None, None]
+        assert kept["1"].limit_resets == cases["1"].limit_resets
+        # Each other answer is dropped; the account the server named stays,
+        # for the store to pace.
+        assert [kept[n].limit_resets for n in ("2", "3", "4")] == [
+            oauth.LimitResetsRead(None, "uuid-2", None),
+            oauth.LimitResetsRead(None, "uuid-3", "org-x"),
+            oauth.LimitResetsRead(None, "uuid-9", None),
+        ]
         assert all(kept[n].usage == cases[n].usage for n in cases)  # the usage always stands
         mismatched_account = s._attest_limit_resets({"1": rec("uuid-9", "org-1")})
-        assert mismatched_account["1"].limit_resets is None
+        assert mismatched_account["1"].limit_resets == oauth.LimitResetsRead(None, "uuid-9", "org-1")
         unattested = s._attest_limit_resets({"1": rec(None, None)})
-        assert unattested["1"].limit_resets is None
+        assert unattested["1"].limit_resets == oauth.LimitResetsRead(None)
 
 
 
@@ -13572,7 +13590,7 @@ class TestLimitResetsAfterReplacement:
         ident = {"2": ("account2@example.com", "")}
         # Account A's attested grant, recorded while it held slot 2.
         claim = s._usage_store.claim(["2"], ident)["2"]
-        assert s._usage_store.reserve_limit_resets("2", ident["2"], claim, 3600.0)
+        assert s._usage_store.reserve_limit_resets("2", ident["2"], claim, 3600.0, account_uuid="uuid-2")
         s._usage_store.record(
             {"2": FetchRecord(usage={"seven_day": {"pct": 5.0}},
                               limit_resets=oauth.LimitResetsRead(TestLimitResetsInTheFetchPass.GRANT, "uuid-2", ""))},
@@ -13601,3 +13619,72 @@ class TestLimitResetsAfterReplacement:
         assert "limit_resets" not in row[3] and "limit_resets" not in row[4]  # ... never shown
         if replacement["uuid"] == "":
             assert ("2", True) not in calls  # and a token-only slot is never read
+
+
+class TestLimitResetsPacedPerAccount:
+    """The resets interval belongs to the account, not to the slot's cache
+    row: a row replaced after a swap must not let the account ask again."""
+
+    OWNERS = {"sk-active": ("uuid-1", ""), "sk-a": ("uuid-A", "org-A"), "sk-b": ("uuid-B", "org-B")}
+
+    @pytest.mark.no_limit_resets_fake
+    @pytest.mark.no_oauth_profile_fake
+    # With the reads failing no account is attested, so only the
+    # reservation's own stamp can pace them.
+    @pytest.mark.parametrize("resets_fail", [False, True], ids=["answered", "failing"])
+    def test_swap_between_metadata_and_backup_read_preserves_resets_interval(
+        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch, resets_fail
+    ):
+        monkeypatch.setattr(oauth, "claude_code_user_agent", lambda: "claude-cli/2.1.316 (external, cli)")
+        # Slots 2 and 3 share an email in two organizations: account A
+        # (org-A) and account B (org-B). They have just been swapped: slot 2
+        # now holds B and slot 3 holds A.
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        sample_sequence_data["sequence"] = [1, 2, 3]
+        sample_sequence_data["accounts"]["2"] = {"email": "shared@example.com", "uuid": "uuid-B", "organizationUuid": "org-B"}
+        sample_sequence_data["accounts"]["3"] = {"email": "shared@example.com", "uuid": "uuid-A", "organizationUuid": "org-A"}
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        live = _oauth_creds("sk-active", 7200)
+        backups = {"1": live, "2": _oauth_creds("sk-b", 7200), "3": _oauth_creds("sk-a", 7200)}
+        log = []
+
+        def fake_urlopen(req, timeout=0):
+            token = (req.get_header("Authorization") or "").removeprefix("Bearer ")
+            if req.full_url == oauth.LIMIT_RESETS_URL:
+                log.append(("resets", token))
+                if resets_fail:
+                    raise urllib.error.HTTPError(req.full_url, 429, "Too Many", hdrs=None, fp=None)
+                body = {"cedar_ember": TestLimitResetsInTheFetchPass.GRANT}
+            elif req.full_url == "https://api.anthropic.com/api/oauth/profile":
+                log.append(("profile", token))
+                uuid, org = self.OWNERS[token]
+                body = {"account": {"uuid": uuid, "email": "x@example.com"},
+                        **({"organization": {"uuid": org}} if org else {})}
+            else:
+                body = {"seven_day": {"utilization": 21.0}}
+            resp = MagicMock()
+            resp.read.return_value = json.dumps(body).encode()
+            resp.__enter__ = lambda r: r
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        with patch.object(ClaudeAccountSwitcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(live, False)), \
+             patch.object(ClaudeAccountSwitcher, "_read_account_credentials",
+                          side_effect=lambda num, email: backups[str(num)]), \
+             patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake_urlopen):
+            # The pass that read the roster before the swap (slot 2 = A,
+            # slot 3 = B) and the backups after it.
+            infos = s._build_accounts_info()
+            before_swap = {"2": "org-A", "3": "org-B"}
+            stale = [i if str(i[0]) not in before_swap else i[:3] + (before_swap[str(i[0])],) + i[4:] for i in infos]
+            s._collect_usage_entries(stale)
+            # A second later, from the swapped roster: each slot's row is
+            # replaced for its new identity.
+            s._collect_usage_entries(s._build_accounts_info(), fresh=True)
+            s._collect_usage_entries(s._build_accounts_info(), fresh=True)
+        for token in ("sk-a", "sk-b", "sk-active"):
+            assert log.count(("resets", token)) == 1, (token, log)
+            assert log.count(("profile", token)) == (0 if resets_fail else 1), (token, log)

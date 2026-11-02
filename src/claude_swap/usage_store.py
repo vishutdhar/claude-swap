@@ -72,13 +72,26 @@ LEGACY_CLAIM_TTL_S = 10.0  # additive-schema overlap with older collectors
 # fetch, paced from the last try whether it answered or not (a failing read
 # must not retry on every poll). Refresh now (and ``list --fresh``) may ask
 # again after ten minutes. The try time is fetch state, kept on the row as
-# ``limitResetsAttemptAt`` and written by ``reserve_limit_resets`` under the
+# ``limitResetsAttempts`` and written by ``reserve_limit_resets`` under the
 # lock right before the request is sent: a read whose record is later
 # thrown away (a foreign-credential sentinel, a collector killed mid-fetch)
 # still paces the next one. The entry itself, with its own ``fetched_at``,
 # rides in ``lastGood`` beside the windows.
+#
+# The interval belongs to the ACCOUNT, not to the slot's row: a row is
+# replaced whenever its slot's identity changes (a swap, an add over the
+# slot), and a stamp kept on it would go with it and let the same account
+# ask again at once. So the stamps live in one top-level map of the cache,
+# ``limitResetsAttempts`` (account uuid -> epoch), that row replacement
+# never touches, written under the lock and trimmed of stamps older than
+# LIMIT_RESETS_ATTEMPTS_KEEP_S. A stamp a build before this one left on a
+# row (``limitResetsAttemptAt``) is honoured for that row's account until
+# the next reservation moves it into the map.
 LIMIT_RESETS_EVERY_S = 3600.0
 LIMIT_RESETS_MANUAL_EVERY_S = 600.0
+LIMIT_RESETS_ATTEMPTS_KEY = "limitResetsAttempts"
+LIMIT_RESETS_ATTEMPTS_KEEP_S = 7 * 86400.0
+_LEGACY_ATTEMPT_KEY = "limitResetsAttemptAt"
 
 
 def _live_claim(
@@ -878,19 +891,47 @@ class UsageStore:
     def _lock(self) -> FileLock:
         return FileLock(self._lock_path)
 
-    def _read_rows(self) -> dict[str, dict]:
+    def _read_table(self) -> tuple[dict[str, dict], dict[str, float]]:
+        """The rows, and the per-account limit-resets try stamps."""
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-            return {}
+            return {}, {}
         if not isinstance(raw, dict) or raw.get("schemaVersion") != SCHEMA_VERSION:
-            return {}  # legacy snapshot or future schema: start empty
+            return {}, {}  # legacy snapshot or future schema: start empty
         rows = raw.get("accounts")
-        return rows if isinstance(rows, dict) else {}
+        stamps = raw.get(LIMIT_RESETS_ATTEMPTS_KEY)
+        attempts: dict[str, float] = {}
+        for uuid, value in (stamps.items() if isinstance(stamps, dict) else ()):
+            stamp = _finite_or_none(value)
+            if isinstance(uuid, str) and uuid and stamp is not None:
+                attempts[uuid] = stamp
+        return (rows if isinstance(rows, dict) else {}), attempts
 
-    def _write_rows(self, rows: dict[str, dict]) -> None:
+    def _read_rows(self) -> dict[str, dict]:
+        return self._read_table()[0]
+
+    def _write_rows(
+        self, rows: dict[str, dict], attempts: dict[str, float] | None = None
+    ) -> None:
+        """Write the table. ``attempts`` None keeps the stamps as stored: every
+        writer holds the lock, so the read here is the one the next writer
+        sees. Stamps older than LIMIT_RESETS_ATTEMPTS_KEEP_S are dropped."""
+        if attempts is None:
+            attempts = self._read_table()[1]
+        now = self.clock()
+        kept = {
+            uuid: stamp
+            for uuid, stamp in attempts.items()
+            if now - stamp <= LIMIT_RESETS_ATTEMPTS_KEEP_S
+        }
         atomic_write_json(
-            self.path, {"schemaVersion": SCHEMA_VERSION, "accounts": rows}
+            self.path,
+            {
+                "schemaVersion": SCHEMA_VERSION,
+                "accounts": rows,
+                LIMIT_RESETS_ATTEMPTS_KEY: kept,
+            },
         )
 
     @staticmethod
@@ -1174,8 +1215,21 @@ class UsageStore:
                     # fingerprint from an earlier, already-healed strike.
                     row["struckFingerprint"] = rec.struck_fp
 
+        # The account whose token asked for a resets answer, as the server
+        # named it, is paced too: it may not be the account reserved for
+        # (the slot's stored one) when the slot's credential raced. Its
+        # stamp is the account's, so it is written whatever the lease says.
+        askers = {
+            rec.limit_resets.account_uuid
+            for rec in outcomes.values()
+            if rec.limit_resets is not None and rec.limit_resets.account_uuid
+        }
+
         with self._lock():
-            rows = self._read_rows()
+            rows, attempts = self._read_table()
+            for asker in askers:
+                if attempts.get(asker, -math.inf) < now:
+                    attempts[asker] = now
             for num in outcomes:
                 identity = identities[num]
                 row = rows.get(num)
@@ -1201,8 +1255,8 @@ class UsageStore:
                     rows[num] = row = self._fresh_row(identity)
                 assert isinstance(row, dict)
                 apply(num, row)
-            if accepted:
-                self._write_rows(rows)
+            if accepted or askers:
+                self._write_rows(rows, attempts)
         return accepted
 
     def set_poll_plan(
@@ -1251,27 +1305,34 @@ class UsageStore:
         nums: Iterable[str],
         identities: dict[str, Identity],
         max_age_s: float,
+        *,
+        account_uuids: dict[str, str],
     ) -> set[str]:
-        """The slots among ``nums`` whose limit-resets read looks due.
+        """The slots among ``nums`` whose account's limit-resets read looks due.
 
-        Due when the last try (``limitResetsAttemptAt``, the reservation's
-        stamp) is at least ``max_age_s`` old, unknown, or dated ahead of the
-        clock (written under a clock since put back,
-        ``codex_usage.dated_ahead``). A row of another account is due. Read
+        ``account_uuids`` is each slot's stored account uuid; a slot without
+        one is never due (nothing could attest its answer). Due when the
+        account's last try (``limitResetsAttempts``; a legacy stamp on the
+        slot's row counts while that row is this identity's) is at least
+        ``max_age_s`` old, unknown, or dated ahead of the clock (written
+        under a clock since put back, ``codex_usage.dated_ahead``). Read
         without the lock (writes are atomic replaces): a cheap first cut,
         so only these slots get a gate. The read itself is sent only after
         ``reserve_limit_resets`` wins it under the lock.
         """
         now = self.clock()
-        rows = self._read_rows()
+        rows, attempts = self._read_table()
         due: set[str] = set()
         for num in nums:
-            row = rows.get(num)
-            if not self._matches(row, identities[num]):
-                due.add(num)
+            uuid = account_uuids.get(num) or ""
+            if not uuid:
                 continue
-            assert isinstance(row, dict)
-            if _limit_resets_due(row, now, max_age_s):
+            row = rows.get(num)
+            legacy = (
+                _finite_or_none(row.get(_LEGACY_ATTEMPT_KEY))
+                if self._matches(row, identities[num]) else None
+            )
+            if _limit_resets_due(attempts.get(uuid), legacy, now, max_age_s):
                 due.add(num)
         return due
 
@@ -1281,31 +1342,37 @@ class UsageStore:
         identity: Identity,
         claim_id: str,
         max_age_s: float,
+        *,
+        account_uuid: str,
     ) -> bool:
         """Win the right to send one limit-resets read for ``num``, now.
 
         Asked right before the request is sent. Under the lock: the row must
-        still be this account's and still carry the usage lease ``claim_id``
+        still be this identity's and still carry the usage lease ``claim_id``
         that this fetch holds (a collector whose lease was taken over sends
-        nothing), and the read must be due (``_limit_resets_due``). Then the
-        try is stamped (``limitResetsAttemptAt``) before any byte goes out,
-        so the next read is paced from it whatever becomes of this one's
-        record. A lock that cannot be had, or a store that cannot be
-        written, refuses: no reservation, no read.
+        nothing), and ``account_uuid``'s read must be due
+        (``_limit_resets_due``). Then the account's try is stamped in
+        ``limitResetsAttempts`` before any byte goes out, so its next read is
+        paced from it whatever becomes of this one's record or of the slot's
+        row; a legacy stamp on the row moves into the map. A lock that
+        cannot be had, or a store that cannot be written, refuses: no
+        reservation, no read.
         """
+        if not account_uuid:
+            return False
         try:
             with self._lock():
                 now = self.clock()
-                rows = self._read_rows()
+                rows, attempts = self._read_table()
                 row = rows.get(num)
-                if (
-                    not self._matches(row, identity)
-                    or row.get("claimId") != claim_id
-                    or not _limit_resets_due(row, now, max_age_s)
-                ):
+                if not self._matches(row, identity) or row.get("claimId") != claim_id:
                     return False
-                row["limitResetsAttemptAt"] = now
-                self._write_rows(rows)
+                legacy = _finite_or_none(row.get(_LEGACY_ATTEMPT_KEY))
+                if not _limit_resets_due(attempts.get(account_uuid), legacy, now, max_age_s):
+                    return False
+                attempts[account_uuid] = now
+                row.pop(_LEGACY_ATTEMPT_KEY, None)
+                self._write_rows(rows, attempts)
                 return True
         except (LockError, OSError):
             return False
@@ -1391,21 +1458,26 @@ def _finite_or_none(value: object) -> float | None:
     return number if number is not None and math.isfinite(number) else None
 
 
-def _limit_resets_due(row: dict, now: float, max_age_s: float) -> bool:
-    """Whether a stored row's limit-resets read is due (see ``limit_resets_due``).
+def _limit_resets_due(
+    attempt: float | None, legacy: float | None, now: float, max_age_s: float
+) -> bool:
+    """Whether an account's limit-resets read is due (see ``limit_resets_due``).
 
-    Paced from the last try (``limitResetsAttemptAt``, the reservation's own
-    stamp) and nothing else: not the entry's ``fetched_at``, which a failing
-    read carries forward unchanged and a clock put back can leave in the
-    future, and not the entry's shape (an older, summed entry is replaced
-    by the next read the interval allows). No stamp, or one too far ahead
-    of the clock (``codex_usage.dated_ahead``: a wrong clock's), is due; a
-    stamp a little ahead counts as a try just made.
+    Paced from the account's last try (``attempt``, the reservation's own
+    stamp, or a legacy row stamp not yet moved into the map) and nothing
+    else: not the entry's ``fetched_at``, which a failing read carries
+    forward and a clock put back can leave in the future, and not the
+    entry's shape. A stamp too far ahead of the clock
+    (``codex_usage.dated_ahead``: a wrong clock's) is dropped; one a little
+    ahead counts as a try just made. No stamp left is due.
     """
-    last = _finite_or_none(row.get("limitResetsAttemptAt"))
-    if last is None or dated_ahead(last, now):
+    stamps = [
+        stamp for stamp in (attempt, legacy)
+        if stamp is not None and not dated_ahead(stamp, now)
+    ]
+    if not stamps:
         return True
-    return now - last >= max_age_s
+    return now - max(stamps) >= max_age_s
 
 
 def _with_limit_resets(

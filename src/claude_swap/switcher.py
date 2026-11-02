@@ -5061,18 +5061,23 @@ class ClaudeAccountSwitcher:
             resets_every = (
                 LIMIT_RESETS_MANUAL_EVERY_S if fresh else LIMIT_RESETS_EVERY_S
             )
-            # A slot with no stored account uuid (a token-only account, a
-            # legacy row) has nothing to attest an answer against: no read.
-            attestable = {
-                num for num, (uuid, _org) in self._slot_account_ids().items() if uuid
+            # Paced per account (its stored uuid). A slot with no stored
+            # account uuid (a token-only account, a legacy row) has nothing
+            # to attest an answer against: no read.
+            uuids = {
+                num: uuid
+                for num, (uuid, _org) in self._slot_account_ids().items()
+                if uuid and num in claims
             }
             resets_gates = {
                 num: functools.partial(
                     store.reserve_limit_resets,
                     num, identities[num], claims[num], resets_every,
+                    account_uuid=uuids[num],
                 )
-                for num in store.limit_resets_due(claims, identities, resets_every)
-                if num in attestable
+                for num in store.limit_resets_due(
+                    claims, identities, resets_every, account_uuids=uuids
+                )
             }
             records = self._run_usage_fetches(
                 [info_by_num[num] for num in claims], limit_resets=resets_gates
@@ -5139,7 +5144,8 @@ class ClaudeAccountSwitcher:
         Anything else (another account, a failed probe, a slot with no
         stored uuid, an unreadable roster) is not kept: the slot's previous
         entry stays (the menu checks its ids before showing it) and the
-        reservation stamp stands, so pacing never depends on attribution.
+        reservation stamp stands, so pacing never depends on attribution;
+        the account the server did name is stamped as well.
         """
         ids = self._slot_account_ids()
         out = dict(records)
@@ -5154,7 +5160,12 @@ class ClaudeAccountSwitcher:
                 and (read.org_uuid or "") == slot_org
             ):
                 continue
-            out[num] = dataclasses.replace(record, limit_resets=None)
+            # The answer is dropped; the account the server named (if any)
+            # stays on the read, so the store paces that account too.
+            out[num] = dataclasses.replace(
+                record,
+                limit_resets=oauth.LimitResetsRead(None, read.account_uuid, read.org_uuid),
+            )
             self._logger.debug(
                 "Limit resets answer for account %s not kept: the server did "
                 "not attest the token as this slot's account.", num,
