@@ -1933,7 +1933,8 @@ class TestFetchUsageWithLimitResets:
                 "1", "a@x.com", self._creds(), is_active=True, limit_resets=lambda: True,
             )
         assert out.error is None and out.usage["five_hour"]["pct"] == 12.0
-        assert out.limit_resets == oauth.LimitResetsRead(cedar)
+        # Tagged with the credential that asked, for the collector's check.
+        assert out.limit_resets == oauth.LimitResetsRead(cedar, oauth.credential_fingerprint(self._creds()))
         assert tokens == ["old-access"]
         assert "limit_resets" not in out.usage  # the store merges it, with its own clock
 
@@ -1970,7 +1971,7 @@ class TestFetchUsageWithLimitResets:
                 "1", "a@x.com", self._creds(), is_active=True, limit_resets=lambda: True,
             )
         assert out.error is None and out.usage is not None
-        assert out.limit_resets == oauth.LimitResetsRead(None)
+        assert out.limit_resets == oauth.LimitResetsRead(None, oauth.credential_fingerprint(self._creds()))
 
     def test_a_resets_read_that_raises_never_fails_the_usage_read(self, monkeypatch):
         def boom(token):
@@ -1982,7 +1983,7 @@ class TestFetchUsageWithLimitResets:
                 "1", "a@x.com", self._creds(), is_active=True, limit_resets=lambda: True,
             )
         assert out.error is None and out.usage["seven_day"]["pct"] == 34.0
-        assert out.limit_resets == oauth.LimitResetsRead(None)
+        assert out.limit_resets == oauth.LimitResetsRead(None, oauth.credential_fingerprint(self._creds()))
 
     def test_after_a_401_refresh_the_resets_read_uses_the_new_token(self, monkeypatch):
         tokens = []
@@ -2004,7 +2005,9 @@ class TestFetchUsageWithLimitResets:
             )
         assert calls == ["old-access", "new-access"]
         assert tokens == ["new-access"]
-        assert out.limit_resets == oauth.LimitResetsRead(_cedar())
+        # The refreshed credential asked, so it is the one named.
+        assert out.limit_resets == oauth.LimitResetsRead(_cedar(), oauth.credential_fingerprint(refreshed))
+        assert out.limit_resets.credential_fp != oauth.credential_fingerprint(self._creds())
 
 
 class TestLimitResetsGate:
@@ -2054,7 +2057,9 @@ class TestReadLimitResetsFor:
         tokens = []
         monkeypatch.setattr(oauth, "request_limit_resets", lambda token: tokens.append(token) or _cedar())
         creds = json.dumps({"claudeAiOauth": {"accessToken": "tok-live"}})
-        assert oauth.read_limit_resets_for(creds, lambda: True) == oauth.LimitResetsRead(_cedar())
+        assert oauth.read_limit_resets_for(creds, lambda: True) == oauth.LimitResetsRead(
+            _cedar(), oauth.credential_fingerprint(creds)
+        )
         assert oauth.read_limit_resets_for(creds, lambda: False) is None
         assert tokens == ["tok-live"]
 

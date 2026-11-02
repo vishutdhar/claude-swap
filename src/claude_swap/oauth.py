@@ -655,13 +655,20 @@ class LimitResetsRead:
     """
 
     cedar_ember: dict | None
+    # credential_fingerprint of the credential whose token asked: the answer
+    # is about that credential's account, and the collector keeps it only
+    # while the slot still holds that credential (see the switcher's
+    # _limit_resets_attributed).
+    credential_fp: str | None = None
 
 
 def _read_limit_resets(
-    access_token: str, gate: Callable[[], bool]
+    access_token: str, gate: Callable[[], bool], credentials: str
 ) -> LimitResetsRead | None:
     """``request_limit_resets`` behind its gate, unable to fail the usage read
-    it rides on. None when the gate refuses (or fails): no read was made."""
+    it rides on, tagged with the fingerprint of ``credentials`` (the
+    credential ``access_token`` came from). None when the gate refuses (or
+    fails): no read was made."""
     try:
         allowed = gate() is True
     except Exception as e:
@@ -669,11 +676,12 @@ def _read_limit_resets(
         return None
     if not allowed:
         return None
+    fp = credential_fingerprint(credentials)
     try:
-        return LimitResetsRead(request_limit_resets(access_token))
+        return LimitResetsRead(request_limit_resets(access_token), fp)
     except Exception as e:  # the contract says never; a bug must not cost the usage
         _logger.debug("Limit resets read raised: %r", e)
-        return LimitResetsRead(None)
+        return LimitResetsRead(None, fp)
 
 
 def read_limit_resets_for(
@@ -691,7 +699,7 @@ def read_limit_resets_for(
     token = extract_access_token(credentials)
     if not token:
         return None
-    return _read_limit_resets(token, gate)
+    return _read_limit_resets(token, gate, credentials)
 
 
 def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
@@ -1000,15 +1008,15 @@ def try_fetch_usage_for_account(
         # A transient refresh failure falls through to try the (expired) token;
         # the 401 path below retries the refresh.
 
-    def succeeded(data: dict, token: str) -> UsageOutcome:
+    def succeeded(data: dict, token: str, creds: str) -> UsageOutcome:
         usage = build_usage_result(data)
         if limit_resets is None or usage is None:
             return UsageOutcome(usage)
-        return UsageOutcome(usage, limit_resets=_read_limit_resets(token, limit_resets))
+        return UsageOutcome(usage, limit_resets=_read_limit_resets(token, limit_resets, creds))
 
     try:
         data = request_usage_data(access_token)
-        return succeeded(data, access_token)
+        return succeeded(data, access_token, working_credentials)
     except urllib.error.HTTPError as e:
         kind, retry_after = _classify_usage_error(e)
         if (
@@ -1057,7 +1065,7 @@ def try_fetch_usage_for_account(
 
         try:
             data = request_usage_data(new_token)
-            return succeeded(data, new_token)
+            return succeeded(data, new_token, working_credentials)
         except Exception as retry_error:
             kind, retry_after = _classify_usage_error(retry_error)
             _log_usage_failure(context + " after refresh", retry_error, kind, retry_after)

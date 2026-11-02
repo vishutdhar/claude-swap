@@ -2316,3 +2316,20 @@ class TestLimitResetsReservation:
         store.record({"1": FetchRecord(usage=USAGE, limit_resets=oauth.LimitResetsRead(_cedar_with()))}, IDENT)
         assert self._stamp(store) is None
         assert json.loads(store.path.read_text())["accounts"]["1"]["lastGood"]["limit_resets"]
+
+
+class TestDisownedLimitResets:
+    def test_a_disowned_answer_keeps_the_old_entry_and_clears_the_stamp(self, store, clock):
+        _resets_pass(store, "1", oauth.LimitResetsRead(_cedar_with()))
+        before = json.loads(store.path.read_text())["accounts"]["1"]["lastGood"]["limit_resets"]
+        clock.advance(4000)
+        claim = store.claim(["1"], IDENT)["1"]
+        assert store.reserve_limit_resets("1", IDENT["1"], claim, 3600.0)
+        other = oauth.LimitResetsRead(_cedar_with(left=5))
+        store.record({"1": FetchRecord(usage=USAGE, limit_resets=other)}, IDENT,
+                     claims={"1": claim}, disowned_resets=["1"])
+        row = json.loads(store.path.read_text())["accounts"]["1"]
+        assert row["lastGood"]["limit_resets"] == before  # not the other account's answer
+        assert "limitResetsAttemptAt" not in row
+        assert store.limit_resets_due(["1"], IDENT, 3600.0) == {"1"}  # read again at once
+        assert row["lastGood"]["five_hour"] == USAGE["five_hour"]  # the usage stands
