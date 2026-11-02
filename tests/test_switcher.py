@@ -13312,11 +13312,9 @@ class TestActivePathResets:
         assert row["claimId"] == taken[0]  # the other collector's lease is untouched
 
 
-class TestLimitResetsProfileAttestation:
-    """A resets answer is kept for a slot only when the server says the token
-    that asked belongs to the slot's account: the profile probe, with the
-    same token, must name the slot's stored uuid and organization. Pacing
-    never depends on it: the reservation stamp stands whatever happens."""
+class _ResetsNetHelpers:
+    """A collect pass over a fake network that answers usage polls, resets
+    reads and profile probes, for the attestation tests below."""
 
     GRANT_A = TestLimitResetsInTheFetchPass.GRANT  # one reset left
     GRANT_B = {**TestLimitResetsInTheFetchPass.GRANT,
@@ -13332,9 +13330,10 @@ class TestLimitResetsProfileAttestation:
         s._write_json(s.sequence_file, sample_sequence_data)
         return s
 
-    def _net(self, log, profile_fails=False):
+    def _net(self, log, profile_fails=False, profile_error=None, on_profile=None):
         """A fake network: usage polls, resets reads and profile probes, logged
-        as (kind, token, user agent)."""
+        as (kind, token, user agent). ``profile_error`` is raised by the
+        profile probe; ``on_profile(token)`` runs while it is in flight."""
         def fake_urlopen(req, timeout=0):
             token = (req.get_header("Authorization") or "").removeprefix("Bearer ")
             url = req.full_url
@@ -13343,13 +13342,18 @@ class TestLimitResetsProfileAttestation:
                 body = {"cedar_ember": self.GRANT_B if token == "sk-b" else self.GRANT_A}
             elif url == "https://api.anthropic.com/api/oauth/profile":
                 log.append(("profile", token, req.get_header("User-agent")))
+                if on_profile is not None:
+                    on_profile(token)
                 if profile_fails:
                     raise urllib.error.HTTPError(url, 500, "down", hdrs=None, fp=None)
+                if profile_error is not None:
+                    raise profile_error
                 body = {"account": {"uuid": self.OWNERS[token], "email": "x@example.com"}}
             elif url == "https://api.anthropic.com/api/oauth/usage":
                 log.append(("usage", token, req.get_header("User-agent")))
                 body = {"seven_day": {"utilization": 21.0}}
             else:
+                log.append(("unexpected", url, None))
                 raise AssertionError(f"unexpected request {url}")
             resp = MagicMock()
             resp.read.return_value = json.dumps(body).encode()
@@ -13358,7 +13362,8 @@ class TestLimitResetsProfileAttestation:
             return resp
         return fake_urlopen
 
-    def _pass(self, s, log, backup_for_2="sk-a2", session=None, fresh=False, profile_fails=False):
+    def _pass(self, s, log, backup_for_2="sk-a2", session=None, fresh=False, profile_fails=False,
+              profile_error=None, on_profile=None):
         """One collect pass. Slot 1 is active (its backup holds the same
         lineage, so no ownership probe runs); slot 2 reads ``backup_for_2``,
         or ``session()`` from its session profile when given."""
@@ -13371,7 +13376,8 @@ class TestLimitResetsProfileAttestation:
                          side_effect=lambda num, email: backups[str(num)]),
             patch.object(ClaudeAccountSwitcher, "_live_session_pids", return_value=[]),
             patch("claude_swap.oauth.urllib.request.urlopen",
-                  side_effect=self._net(log, profile_fails=profile_fails)),
+                  side_effect=self._net(log, profile_fails=profile_fails,
+                                        profile_error=profile_error, on_profile=on_profile)),
         ]
         if session is not None:
             patches += [
@@ -13407,6 +13413,14 @@ class TestLimitResetsProfileAttestation:
                     row[key] -= seconds
             row["nextPollAt"] = None
         s._usage_store.path.write_text(json.dumps(table))
+
+
+
+class TestLimitResetsProfileAttestation(_ResetsNetHelpers):
+    """A resets answer is kept for a slot only when the server says the token
+    that asked belongs to the slot's account: the profile probe, with the
+    same token, must name the slot's stored uuid and organization. Pacing
+    never depends on it: the reservation stamp stands whatever happens."""
 
     @pytest.mark.no_limit_resets_fake
     @pytest.mark.no_oauth_profile_fake
@@ -13732,3 +13746,70 @@ class TestSnapshotIdsReadTogether:
         assert acc.usage.last_good["limit_resets"]  # the org A entry is still stored
         row = {r[0]: r for r in menubar._adapt_snapshot(snap)["accounts"]}["2"]
         assert "limit_resets" not in row[3] and "limit_resets" not in row[4]
+
+
+
+class TestLimitResetsProfileProbeFailures(_ResetsNetHelpers):
+    """The profile probe's own failures, and a lease lost while it runs."""
+
+    @pytest.mark.no_limit_resets_fake
+    @pytest.mark.no_oauth_profile_fake
+    @pytest.mark.parametrize("error", [
+        urllib.error.HTTPError("p", 401, "Unauthorized", hdrs=None, fp=None),
+        urllib.error.HTTPError("p", 403, "Forbidden", hdrs=None, fp=None),
+        urllib.error.HTTPError("p", 429, "Too Many", hdrs=None, fp=None),
+        urllib.error.URLError(TimeoutError("timed out")),
+    ], ids=["401", "403", "429", "timeout"])
+    def test_profile_401_403_429_timeout_preserves_poll_state(
+        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch, error
+    ):
+        monkeypatch.setattr(oauth, "claude_code_user_agent", lambda: "claude-cli/2.1.316 (external, cli)")
+        s = self._switcher(sample_sequence_data)
+        log = []
+        self._pass(s, log)  # A's grant, attested and kept
+        self._age(s, 3600)
+        before, stamp = self._row(s), _resets_stamps(s)["uuid-2"]
+        log.clear()
+        entries = self._pass(s, log, backup_for_2="sk-b", profile_error=error)
+        assert ("profile", "sk-b", "claude-swap/1.0") in log
+        assert not any(kind == "unexpected" for kind, _t, _u in log)  # no token refresh, nothing else
+        after = self._row(s)
+        assert after["lastGood"]["limit_resets"] == before["lastGood"]["limit_resets"]
+        assert _resets_stamps(s)["uuid-2"] > stamp  # the try stands
+        entry = entries["2"]
+        assert (entry.last_error, entry.consecutive_failures, entry.backoff_until) == (None, 0, None)
+        assert entry.auth_dead_strikes == 0 and entry.sentinel is None
+        assert entry.last_good["seven_day"] == {"pct": 21.0}  # the poll's windows
+
+    @pytest.mark.no_limit_resets_fake
+    @pytest.mark.no_oauth_profile_fake
+    def test_profile_probe_overruns_lease_without_duplicate_resets(
+        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch
+    ):
+        monkeypatch.setattr(oauth, "claude_code_user_agent", lambda: "claude-cli/2.1.316 (external, cli)")
+        s = self._switcher(sample_sequence_data)
+        ident = ("account2@example.com", "")
+        taken = []
+
+        def another_collector_takes_the_slot(token):
+            if token != "sk-a2" or taken:
+                return
+            claim = s._usage_store.claim(["2"], {"2": ident})["2"]
+            taken.append((claim, s._usage_store.reserve_limit_resets(
+                "2", ident, claim, 3600.0, account_uuid="uuid-2")))
+
+        log = []
+        self._pass(s, log, on_profile=another_collector_takes_the_slot)
+        ((claim, won),) = taken
+        assert won is False  # the account's try is already stamped
+        row = self._row(s)
+        assert row["claimId"] == claim  # the late writer was fenced out
+        assert self._left(s) is None  # and its answer not written over the new lease
+        # The other collector's lease ends; the slot is fetched again soon
+        # after, and its account waits out the interval.
+        table = json.loads(s._usage_store.path.read_text())
+        table["accounts"]["2"]["claimUntil"] = 0.0
+        s._usage_store.path.write_text(json.dumps(table))
+        self._pass(s, log, fresh=True)
+        assert [t for kind, t, _u in log if kind == "resets" and t == "sk-a2"] == ["sk-a2"]
+        assert [t for kind, t, _u in log if kind == "profile" and t == "sk-a2"] == ["sk-a2"]
