@@ -2330,3 +2330,10 @@ def test_long_codex_alias_bounds_status_title_width():
     assert passed == "⇄ review…x-end · UR 2"
     whole = menubar.format_title("a@x.com", None, s, now=_CODEX_NOW, codex=_codex(), codex_alias="a-twelve-chr")
     assert whole == "⇄ a-twelve-chr 56% · UR 2"
+
+
+def test_the_menu_bar_reads_rollouts_from_the_codex_home(tmp_path, monkeypatch):
+    log = logging.getLogger("claude-swap")
+    assert menubar.default_codex_monitor(tmp_path, log).sessions_dir == Path.home() / ".codex" / "sessions"
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "alt-home"))
+    assert menubar.default_codex_monitor(tmp_path, log).sessions_dir == tmp_path / "alt-home" / "sessions"

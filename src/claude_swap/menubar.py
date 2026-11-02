@@ -551,12 +551,14 @@ CODEX_RENAME_SPACES = "Names cannot contain spaces; use - or _"
 
 
 def default_codex_monitor(backup_dir: Path, logger):
-    """The Codex monitor the menu bar runs: ~/.codex/sessions, the CLI on its
-    usual paths, and the launch budget's log beside the menu bar settings."""
-    from claude_swap.codex_usage import CodexMonitor, LaunchBudget, find_codex_binary
+    """The Codex monitor the menu bar runs: the rollouts in ``codex_home()``'s
+    sessions folder (the same home the app-server child resolves), the CLI
+    on its usual paths, and the launch budget's log beside the menu bar
+    settings."""
+    from claude_swap.codex_usage import CodexMonitor, LaunchBudget, codex_home, find_codex_binary
 
     try:
-        sessions = Path.home() / ".codex" / "sessions"
+        sessions = codex_home() / "sessions"
     except RuntimeError:  # no home directory: no rollouts to read
         sessions = Path("/nonexistent/.codex/sessions")
     return CodexMonitor(sessions, LaunchBudget(Path(backup_dir) / CODEX_LAUNCH_LOG), find_codex_binary(), logger)

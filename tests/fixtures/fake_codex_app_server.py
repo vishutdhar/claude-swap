@@ -38,6 +38,7 @@ mode = sys.argv[1]
 log = open(sys.argv[2], "a", encoding="utf-8")
 log.write("ARGS " + " ".join(sys.argv[3:]) + "\n")
 log.write("PATH " + os.environ.get("PATH", "") + "\n")
+log.write("CODEX_HOME " + os.environ.get("CODEX_HOME", "-") + "\n")
 log.write("PID " + str(os.getpid()) + "\n")
 log.flush()
 

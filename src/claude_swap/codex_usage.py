@@ -429,6 +429,22 @@ def parse_rate_limits_result(result, now: float) -> tuple[CodexReading | None, i
     return reading, count
 
 
+def codex_home(environ=None) -> Path:
+    """The Codex state folder both sources read: ``CODEX_HOME`` when it is an
+    absolute path, else ``~/.codex``.
+
+    The rollouts are read from its ``sessions`` folder, and the app-server
+    child is given an environment that resolves to the same folder
+    (``_child_env`` drops a ``CODEX_HOME`` that is not absolute), so the
+    usage and the reset count always describe the same account.
+    """
+    env = os.environ if environ is None else environ
+    value = env.get("CODEX_HOME") or ""
+    if value and os.path.isabs(value):
+        return Path(value)
+    return Path.home() / ".codex"
+
+
 def default_codex_dirs() -> list[Path]:
     """Where the CLI is looked for, in order; its child needs them on PATH (node is in Homebrew)."""
     dirs = [Path("/opt/homebrew/bin"), Path("/usr/local/bin")]
@@ -468,7 +484,13 @@ def _client_version() -> str:
 
 
 def _child_env(env: dict | None) -> dict:
+    """The app-server's environment: ours, ``default_codex_dirs()`` first on
+    PATH, and a ``CODEX_HOME`` only when it is absolute: one the child would
+    resolve otherwise (relative, empty) is dropped, so it uses ``~/.codex``
+    as ``codex_home()`` does for the rollouts."""
     child = dict(os.environ if env is None else env)
+    if "CODEX_HOME" in child and not os.path.isabs(child["CODEX_HOME"] or ""):
+        del child["CODEX_HOME"]
     inherited = child.get("PATH") or "/usr/bin:/bin:/usr/sbin:/sbin"
     child["PATH"] = os.pathsep.join([str(d) for d in default_codex_dirs()] + [inherited])
     return child

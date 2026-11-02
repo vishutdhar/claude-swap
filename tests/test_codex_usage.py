@@ -1722,3 +1722,30 @@ def test_the_client_works_without_waitid(tmp_path, monkeypatch, mode):
     assert _gone(_pid(log))  # killed if need be, and reaped
     descendants = [int(line.split()[1]) for line in _log(log) if line.startswith("DESCENDANT ")]
     assert all(_wait_for(lambda pid=pid: _gone(pid), 3.0) for pid in descendants)
+
+
+# --- one Codex home for the rollouts and the app-server ---------------------------------
+
+def test_codex_home_resolution(tmp_path, monkeypatch):
+    default = Path.home() / ".codex"
+    assert cu.codex_home() == default  # unset (conftest clears it for every test)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "alt"))
+    assert cu.codex_home() == tmp_path / "alt"
+    for odd in ("relative/dir", "~/elsewhere", ""):
+        monkeypatch.setenv("CODEX_HOME", odd)
+        assert cu.codex_home() == default, odd
+    assert cu.codex_home({"CODEX_HOME": "/given/home"}) == Path("/given/home")
+
+
+@posix_only
+@pytest.mark.parametrize("value", ["absolute", "relative/dir", "", None])
+def test_the_app_server_gets_the_same_codex_home(tmp_path, value):
+    server, log = _server(tmp_path, "ok")
+    env = {"PATH": "/usr/bin:/bin"}
+    if value is not None:
+        env["CODEX_HOME"] = str(tmp_path / "alt") if value == "absolute" else value
+    assert cu.read_rate_limits(server, timeout=10, now=NOW, env=env).error is None
+    (line,) = [line for line in _log(log) if line.startswith("CODEX_HOME ")]
+    # The child resolves the home exactly as codex_home() does for the rollouts:
+    # an absolute one is kept, anything else is dropped so both use ~/.codex.
+    assert line == ("CODEX_HOME " + str(tmp_path / "alt") if value == "absolute" else "CODEX_HOME -")

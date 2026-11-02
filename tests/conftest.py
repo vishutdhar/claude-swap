@@ -583,9 +583,11 @@ def _no_real_codex(monkeypatch):
     and leaves a folder in ~/.codex/.tmp each time. Every test gets an empty
     search list, so an app built by a test finds no binary; a test that needs
     one passes the fake server's path itself. ``~/.codex/sessions`` is the
-    throwaway home's (``_isolate_real_home``).
+    throwaway home's (``_isolate_real_home``), and ``CODEX_HOME`` is cleared
+    so it cannot point anywhere else.
     """
     monkeypatch.setattr("claude_swap.codex_usage.default_codex_dirs", lambda: [])
+    monkeypatch.delenv("CODEX_HOME", raising=False)  # nor a developer's own Codex home
 
 
 @pytest.fixture
