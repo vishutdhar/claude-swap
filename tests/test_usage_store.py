@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 import re
 
 import pytest
@@ -2560,3 +2561,81 @@ class TestLimitResetsAttemptsConcurrency:
         assert all(tokens[a] for a in accounts)  # every writer got its turn
         assert set(store.attempts.read()) == set(accounts)  # and no write lost another's
         assert all(store.attempts.holds(a, tokens[a]) for a in accounts)
+
+
+_RESERVE_IN_A_PROCESS = """
+import json, os, sys, time
+from pathlib import Path
+from claude_swap.usage_store import UsageStore
+cache, here, accounts = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3].split(",")
+store = UsageStore(cache)
+(here / f"ready-{os.getpid()}").write_text("")
+deadline = time.monotonic() + 20
+while not (here / "go").exists() and time.monotonic() < deadline:
+    time.sleep(0.001)
+print(json.dumps({a: store.attempts.reserve(a, 3600.0) for a in accounts}))
+"""
+
+
+class TestLimitResetsAttemptsAcrossReadersAndProcesses:
+    def test_holds_during_atomic_replace_sees_complete_entry(self, tmp_path):
+        import threading
+
+        store = UsageStore(tmp_path / "cache")  # the real clock and the real file
+        attempts = store.attempts
+        token = attempts.reserve("acct-1", 3600.0)
+        now = time.time()
+        # Two complete versions of a large file, both holding acct-1's
+        # reservation, written over each other as fast as they go.
+        small = {"acct-1": (now, token), **{f"acct-{i}": (now, f"{i:032x}") for i in range(2, 50)}}
+        large = {"acct-1": (now, token), **{f"acct-{i}": (now, f"{i:032x}") for i in range(2, 900)}}
+        attempts._write(small, time.time())  # the reader starts on one of the two
+        stop = threading.Event()
+
+        def writer():
+            while not stop.is_set():
+                attempts._write(large, time.time())
+                attempts._write(small, time.time())
+
+        thread = threading.Thread(target=writer)
+        thread.start()
+        holds, sizes = [], set()
+        try:
+            for _ in range(600):
+                holds.append(attempts.holds("acct-1", token))
+                sizes.add(len(attempts.read()))
+        finally:
+            stop.set()
+            thread.join(10)
+        assert all(holds)  # never a torn or empty file ...
+        assert sizes <= {len(small), len(large)}  # ... only the old version or the new one
+
+    def test_multiprocess_same_account_reservation_has_one_winner(self, tmp_path):
+        import subprocess
+        import sys
+
+        cache = tmp_path / "cache"
+        script = tmp_path / "reserve_in_a_process.py"
+        script.write_text(_RESERVE_IN_A_PROCESS)
+        accounts = [f"acct-{i}" for i in range(50)]
+        procs = [
+            subprocess.Popen(
+                [sys.executable, str(script), str(cache), str(tmp_path), ",".join(accounts)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            for _ in range(2)
+        ]
+        deadline = time.monotonic() + 30
+        while len(list(tmp_path.glob("ready-*"))) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        (tmp_path / "go").write_text("")  # both start reserving at once
+        results = []
+        for proc in procs:
+            out, err = proc.communicate(timeout=60)
+            assert proc.returncode == 0, err
+            results.append(json.loads(out))
+        stored = json.loads((cache / "limit_resets_attempts.json").read_text())["attempts"]
+        for account in accounts:
+            winners = [r[account] for r in results if r[account]]
+            assert len(winners) == 1, (account, results[0][account], results[1][account])
+            assert stored[account]["id"] == winners[0]  # the file holds the winner's token
