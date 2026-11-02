@@ -892,3 +892,164 @@ def test_any_other_shape_waits_for_the_menu_to_close(new):
 def test_text_rows_compare_by_account_alone():
     assert mp.fits_in_place([("1", None), ("2", None)], [("1", None), ("2", None)])
     assert not mp.fits_in_place([("1", None), ("2", None)], [("2", None), ("1", None)])
+
+
+# --- the Codex block ------------------------------------------------------------------
+
+from claude_swap import codex_usage as cu  # noqa: E402
+
+
+def _codex_window(pct=56.0, resets_in=2 * 86400 + 3 * 3600, minutes=10080):
+    return cu.CodexWindow(cu.window_label(minutes), pct, minutes, _NOW + resets_in if resets_in is not None else None)
+
+
+def _codex_state(*windows, credits=2, credits_age=60.0, fetched_age=9.0, plan="pro", present=True):
+    reading = cu.CodexReading(tuple(windows), plan, _NOW - fetched_age, "rollout") if windows else None
+    credits_at = None if credits is None else _NOW - credits_age
+    return cu.CodexState(present, reading, credits, credits_at, None)
+
+
+def test_codex_row_no_roll_forward_past_reset():
+    # Codex has no proven fixed cycle: a passed reset is shown as reset, never
+    # moved on by a week the way an account's weekly window is.
+    row = mp.codex_window_row(_codex_window(pct=93.0, resets_in=-60), _NOW)
+    assert (row.label, row.fraction, row.pct_text, row.reset_text, row.state) == ("7d", 0.0, "0%", "reset", "ok")
+    assert row.pace_fraction is None and row.note == ""
+
+
+def test_codex_row_countdown_before_reset():
+    row = mp.codex_window_row(_codex_window(pct=56.0), _NOW)
+    assert (row.label, row.pct_text, row.reset_text, row.state) == ("7d", "56%", "2d 3h", mp.usage_state(56.0))
+    assert row.fraction == pytest.approx(0.56)
+    assert row.pace_fraction is None
+    full = mp.codex_window_row(_codex_window(pct=100.0), _NOW)
+    assert full.state == "over"
+    unknown_reset = mp.codex_window_row(_codex_window(pct=12.0, resets_in=None, minutes=300), _NOW)
+    assert (unknown_reset.label, unknown_reset.reset_text) == ("5h", "")
+
+
+@pytest.mark.parametrize("credits, known, badge", [
+    (2, True, ("UR 2", "ok")),
+    (1, True, ("UR 1", "ok")),
+    (0, True, ("UR 0", "over")),
+    (2, False, ("UR ?", "unknown")),
+    (None, True, ("UR ?", "unknown")),
+])
+def test_ur_badge_states(credits, known, badge):
+    assert mp.ur_badge(credits, known) == badge
+
+
+def test_build_codex_panel_rows_badge_and_label():
+    state = _codex_state(_codex_window(pct=12.0, resets_in=3600, minutes=300), _codex_window(pct=56.0))
+    panel = mp.build_codex_panel(state, _NOW, alias=None, names_only=False)
+    assert panel.num == mp.CODEX_KEY == "codex"
+    assert panel.kind == "codex"
+    assert (panel.name_text, panel.email, panel.show_email, panel.title) == ("Codex", "pro", True, "Codex")
+    assert (panel.is_active, panel.disabled, panel.state_words, panel.exhausted) == (False, False, (), False)
+    assert [r.label for r in panel.rows] == ["5h", "7d"]
+    assert (panel.badge_text, panel.badge_state) == ("UR 2", "ok")
+    assert panel.age_text == "9s ago"
+    assert panel.text_label == "Codex · 5h 12% · 7d 56% · UR 2 · 9s ago"
+
+
+def test_build_codex_panel_with_an_alias():
+    panel = mp.build_codex_panel(_codex_state(_codex_window()), _NOW, alias="Review", names_only=False)
+    assert (panel.name_text, panel.title, panel.email, panel.show_email) == ("Review", "Review  (Codex)", "pro", True)
+    assert panel.text_label.startswith("Review · 7d 56% · UR 2")
+
+
+def test_build_codex_panel_no_reading():
+    panel = mp.build_codex_panel(_codex_state(credits=None), _NOW, alias=None, names_only=False)
+    (row,) = panel.rows
+    assert (row.state, row.note) == ("unknown", "no reading")
+    assert (panel.email, panel.show_email, panel.age_text) == ("", False, None)
+    assert (panel.badge_text, panel.badge_state) == ("UR ?", "unknown")
+    assert panel.text_label == "Codex · no reading · UR ?"
+
+
+def test_build_codex_panel_old_count_is_unknown_and_zero_is_over():
+    stale = mp.build_codex_panel(_codex_state(_codex_window(), credits=3, credits_age=25 * 3600), _NOW)
+    assert (stale.badge_text, stale.badge_state) == ("UR ?", "unknown")
+    spent = mp.build_codex_panel(_codex_state(_codex_window(), credits=0), _NOW)
+    assert (spent.badge_text, spent.badge_state) == ("UR 0", "over")
+
+
+def test_build_codex_panel_names_only_hides_plan():
+    named = mp.build_codex_panel(_codex_state(_codex_window()), _NOW, alias="Review", names_only=True)
+    assert (named.title, named.show_email) == ("Review", False)
+    plain = mp.build_codex_panel(_codex_state(_codex_window()), _NOW, alias=None, names_only=True)
+    assert plain.show_email is True  # no alias: nothing to hide behind, as for an account
+
+
+def test_build_codex_panel_passed_reset_reads_reset():
+    panel = mp.build_codex_panel(_codex_state(_codex_window(pct=80.0, resets_in=-5)), _NOW)
+    assert panel.rows[0].reset_text == "reset"
+    assert panel.text_label == "Codex · 7d 0% · UR 2 · 9s ago"
+
+
+def test_codex_accessibility_label():
+    panel = mp.build_codex_panel(_codex_state(_codex_window()), _NOW, alias=None, names_only=False)
+    assert mp.accessibility_label(panel) == (
+        "Codex, pro, 9 seconds ago. 7 day, 56 percent, resets in 2 days 3 hours. 2 usage resets."
+    )
+    named = mp.build_codex_panel(_codex_state(_codex_window(resets_in=-5), credits=1), _NOW, alias="Review", names_only=True)
+    assert mp.accessibility_label(named) == (
+        "Review  (Codex), pro, 9 seconds ago. 7 day, 0 percent, has reset. 1 usage reset."
+    )
+    none = mp.build_codex_panel(_codex_state(credits=None), _NOW)
+    assert mp.accessibility_label(none) == "Codex. no reading. usage resets unknown."
+    spent = mp.build_codex_panel(_codex_state(_codex_window(), credits=0, plan=None), _NOW)
+    assert mp.accessibility_label(spent).endswith(". no usage resets.")
+    assert mp.accessibility_label(spent).startswith("Codex, 9 seconds ago. ")
+
+
+def test_account_panel_defaults_unchanged():
+    panel = mp.build_account_panel(_entry({"five_hour": {"pct": 10.0}}, num=1), _NOW)
+    assert (panel.kind, panel.badge_text, panel.badge_state) == ("account", None, "ok")
+    assert mp.accessibility_label(panel).startswith("Account 1, a@x.com")
+
+
+# --- the Codex pace tick (the account weekly rows' rule) ---------------------------------
+
+def _paced(pct, resets_after_fetch, minutes=10080, fetched_age=60.0, now=_NOW):
+    fetched = now - fetched_age
+    window = cu.CodexWindow(cu.window_label(minutes), pct, minutes, fetched + resets_after_fetch)
+    return mp.codex_window_row(window, now, fetched_at=fetched)
+
+
+def test_codex_row_pace_tick_half_elapsed():
+    row = _paced(30.0, 3.5 * 86400)  # half the week left when measured
+    assert row.pace_fraction == pytest.approx(0.5)
+    assert row.ahead is False
+    ahead = _paced(80.0, 3.5 * 86400)  # 80% used at the half-way mark
+    assert ahead.pace_fraction == pytest.approx(0.5) and ahead.ahead is True
+    spent = _paced(100.0, 3.5 * 86400)
+    assert spent.pace_fraction == pytest.approx(0.5) and spent.ahead is False  # over hides ahead, as for accounts
+    assert (row.pct_text, row.reset_text) == ("30%", "3d 11h")  # the rest of the row as before
+
+
+def test_codex_row_no_tick_past_or_unknown_reset():
+    assert _paced(30.0, -120).pace_fraction is None  # passed reset: "reset", no tick
+    unknown = mp.codex_window_row(cu.CodexWindow("7d", 30.0, 10080, None), _NOW, fetched_at=_NOW - 60)
+    assert unknown.pace_fraction is None and unknown.reset_text == ""
+    no_time = mp.codex_window_row(cu.CodexWindow("7d", 30.0, 10080, _NOW + 3 * 86400), _NOW)
+    assert no_time.pace_fraction is None  # no measurement time, no pace
+
+
+def test_codex_row_pace_follows_the_account_suppression():
+    # compute_pace hides the tick for a day after a window starts, as on the
+    # account rows: a weekly window in its first day, and any window a day or
+    # shorter (the 5h one), get none.
+    assert _paced(30.0, 6.5 * 86400).pace_fraction is None
+    assert _paced(30.0, 2 * 3600, minutes=300).pace_fraction is None
+    assert _paced(30.0, 5.5 * 86400).pace_fraction == pytest.approx(1.5 / 7)
+
+
+def test_build_codex_panel_paces_against_the_readings_time():
+    fetched_age = 2 * 3600.0  # measured two hours ago
+    window = cu.CodexWindow("7d", 80.0, 10080, _NOW - fetched_age + 3.5 * 86400)
+    reading = cu.CodexReading((window,), "pro", _NOW - fetched_age, "rollout")
+    panel = mp.build_codex_panel(cu.CodexState(True, reading, 2, _NOW - 60, None), _NOW)
+    (row,) = panel.rows
+    assert row.pace_fraction == pytest.approx(0.5)  # elapsed at the measurement, not now
+    assert "7 day, 80 percent, ahead of pace, resets in " in mp.accessibility_label(panel)

@@ -20,8 +20,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from claude_swap import oauth, pace
+from claude_swap.codex_usage import CodexState, CodexWindow, ur_badge
 from claude_swap.json_output import DEAD_LOGIN_SENTINELS
 from claude_swap.menubar import (
+    CODEX_NAME,
     GuardHold,
     _countdown_until,
     _live_countdown,
@@ -51,7 +53,11 @@ RESET_GAP = 12.0  # percent -> reset countdown
 EMAIL_GAP = 8.0  # name -> email
 EMAIL_MIN_W = 24.0  # an email squeezed below this is left out, not drawn as "…"
 META_GAP = 10.0  # email -> the right-hand state/age text
-AGE_GAP = 8.0  # between the right-hand pieces: state words, then the age
+AGE_GAP = 8.0  # between the right-hand pieces: state words (or the badge), then the age
+BADGE_PAD_X = 5.0  # the usage-resets pill: text inset from its left and right ends
+BADGE_PAD_Y = 1.0  # ... and from its top and bottom
+BADGE_RADIUS = 4.0
+BADGE_STROKE = 1.0
 TOP_PAD = 7.0
 HEADER_GAP = 4.0
 BOTTOM_PAD = 9.0
@@ -61,6 +67,13 @@ HAIRLINE = 0.5  # the rule under each inactive account
 
 UNAVAILABLE = "usage unavailable"  # the text row's wording
 STATE_SEP = " · "  # joins the state words ("active · held · 28m")
+
+# The Codex block: one panel after the accounts, keyed by a name that can
+# never be a slot number, so ``fits_in_place`` tells it from every account.
+CODEX_KEY = "codex"
+NO_READING = "no reading"
+RESET_DONE = "reset"  # a Codex window whose reset time has passed
+BADGE_STATES = ("ok", "over", "unknown")
 
 # A dead login (``json_output.DEAD_LOGIN_SENTINELS``): only the user can fix
 # it, so its row is urgent. The panel is handed the sentinel's display text,
@@ -122,6 +135,11 @@ class AccountPanel:
     text_label: str  # the plain text row, for accessibility and type-select
     alias: str | None = None  # kept so the accessibility label can name the email
     show_email: bool = True  # off where Show names only hides it in the text row
+    # "account", or "codex" for the Codex block: no slot number, not a switch,
+    # and ``email`` holds the plan type.
+    kind: str = "account"
+    badge_text: str | None = None  # the Codex block's "UR 2" pill, drawn before the age
+    badge_state: str = "ok"  # one of BADGE_STATES
 
     @property
     def state_text(self) -> str:
@@ -298,6 +316,84 @@ def build_account_panel(entry: tuple, now: float, names_only: bool = False, hold
     )
 
 
+# ---- the Codex block ---------------------------------------------------------------
+
+def codex_window_row(window: CodexWindow, now: float, fetched_at: float | None = None) -> WindowRow:
+    """A Codex window as a bar row: an account's row, paced, never rolled forward.
+
+    Codex has no proven fixed cycle, so a window whose reset time has passed
+    is not moved on by a period: it shows 0% and "reset", with no pace tick,
+    until the next reading replaces it. Otherwise the row is built exactly
+    as an account's weekly row, paced by ``pace.compute_pace`` over the
+    window's own length, measured at ``fetched_at`` (the reading's time).
+    That rule hides the tick for a day after a window starts, so a window a
+    day or shorter never shows one, like the accounts' 5h row; without a
+    reset time or a measurement time there is no tick either.
+    """
+    countdown = _countdown_until(window.resets_at, now) if window.resets_at is not None else None
+    if window.resets_at is not None and countdown is None:
+        return WindowRow(window.label, 0.0, "0%", RESET_DONE, "ok", None, "")
+    raw: dict = {"pct": window.pct}
+    if window.resets_at is not None:
+        raw["resets_at"] = datetime.fromtimestamp(window.resets_at, timezone.utc).isoformat()
+    pace_result = pace.compute_pace(raw, fetched_at=fetched_at, period_s=window.window_minutes * 60.0)
+    return _row(window.label, raw, window.pct, now, pace_result)
+
+
+def codex_text_label(name: str, rows, badge_text: str | None, age: str | None) -> str:
+    """The Codex text row: "Codex · 7d 56% · UR 2 · 9s ago"."""
+    parts = [name]
+    windows = [row for row in rows if row.state != "unknown"]
+    if windows:
+        parts.extend(f"{row.label} {row.pct_text}" for row in windows)
+    else:
+        parts.append(rows[0].note if rows else NO_READING)
+    parts.extend(piece for piece in (badge_text, age) if piece)
+    return STATE_SEP.join(parts)
+
+
+def build_codex_panel(
+    state: CodexState, now: float, alias: str | None = None, names_only: bool = False
+) -> AccountPanel:
+    """Panel model for the Codex block, after the accounts.
+
+    Named "Codex" or its alias; the plan type sits where an account's email
+    goes, and Show names only hides it behind an alias the same way. One
+    row per window the reading carries, or one "no reading" row. The badge
+    is the banked reset count, unknown when the app-server has not reported
+    it within a day.
+    """
+    reading = state.reading
+    alias = alias or None
+    name = alias or CODEX_NAME
+    plan = (reading.plan_type if reading is not None else None) or ""
+    rows = (
+        [codex_window_row(window, now, reading.fetched_at) for window in reading.windows]
+        if reading is not None else []
+    )
+    rows = rows or [_unknown(NO_READING)]
+    badge_text, badge_state = ur_badge(state.reset_credits, state.credits_known(now))
+    age = age_text(reading.fetched_at, now) if reading is not None else None
+    return AccountPanel(
+        num=CODEX_KEY,
+        title=account_identity(CODEX_NAME, alias, names_only=names_only),
+        name_text=name,
+        email=plan,
+        is_active=False,
+        disabled=False,
+        state_words=(),
+        spoken_states=(),
+        age_text=age,
+        rows=tuple(rows),
+        text_label=codex_text_label(name, rows, badge_text, age),
+        alias=alias,
+        show_email=bool(plan) and not (names_only and alias),
+        kind="codex",
+        badge_text=badge_text,
+        badge_state=badge_state,
+    )
+
+
 # ---- geometry (flipped coordinates: y grows downward from the panel top) -------------
 
 @dataclass(frozen=True)
@@ -467,11 +563,30 @@ def _spoken_meta(panel: AccountPanel) -> str:
     return ", ".join(out)
 
 
+def _spoken_badge(panel: AccountPanel) -> str:
+    """"2 usage resets", "1 usage reset", "no usage resets" or "usage resets unknown"."""
+    if panel.badge_state == "unknown" or not panel.badge_text:
+        return "usage resets unknown"
+    count = panel.badge_text.rsplit(" ", 1)[-1]
+    if count == "0":
+        return "no usage resets"
+    return f"{count} usage reset{'' if count == '1' else 's'}"
+
+
 def accessibility_label(panel: AccountPanel) -> str:
-    """What VoiceOver reads for a panel: who, their state, then every window."""
+    """What VoiceOver reads for a panel: who, their state, then every window.
+
+    The Codex block says its name (with "Codex" after an alias), its plan,
+    the age, each window, and then the banked usage resets.
+    """
     # Always the full identity, whatever the display setting: a listener
     # has no other way to tell which email an alias belongs to.
-    head = f"Account {panel.num}, {account_identity(panel.email, panel.alias)}"
+    if panel.kind == "codex":
+        head = account_identity(CODEX_NAME, panel.alias)
+        if panel.email:
+            head += f", {panel.email}"
+    else:
+        head = f"Account {panel.num}, {account_identity(panel.email, panel.alias)}"
     meta = _spoken_meta(panel)
     if meta:
         head += f", {meta}"
@@ -485,7 +600,11 @@ def accessibility_label(panel: AccountPanel) -> str:
             parts.append("over limit")
         elif row.ahead:
             parts.append("ahead of pace")
-        if row.reset_text:
+        if row.reset_text == RESET_DONE:
+            parts.append("has reset")
+        elif row.reset_text:
             parts.append(f"resets in {spoken_duration(row.reset_text)}")
         sentences.append(", ".join(parts))
+    if panel.kind == "codex":
+        sentences.append(_spoken_badge(panel))
     return ". ".join(sentences) + "."

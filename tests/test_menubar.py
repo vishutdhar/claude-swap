@@ -2223,3 +2223,117 @@ def test_a_slow_read_logs_its_duration(caplog):
     assert _lines(caplog, name) == []
     log.took(452.4)
     assert _lines(caplog, name) == ["menubar snapshot took 452s (over 60s)"]
+
+
+# --- the Codex settings and title segment -------------------------------------------
+
+from claude_swap import codex_usage as _cu  # noqa: E402
+
+_CODEX_NOW = 2_000_000_000.0
+
+
+def _codex(pct=56.0, resets_in=2 * 86400, credits=2, credits_age=60.0, windows=None, reading=True):
+    if not reading:
+        return _cu.CodexState(True, None, credits, _CODEX_NOW - credits_age, None)
+    windows = windows or (_cu.CodexWindow("7d", pct, 10080, _CODEX_NOW + resets_in),)
+    found = _cu.CodexReading(tuple(windows), "pro", _CODEX_NOW - 9, "rollout")
+    credits_at = None if credits is None else _CODEX_NOW - credits_age
+    return _cu.CodexState(True, found, credits, credits_at, None)
+
+
+def test_settings_round_trip_codex_keys(tmp_path: Path):
+    defaults = menubar.MenuBarSettings()
+    assert (defaults.show_codex, defaults.title_codex, defaults.codex_alias) == (True, True, "")
+    path = tmp_path / "menubar_settings.json"
+    original = menubar.MenuBarSettings(show_codex=False, title_codex=False, codex_alias="Review")
+    original.save(path)
+    assert menubar.MenuBarSettings.load(path) == original
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert (saved["show_codex"], saved["title_codex"], saved["codex_alias"]) == (False, False, "Review")
+
+
+def test_settings_ignore_wrong_type_codex_alias(tmp_path: Path):
+    path = tmp_path / "menubar_settings.json"
+    path.write_text(json.dumps({"codex_alias": 7, "show_codex": "no", "title_codex": 0}), encoding="utf-8")
+    s = menubar.MenuBarSettings.load(path)
+    assert (s.codex_alias, s.show_codex, s.title_codex) == ("", True, True)
+
+
+def test_format_title_codex_segment():
+    s = menubar.MenuBarSettings(show_account_name=True, title_pct="5h")
+    title = menubar.format_title("loc@papaya.asia", _USAGE, s, now=_CODEX_NOW, codex=_codex())
+    assert title == "⇄ loc · 42% · Codex 56% · UR 2"
+
+
+def test_format_title_codex_uses_the_longest_window():
+    s = menubar.MenuBarSettings(show_account_name=False, title_pct="off")
+    both = (_cu.CodexWindow("5h", 12.0, 300, _CODEX_NOW + 3600), _cu.CodexWindow("7d", 56.0, 10080, _CODEX_NOW + 86400))
+    assert menubar.format_title("a@x.com", None, s, now=_CODEX_NOW, codex=_codex(windows=both)) == "⇄ Codex 56% · UR 2"
+
+
+def test_format_title_codex_passed_reset_drops_pct_keeps_ur():
+    s = menubar.MenuBarSettings(show_account_name=False, title_pct="off")
+    title = menubar.format_title("a@x.com", None, s, now=_CODEX_NOW, codex=_codex(pct=97.0, resets_in=-30))
+    assert title == "⇄ Codex · UR 2"
+    assert "97" not in title and "0%" not in title
+
+
+def test_format_title_codex_unknown_count():
+    s = menubar.MenuBarSettings(show_account_name=False, title_pct="off")
+    stale = _codex(credits=3, credits_age=25 * 3600)
+    assert menubar.format_title("a@x.com", None, s, now=_CODEX_NOW, codex=stale) == "⇄ Codex 56% · UR ?"
+    never = _codex(credits=None)
+    assert menubar.format_title("a@x.com", None, s, now=_CODEX_NOW, codex=never) == "⇄ Codex 56% · UR ?"
+
+
+def test_format_title_codex_off():
+    title_off = menubar.MenuBarSettings(show_account_name=True, title_pct="off", title_codex=False)
+    assert menubar.format_title("loc@x.com", None, title_off, now=_CODEX_NOW, codex=_codex()) == "⇄ loc"
+    block_off = menubar.MenuBarSettings(show_account_name=True, title_pct="off", show_codex=False)
+    assert menubar.format_title("loc@x.com", None, block_off, now=_CODEX_NOW, codex=_codex()) == "⇄ loc"
+    on = menubar.MenuBarSettings(show_account_name=True, title_pct="off")
+    # No reading: nothing at all, not even the badge.
+    assert menubar.format_title("loc@x.com", None, on, now=_CODEX_NOW, codex=_codex(reading=False)) == "⇄ loc"
+    assert menubar.format_title("loc@x.com", None, on, now=_CODEX_NOW, codex=None) == "⇄ loc"
+
+
+def test_format_title_codex_alias():
+    s = menubar.MenuBarSettings(show_account_name=False, title_pct="off")
+    title = menubar.format_title("a@x.com", None, s, now=_CODEX_NOW, codex=_codex(credits=0), codex_alias="Review")
+    assert title == "⇄ Review 56% · UR 0"
+
+
+def test_format_title_codex_without_an_active_account():
+    s = menubar.MenuBarSettings()
+    assert menubar.format_title(None, None, s, now=_CODEX_NOW, codex=_codex()) == "⇄ Codex 56% · UR 2"
+
+
+@pytest.mark.parametrize("stored, shown", [
+    ("Review", "Review"), ("", None), ("  ", None), ("my review", None), ("123", None), ("-x", None),
+    ("x@y", None), ("Pro\u200b", "Pro"),
+])
+def test_codex_alias_name_uses_the_account_alias_rule(stored, shown):
+    # A name hand-edited into the settings file is shown only when the
+    # rename prompt would have accepted it.
+    assert menubar.codex_alias_name(stored) == shown
+
+
+def test_long_codex_alias_bounds_status_title_width():
+    s = menubar.MenuBarSettings(show_account_name=False, title_pct="off")
+    alias = "review-" + "x" * 60 + "-end"
+    assert menubar.codex_alias_name(alias) == alias  # the alias rule is left alone
+    title = menubar.format_title("a@x.com", None, s, now=_CODEX_NOW, codex=_codex(), codex_alias=alias)
+    assert title == "⇄ review…x-end 56% · UR 2"  # 12 characters, cut in the middle
+    passed = menubar.format_title(
+        "a@x.com", None, s, now=_CODEX_NOW, codex=_codex(resets_in=-30), codex_alias=alias
+    )
+    assert passed == "⇄ review…x-end · UR 2"
+    whole = menubar.format_title("a@x.com", None, s, now=_CODEX_NOW, codex=_codex(), codex_alias="a-twelve-chr")
+    assert whole == "⇄ a-twelve-chr 56% · UR 2"
+
+
+def test_the_menu_bar_reads_rollouts_from_the_codex_home(tmp_path, monkeypatch):
+    log = logging.getLogger("claude-swap")
+    assert menubar.default_codex_monitor(tmp_path, log).sessions_dir == Path.home() / ".codex" / "sessions"
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "alt-home"))
+    assert menubar.default_codex_monitor(tmp_path, log).sessions_dir == tmp_path / "alt-home" / "sessions"

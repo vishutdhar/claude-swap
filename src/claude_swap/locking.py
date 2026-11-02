@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -19,9 +20,13 @@ from claude_swap.exceptions import LockError
 class FileLock:
     """Cross-process file lock using platform-specific APIs."""
 
-    def __init__(self, lock_path: Path, timeout: float = 10.0):
+    def __init__(self, lock_path: Path, timeout: float = 10.0, create_parent: bool = True):
         self.lock_path = lock_path
         self.timeout = timeout
+        # False: a missing parent folder is an error (FileNotFoundError from
+        # acquire), never made again; for callers whose folder vanishing
+        # means their state is gone.
+        self.create_parent = create_parent
         self._lock_file: IO | None = None
         self._locked = False
 
@@ -37,7 +42,8 @@ class FileLock:
         """
         if timeout is None:
             timeout = self.timeout
-        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        if self.create_parent:
+            self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock_file = open(self.lock_path, "w")
 
         start = time.monotonic()
@@ -57,6 +63,24 @@ class FileLock:
                     self._lock_file = None
                     return False
                 time.sleep(0.1)
+
+    def holds_path(self) -> bool:
+        """Whether the lock held is on the file at ``lock_path`` now.
+
+        False when not held, or when the file was deleted or replaced since
+        it was opened: another process can then lock a new file at the same
+        path, and this lock keeps nobody out. Callers that must not share
+        their critical section check it after acquiring and before
+        committing.
+        """
+        if not (self._lock_file and self._locked):
+            return False
+        try:
+            held = os.fstat(self._lock_file.fileno())
+            there = os.stat(self.lock_path)
+        except OSError:
+            return False
+        return (held.st_dev, held.st_ino) == (there.st_dev, there.st_ino)
 
     def release(self) -> None:
         """Release the lock."""
