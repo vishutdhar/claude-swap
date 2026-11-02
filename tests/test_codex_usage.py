@@ -1316,13 +1316,14 @@ def test_corrupt_or_deleted_launch_history_fails_closed(tmp_path):
     path = tmp_path / "launches.json"
     budget = cu.LaunchBudget(path)
     assert budget.reserve(NOW, manual=False, first_of_process=True)  # first run: no log yet
+    token = budget.last_reservation  # a real reservation's token, kept for the releases below
     for text in CORRUPT_LOGS:
         path.write_text(text)
         assert budget.reserve(NOW + 7 * HOUR, manual=True, first_of_process=True) is False, text
         assert budget.last_failure == "launch log unreadable"
         assert budget.record(NOW + 7 * HOUR) is False
         budget.save_credits(2, NOW + 7 * HOUR)
-        budget.release(budget.last_reservation, now=NOW + 7 * HOUR)
+        budget.release(token, now=NOW + 7 * HOUR)
         assert path.read_text() == text  # never written over with an emptied history
     path.unlink()  # deleted while this process runs: lost, not a first run
     assert budget.reserve(NOW + 7 * HOUR, manual=True, first_of_process=True) is False
@@ -1552,3 +1553,19 @@ def test_delete_after_initial_corrupt_read_fails_closed(tmp_path):
     assert budget.reserve(now, manual=False, first_of_process=True) is False
     assert budget.last_failure == "launch log missing"
     assert not path.exists()
+
+
+
+def test_release_with_real_token_preserves_corrupt_history(tmp_path):
+    path = tmp_path / "launches.json"
+    budget = cu.LaunchBudget(path)
+    assert budget.reserve(NOW, manual=False, first_of_process=True)
+    token = budget.last_reservation  # kept: the failing reserve below clears last_reservation
+    data = json.loads(path.read_text())
+    data["launches"].append(True)  # the token's entry is still there, beside one that is not a launch
+    text = json.dumps(data)
+    path.write_text(text)
+    assert budget.reserve(NOW + 60, manual=True, first_of_process=True) is False
+    assert budget.last_reservation is None
+    budget.release(token, now=NOW + 60)
+    assert path.read_text() == text  # a log that cannot be trusted is never written over
