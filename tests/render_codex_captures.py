@@ -2,8 +2,9 @@
 
     .venv/bin/python tests/render_codex_captures.py [OUT_DIR]
 
-Writes the dropdown (four accounts, then the Codex block) and the Codex
-header states, each in light and dark, to OUT_DIR. OUT_DIR is
+Writes the dropdown (four accounts, then the Codex block), the Codex
+header states and the accounts' limit-resets (UR) pills, each in light and
+dark, to OUT_DIR. OUT_DIR is
 ~/Code/cswap-captures/codex-block or a folder inside it, and nothing else:
 any other folder, or one that leads out of it through a symlink, is
 refused before anything is drawn. A fixed clock and example accounts, so
@@ -45,6 +46,47 @@ def accounts():
     ]
 
 
+def _grant(left: int, usable: bool = True, paused: bool = False) -> dict:
+    """An account's limit-resets entry, as the usage store keeps it."""
+    return {
+        "left": left, "total": max(left, 1),
+        "ends_at": dt.datetime.fromtimestamp(NOW + 28 * DAY, dt.timezone.utc).isoformat(),
+        "label": "Free limit reset", "usable_now": usable, "eligible": True, "paused": paused,
+        "fetched_at": NOW - 600,
+    }
+
+
+def resets_accounts():
+    """The dropdown with grants: the active account holds one, account 2
+    has used its reset, account 3 holds one, account 4 has none."""
+    return [
+        _account("1", "first@example.com", "work",
+                 {"five_hour": _window(17.0, 3 * HOUR), "seven_day": _window(42.0, 4 * DAY),
+                  "limit_resets": _grant(1)}, active=True),
+        _account("2", "second@example.com", "spare",
+                 {"five_hour": {"pct": 0.0}, "seven_day": _window(100.0, 2 * DAY),
+                  "limit_resets": _grant(0, usable=False)}),
+        _account("3", "third@example.com", "third",
+                 {"five_hour": _window(64.0, 1.5 * HOUR), "seven_day": _window(71.0, 6 * DAY),
+                  "limit_resets": _grant(1)}),
+        _account("4", "fourth@example.com", "fourth", {"five_hour": {"pct": 5.0}}, disabled=True),
+    ]
+
+
+def resets_states():
+    """The pill's states on account headers: ok, used, not usable now, a
+    paused grant on a paused account, and two digits on the active one."""
+    seven = {"seven_day": _window(30.0, 3 * DAY)}
+    return [
+        _account("1", "one@example.com", "ok", {**seven, "limit_resets": _grant(1)}),
+        _account("2", "two@example.com", "used", {**seven, "limit_resets": _grant(0, usable=False)}),
+        _account("3", "three@example.com", "later", {**seven, "limit_resets": _grant(1, usable=False)}),
+        _account("4", "four@example.com", "paused", {**seven, "limit_resets": _grant(1, usable=False, paused=True)},
+                 disabled=True),
+        _account("5", "five@example.com", "many", {**seven, "limit_resets": _grant(12)}, active=True),
+    ]
+
+
 def codex(credits=2, alias=None, names_only=False, windows=None, reading=True):
     windows = windows or (cu.CodexWindow("7d", 56.0, WEEK_MIN, NOW + 2 * DAY + 3 * HOUR),)
     read = cu.CodexReading(tuple(windows), "pro", NOW - 9, "rollout") if reading else None
@@ -72,6 +114,9 @@ SCENES = {
     "codex-states": (codex_states, False),
     "codex-highlighted": (lambda: [codex()], True),
     "codex-alias-names-only": (lambda: accounts()[:1] + [codex(alias="a-twelve-chr", names_only=True)], False),
+    "claude-resets": (lambda: resets_accounts() + [codex()], False),
+    "claude-resets-states": (resets_states, False),
+    "claude-resets-highlighted": (lambda: resets_accounts()[:1], True),
 }
 
 
