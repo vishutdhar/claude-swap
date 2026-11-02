@@ -2198,17 +2198,30 @@ class TestLimitResetsDue:
         store.path.write_text(json.dumps(table), encoding="utf-8")
         assert store.limit_resets_due(["1"], IDENT, usage_store.LIMIT_RESETS_EVERY_S) == {"1"}
 
-    def test_an_entry_in_the_older_shape_is_due(self, store, clock):
-        # An entry written before it kept each grant (the summed shape) is
-        # read again at the next fetch instead of waiting out the hour.
+    def test_failed_old_shape_migration_honors_resets_attempt_interval(self, store, clock):
+        # An entry in the older, summed shape (written before each grant was
+        # kept) is replaced at the next read, which waits out the interval
+        # from the last try like any other: a failing read that carries the
+        # old entry forward must not let every fetch try again.
         self._seed(store, oauth.LimitResetsRead(_cedar_with()))
         table = json.loads(store.path.read_text(encoding="utf-8"))
         table["accounts"]["1"]["lastGood"]["limit_resets"] = {
             "left": 1, "total": 1, "ends_at": "2099-01-01T00:00:00+00:00", "fetched_at": clock.now,
         }
         store.path.write_text(json.dumps(table), encoding="utf-8")
+        every = usage_store.LIMIT_RESETS_EVERY_S
         clock.advance(60)
-        assert store.limit_resets_due(["1"], IDENT, usage_store.LIMIT_RESETS_EVERY_S) == {"1"}
+        assert store.limit_resets_due(["1"], IDENT, every) == set()
+        clock.advance(every)
+        _resets_pass(store, "1", oauth.LimitResetsRead(None))  # the migrating read fails
+        assert "grants" not in json.loads(store.path.read_text())["accounts"]["1"]["lastGood"]["limit_resets"]
+        for _ in range(3):  # the next fetches, a minute apart, under one lease
+            clock.advance(60)
+            claim = store.claim(["1"], IDENT)["1"]
+            assert store.limit_resets_due(["1"], IDENT, every) == set()
+            assert store.reserve_limit_resets("1", IDENT["1"], claim, every) is False
+        clock.advance(every)
+        assert store.limit_resets_due(["1"], IDENT, every) == {"1"}
 
     def test_a_row_of_another_account_is_due(self, store, clock):
         self._seed(store, oauth.LimitResetsRead(NO_GRANT))
