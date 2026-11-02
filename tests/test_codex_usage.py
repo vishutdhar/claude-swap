@@ -1633,3 +1633,62 @@ def test_mixed_legacy_corruption_fails_closed(tmp_path):
     _set_mtime(stale, NOW - 25 * HOUR)
     assert cu.LaunchBudget(stale).reserve(NOW, manual=False, first_of_process=True)  # heals only when stale
     assert _logged(stale)["launches"] == [NOW]
+
+
+# --- what the rollout reader actually reads ------------------------------------------------
+
+class _OsSpy:
+    """``os`` for codex_usage, counting the bytes read and, once, running ``after_lstat``
+    between the reader's lstat and its open."""
+
+    def __init__(self, after_lstat=None):
+        self.after_lstat = after_lstat
+        self.bytes_read = 0
+
+    def __getattr__(self, name):
+        return getattr(os, name)
+
+    def lstat(self, path, *args, **kwargs):
+        found = os.lstat(path, *args, **kwargs)
+        hook, self.after_lstat = self.after_lstat, None
+        if hook is not None:
+            hook()
+        return found
+
+    def read(self, fd, n):
+        data = os.read(fd, n)
+        self.bytes_read += len(data)
+        return data
+
+
+def test_rollout_tail_caps_actual_bytes_read(tmp_path, monkeypatch):
+    filler = _line({"timestamp": "2026-11-01T11:00:00Z", "payload": {"type": "agent_message", "text": "x" * 1000}})
+    lines = [filler] * (10 * 1024 * 1024 // (len(filler) + 1) + 2) + [_line(_record(pct=61.0))]
+    path = _rollout(tmp_path, "rollout-big.jsonl", *lines)
+    assert path.stat().st_size > 10 * 1024 * 1024
+    spy = _OsSpy()
+    monkeypatch.setattr(cu, "os", spy)
+    reading = cu.read_rollout_tail(path, max_bytes=cu.ROLLOUT_TAIL_BYTES)
+    assert reading.windows[0].pct == 61.0
+    assert 0 < spy.bytes_read <= cu.ROLLOUT_TAIL_BYTES  # the tail only, never the file
+
+
+@posix_only
+@pytest.mark.parametrize("swap", ["other-file", "hard-link", "fifo"])
+def test_rollout_tail_refuses_file_changed_between_lstat_and_open(tmp_path, monkeypatch, swap):
+    path = _rollout(tmp_path, "rollout-a.jsonl", _line(_record(pct=12.0)))
+    other = _rollout(tmp_path / "elsewhere", "rollout-b.jsonl", _line(_record(pct=99.0)))
+
+    def substitute():
+        if swap == "other-file":
+            os.replace(other, path)  # another file now has the name
+        elif swap == "hard-link":
+            os.link(path, tmp_path / "second-name.jsonl")  # the same file, now with two names
+        else:
+            os.unlink(path)
+            os.mkfifo(path)  # opened as it is, a pipe would block the reader forever
+
+    spy = _OsSpy(after_lstat=substitute)
+    monkeypatch.setattr(cu, "os", spy)
+    assert cu.read_rollout_tail(path) is None
+    assert spy.bytes_read == 0  # refused before a byte was read
