@@ -13549,3 +13549,55 @@ class TestAttestLimitResetsRule:
         assert mismatched_account["1"].limit_resets is None
         unattested = s._attest_limit_resets({"1": rec(None, None)})
         assert unattested["1"].limit_resets is None
+
+
+
+class TestLimitResetsAfterReplacement:
+    """An entry the server attested for one account is never shown for the
+    account that takes its slot."""
+
+    @pytest.mark.parametrize("replacement", [
+        {"uuid": ""},  # add-token over the slot: a token-only account
+        {"uuid": "uuid-9"},  # another OAuth account under the same name
+    ], ids=["token-only", "new-uuid"])
+    def test_add_token_replacement_never_carries_previous_credentials_grant(
+        self, temp_home, mock_claude_config, sample_sequence_data, replacement
+    ):
+        from claude_swap import menubar
+
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        ident = {"2": ("account2@example.com", "")}
+        # Account A's attested grant, recorded while it held slot 2.
+        claim = s._usage_store.claim(["2"], ident)["2"]
+        assert s._usage_store.reserve_limit_resets("2", ident["2"], claim, 3600.0)
+        s._usage_store.record(
+            {"2": FetchRecord(usage={"seven_day": {"pct": 5.0}},
+                              limit_resets=oauth.LimitResetsRead(TestLimitResetsInTheFetchPass.GRANT, "uuid-2", ""))},
+            ident, claims={"2": claim},
+        )
+        # Slot 2 is replaced, keeping its name and organization.
+        sample_sequence_data["accounts"]["2"].update(replacement)
+        s._write_json(s.sequence_file, sample_sequence_data)
+
+        calls = []
+
+        def fetch(info, limit_resets=None):
+            calls.append((str(info[0]), limit_resets is not None))
+            return FetchRecord(usage={"seven_day": {"pct": 6.0}})
+
+        live = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        with patch.object(ClaudeAccountSwitcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(live, False)), \
+             patch.object(ClaudeAccountSwitcher, "_read_account_credentials", return_value=live), \
+             patch.object(s, "_fetch_account_usage", side_effect=fetch):
+            snap = s.accounts_snapshot(fresh=True)
+        acc = {a.number: a for a in snap.accounts}["2"]
+        assert acc.account_uuid == replacement["uuid"]
+        assert acc.usage.last_good["limit_resets"]  # still stored (no write needed) ...
+        row = {r[0]: r for r in menubar._adapt_snapshot(snap)["accounts"]}["2"]
+        assert "limit_resets" not in row[3] and "limit_resets" not in row[4]  # ... never shown
+        if replacement["uuid"] == "":
+            assert ("2", True) not in calls  # and a token-only slot is never read

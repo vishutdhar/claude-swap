@@ -946,6 +946,27 @@ def _account_display_usage(entry) -> dict | str | None:
     return entry.last_good
 
 
+def _attested_for_slot(usage, account_uuid: str, org_uuid: str):
+    """``usage`` with its limit-resets entry only while it was attested for
+    this slot's current account: the entry's ``account_uuid`` and
+    ``org_uuid`` (what the server said the asking token belonged to) must be
+    the slot's stored uuid and organization now. Anything else (a slot
+    since given to another account, a token-only slot, an entry with no
+    attested ids) shows without it. The stored entry is left as it is.
+    """
+    if not isinstance(usage, dict) or "limit_resets" not in usage:
+        return usage
+    entry = usage["limit_resets"]
+    if (
+        isinstance(entry, dict)
+        and account_uuid
+        and entry.get("account_uuid") == account_uuid
+        and (entry.get("org_uuid") or "") == (org_uuid or "")
+    ):
+        return usage
+    return {key: value for key, value in usage.items() if key != "limit_resets"}
+
+
 EMPTY_SNAPSHOT: dict = {
     "accounts": [],
     "active_email": None,
@@ -976,11 +997,17 @@ def _adapt_snapshot(snap, marker_path: Path | None = None) -> dict:
     active_usage = None
     active_alias = None
     for acc in snap.accounts:
-        orgs[acc.number] = getattr(acc, "org_uuid", "") or ""
-        display = _account_display_usage(acc.usage)
+        org_uuid = getattr(acc, "org_uuid", "") or ""
+        orgs[acc.number] = org_uuid
+        # A limit-resets entry reaches the menu only while it is this slot's
+        # current account's (the pill, text row, VoiceOver, title and log
+        # all read these two).
+        account_uuid = getattr(acc, "account_uuid", "") or ""
+        display = _attested_for_slot(_account_display_usage(acc.usage), account_uuid, org_uuid)
+        last_good = _attested_for_slot(acc.usage.last_good, account_uuid, org_uuid)
         accounts.append(
             (
-                acc.number, acc.email, acc.is_active, display, acc.usage.last_good,
+                acc.number, acc.email, acc.is_active, display, last_good,
                 acc.alias, acc.disabled, acc.usage.fetched_at,
             )
         )

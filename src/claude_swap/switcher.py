@@ -1853,6 +1853,9 @@ class ClaudeAccountSwitcher:
                     usage=entries[n],
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, n),
+                    account_uuid=(
+                        ((seq_data.get("accounts") or {}).get(n) or {}).get("uuid") or ""
+                    ).strip(),
                 )
             )
         return AccountsSnapshot(

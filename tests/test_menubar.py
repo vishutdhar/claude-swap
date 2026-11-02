@@ -2515,10 +2515,41 @@ def test_format_usage_log_gains_the_resets():
     assert menubar.format_usage_log("a@x.com", {"limit_resets": _resets()}, _UR_NOW) is None  # no window
 
 
+def _attested_resets(account_uuid="uuid-1", org_uuid=""):
+    return {**_resets(), "account_uuid": account_uuid, "org_uuid": org_uuid}
+
+
+def _acct_with_ids(entry, account_uuid="uuid-1", org_uuid="", active=True, number="1"):
+    acct = _FakeAcct(number, "a@x.com", active, entry)
+    acct.account_uuid, acct.org_uuid = account_uuid, org_uuid
+    return acct
+
+
 def test_adapt_snapshot_hands_the_resets_entry_to_the_menu():
-    lg = _with_resets({"seven_day": {"pct": 20.0}})
-    accts = [_FakeAcct("1", "a@x.com", True, _FakeEntry(last_good=lg, fetched_at=123.0))]
+    lg = {"seven_day": {"pct": 20.0}, "limit_resets": _attested_resets()}
+    accts = [_acct_with_ids(_FakeEntry(last_good=lg, fetched_at=123.0))]
     snap = menubar._adapt_snapshot(_FakeSnap(accts))
     (entry,) = snap["accounts"]
     assert entry[3]["limit_resets"] == lg["limit_resets"]  # the display usage the rows read
+    assert entry[4]["limit_resets"] == lg["limit_resets"]  # the last good the log reads
     assert snap["active_usage"]["limit_resets"] == lg["limit_resets"]  # and the title
+
+
+@pytest.mark.parametrize("stored, slot", [
+    (("uuid-1", ""), ("uuid-9", "")),  # the slot now holds another account
+    (("uuid-1", "org-1"), ("uuid-1", "org-2")),  # same account, another organization
+    (("uuid-1", ""), ("", "")),  # the slot has no stored uuid (a token-only account)
+    ((None, None), ("uuid-1", "")),  # an entry with no attested ids at all
+])
+def test_display_hides_entry_whose_attested_ids_differ_from_slot(stored, slot):
+    entry = _resets()
+    if stored != (None, None):
+        entry = {**entry, "account_uuid": stored[0], "org_uuid": stored[1]}
+    lg = {"seven_day": {"pct": 20.0}, "limit_resets": entry}
+    snap = menubar._adapt_snapshot(_FakeSnap([_acct_with_ids(_FakeEntry(last_good=lg), *slot)]))
+    (row,) = snap["accounts"]
+    for usage in (row[3], row[4], snap["active_usage"]):
+        assert "limit_resets" not in usage
+        assert usage["seven_day"] == {"pct": 20.0}  # the windows stay
+    assert "limit_resets" in lg  # the stored entry itself is left alone
+    assert menubar.format_account_label("1", "a@x.com", row[3], _UR_NOW).endswith("7d 20%")
