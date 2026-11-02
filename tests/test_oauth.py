@@ -1500,3 +1500,295 @@ class TestConsumeBusyIsDeterministic:
             k for k in oauth._DETERMINISTIC_REFRESH_ERRORS if k not in ERROR_NOTES
         ]
         assert not missing, missing
+
+
+# ---- limit resets (the cedar_ember read) -------------------------------------------
+
+_REAL_RUN_CLAUDE_VERSION = getattr(oauth, "_run_claude_version", None)  # before the autouse guard stubs it
+
+_NOW = datetime(2026, 11, 2, 12, 0, tzinfo=timezone.utc).timestamp()
+
+
+def _grant(**overrides) -> dict:
+    """One grant as the server sent it on 2026-11-02 (account 3)."""
+    grant = {
+        "id": "free_reset_oct_2026",
+        "label": "Free limit reset",
+        "resets_total": 1,
+        "resets_left": 1,
+        "starts_at": "2026-10-21T00:45:00+00:00",
+        "ends_at": "2026-12-01T04:59:00+00:00",
+        "clears": ["seven_day", "seven_day_overage_included"],
+        "paused": False,
+        "usable_now": True,
+        "use_requires_limit": False,
+    }
+    grant.update(overrides)
+    return grant
+
+
+def _cedar(grants=(), **overrides) -> dict:
+    cedar = {
+        "eligible": bool(grants),
+        "ineligible_reason": None if grants else "no_grant",
+        "at_limit": False,
+        "exhausted": [],
+        "grants": list(grants),
+        "next_grant_id": None,
+        "weekly_resets_at": "2026-11-05T10:00:00+00:00",
+        "cooldown_until": None,
+        "event_props": None,
+    }
+    cedar.update(overrides)
+    return cedar
+
+
+def _json_response(payload: dict) -> MagicMock:
+    resp = MagicMock()
+    resp.read.return_value = json.dumps(payload).encode()
+    resp.__enter__ = lambda s: s
+    resp.__exit__ = MagicMock(return_value=False)
+    return resp
+
+
+class TestClaudeCodeVersion:
+    """The Claude Code version the resets read names in its User-Agent."""
+
+    def test_newest_version_name_in_the_versions_folder_wins_by_number(self, tmp_path):
+        for name in ("2.1.99", "2.1.316", "2.1.310", "notes.txt", "2.1.400.partial", "3.0.0-beta"):
+            (tmp_path / name).write_text("")
+        (tmp_path / "2.1.311").mkdir()  # a folder named by a version counts as well
+        ran = []
+        version = oauth.claude_code_version(tmp_path, run=lambda: ran.append(1) or "9.9.9")
+        assert version == "2.1.316"  # numeric order: 316 > 311 > 310 > 99
+        assert ran == []  # the folder answered; the CLI is never started
+
+    def test_empty_or_missing_folder_asks_the_cli(self, tmp_path):
+        (tmp_path / "README").write_text("")
+        assert oauth.claude_code_version(tmp_path, run=lambda: "2.1.400 (Claude Code)\n") == "2.1.400"
+        missing = tmp_path / "nowhere"
+        assert oauth.claude_code_version(missing, run=lambda: "2.1.401 (Claude Code)") == "2.1.401"
+
+    @pytest.mark.parametrize("answer", [None, "", "Claude Code", "v2", "2.1.316(Claude", 7])
+    def test_a_cli_without_a_usable_answer_falls_back_to_the_constant(self, tmp_path, answer):
+        assert oauth.claude_code_version(tmp_path, run=lambda: answer) == oauth.CLAUDE_CODE_VERSION_FALLBACK
+        assert oauth.CLAUDE_CODE_VERSION_FALLBACK == "2.1.316"
+
+    def test_only_the_first_word_of_the_cli_answer_is_used(self, tmp_path):
+        # Whatever else the CLI prints, a line break or a second header
+        # never reaches the User-Agent.
+        answer = "2.1.316\r\nX-Injected: 1"
+        assert oauth.claude_code_version(tmp_path, run=lambda: answer) == "2.1.316"
+
+    def test_a_cli_that_raises_falls_back_to_the_constant(self, tmp_path):
+        def boom():
+            raise OSError("no such file")
+
+        assert oauth.claude_code_version(tmp_path, run=boom) == oauth.CLAUDE_CODE_VERSION_FALLBACK
+
+    def test_a_name_that_could_break_the_header_is_never_a_version(self, tmp_path):
+        (tmp_path / "2.1.999 x").write_text("")
+        (tmp_path / "2.1.998\tX").write_text("")
+        assert oauth.claude_code_version(tmp_path, run=lambda: None) == oauth.CLAUDE_CODE_VERSION_FALLBACK
+
+    def test_run_claude_version_reads_the_binary_answer(self, tmp_path):
+        fake = tmp_path / "claude"
+        fake.write_text('#!/bin/sh\n[ "$1" = "--version" ] && echo "2.1.512 (Claude Code)"\n')
+        fake.chmod(0o755)
+        assert _REAL_RUN_CLAUDE_VERSION(str(fake)).strip() == "2.1.512 (Claude Code)"
+        assert _REAL_RUN_CLAUDE_VERSION(str(tmp_path / "absent")) is None
+
+    def test_user_agent_is_claude_codes_own_and_read_once(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(oauth, "claude_code_version", lambda: calls.append(1) or "2.1.316")
+        monkeypatch.setattr(oauth, "_CLAUDE_CODE_UA", None)
+        assert oauth.claude_code_user_agent() == "claude-cli/2.1.316 (external, cli)"
+        assert oauth.claude_code_user_agent() == "claude-cli/2.1.316 (external, cli)"
+        assert calls == [1]  # one discovery per process
+
+
+@pytest.mark.no_limit_resets_fake
+class TestRequestLimitResets:
+    """``request_limit_resets``: the one call that carries Claude Code's User-Agent."""
+
+    @pytest.fixture(autouse=True)
+    def _ua(self, monkeypatch):
+        monkeypatch.setattr(oauth, "claude_code_user_agent", lambda: "claude-cli/2.1.316 (external, cli)")
+
+    def _call(self, answer):
+        seen = []
+
+        def fake_urlopen(req, timeout=0):
+            seen.append((req, timeout))
+            if isinstance(answer, BaseException):
+                raise answer
+            return _json_response(answer)
+
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = oauth.request_limit_resets("tok-123")
+        return result, seen
+
+    def test_query_string_and_headers(self):
+        _result, seen = self._call({"cedar_ember": _cedar([_grant()])})
+        ((req, timeout),) = seen
+        assert req.full_url == "https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1"
+        assert req.get_method() == "GET"
+        assert req.get_header("Authorization") == "Bearer tok-123"
+        assert req.get_header("Anthropic-beta") == oauth.OAUTH_BETA_HEADER
+        assert req.get_header("User-agent") == "claude-cli/2.1.316 (external, cli)"
+        assert 0 < timeout <= 10
+
+    def test_returns_the_cedar_ember_object(self):
+        cedar = _cedar([_grant()])
+        result, _seen = self._call({"five_hour": {"utilization": 3.0}, "cedar_ember": cedar})
+        assert result == cedar
+
+    def test_no_grant_answer_is_returned(self):
+        cedar = _cedar()
+        result, _seen = self._call({"cedar_ember": cedar})
+        assert result == cedar
+
+    def test_surface_refusal_is_no_answer(self):
+        # The server did not judge this client's grants at all: nothing is known.
+        cedar = _cedar(eligible=False, ineligible_reason="surface")
+        result, _seen = self._call({"cedar_ember": cedar})
+        assert result is None
+
+    @pytest.mark.parametrize("payload", [{}, {"cedar_ember": None}, {"cedar_ember": []}, ["x"]])
+    def test_missing_or_malformed_cedar_ember_is_none(self, payload):
+        result, _seen = self._call(payload)
+        assert result is None
+
+    @pytest.mark.parametrize("error", [
+        urllib.error.HTTPError("u", 429, "Too Many", hdrs=None, fp=None),
+        urllib.error.HTTPError("u", 401, "Unauthorized", hdrs=None, fp=None),
+        urllib.error.URLError("down"),
+        TimeoutError(),
+        ValueError("bad json"),
+    ])
+    def test_any_failure_is_none_and_never_raises(self, error):
+        result, _seen = self._call(error)
+        assert result is None
+
+    def test_a_failing_user_agent_lookup_is_none_too(self, monkeypatch):
+        def boom():
+            raise RuntimeError("version lookup broke")
+
+        monkeypatch.setattr(oauth, "claude_code_user_agent", boom)
+        with patch("claude_swap.oauth.urllib.request.urlopen") as urlopen:
+            assert oauth.request_limit_resets("tok") is None
+        urlopen.assert_not_called()
+
+    def test_the_paced_usage_poll_keeps_its_own_user_agent_and_url(self):
+        seen = []
+
+        def fake_urlopen(req, timeout=0):
+            seen.append(req)
+            return _json_response({"seven_day": {"utilization": 1.0}})
+
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake_urlopen):
+            oauth.request_usage_data("tok")
+        (req,) = seen
+        assert req.full_url == "https://api.anthropic.com/api/oauth/usage"
+        assert req.get_header("User-agent") == "claude-swap/1.0"
+
+
+class TestParseLimitResets:
+    """``parse_limit_resets``: the entry kept beside the usage windows."""
+
+    def test_one_live_grant(self):
+        entry = oauth.parse_limit_resets(_cedar([_grant()]), _NOW)
+        assert entry == {
+            "left": 1,
+            "total": 1,
+            "ends_at": "2026-12-01T04:59:00+00:00",
+            "label": "Free limit reset",
+            "usable_now": True,
+            "eligible": True,
+            "paused": False,
+        }
+
+    def test_no_grant_and_surface_answers_are_none(self):
+        assert oauth.parse_limit_resets(_cedar(), _NOW) is None
+        assert oauth.parse_limit_resets(_cedar(eligible=False, ineligible_reason="surface"), _NOW) is None
+
+    @pytest.mark.parametrize("value", [None, [], "grants", 3, {"grants": "x"}, {"grants": [None, 4]}])
+    def test_non_dict_or_malformed_input_is_none(self, value):
+        assert oauth.parse_limit_resets(value, _NOW) is None
+
+    def test_a_grant_whose_ends_at_has_passed_is_left_out(self):
+        passed = _grant(ends_at="2026-11-02T11:59:59+00:00")
+        assert oauth.parse_limit_resets(_cedar([passed]), _NOW) is None
+        both = oauth.parse_limit_resets(_cedar([passed, _grant(resets_left=2, resets_total=2)]), _NOW)
+        assert (both["left"], both["total"]) == (2, 2)
+
+    @pytest.mark.parametrize("ends_at", [None, "", "soon", 12345, "2026-13-45T00:00:00+00:00"])
+    def test_a_grant_without_a_readable_ends_at_is_left_out(self, ends_at):
+        assert oauth.parse_limit_resets(_cedar([_grant(ends_at=ends_at)]), _NOW) is None
+
+    def test_a_naive_ends_at_reads_as_utc(self):
+        entry = oauth.parse_limit_resets(_cedar([_grant(ends_at="2026-12-01T04:59:00")]), _NOW)
+        assert entry["ends_at"] == "2026-12-01T04:59:00+00:00"
+
+    def test_a_paused_grant_is_left_out_of_the_count(self):
+        paused = _grant(id="b", label="Paused one", resets_left=2, resets_total=2, paused=True,
+                        usable_now=False, ends_at="2026-11-10T00:00:00+00:00")
+        entry = oauth.parse_limit_resets(_cedar([paused, _grant()]), _NOW)
+        assert (entry["left"], entry["total"], entry["paused"]) == (1, 1, False)
+        assert entry["ends_at"] == "2026-12-01T04:59:00+00:00"  # the paused grant's date is not used
+        assert entry["label"] == "Free limit reset"
+
+    def test_every_live_grant_paused_is_described_and_marked_paused(self):
+        # Nothing usable to count, but a paused reset is not a used one: the
+        # entry describes the paused grants and says so, for a dimmed pill.
+        paused = _grant(paused=True, usable_now=False)
+        entry = oauth.parse_limit_resets(_cedar([paused]), _NOW)
+        assert (entry["left"], entry["total"], entry["paused"], entry["usable_now"]) == (1, 1, True, False)
+
+    def test_two_grants_are_summed_with_the_soonest_end(self):
+        later = _grant(id="a", label="First listed", resets_left=1, resets_total=1,
+                       ends_at="2026-12-01T04:59:00+00:00", usable_now=False)
+        sooner = _grant(id="b", label="Second listed", resets_left=2, resets_total=3,
+                        ends_at="2026-11-20T00:00:00Z", usable_now=True)
+        entry = oauth.parse_limit_resets(_cedar([later, sooner]), _NOW)
+        assert (entry["left"], entry["total"]) == (3, 4)
+        assert entry["ends_at"] == "2026-11-20T00:00:00+00:00"
+        assert entry["label"] == "First listed"
+        assert entry["usable_now"] is True  # any grant usable now
+
+    def test_a_used_grant_counts_zero_left(self):
+        entry = oauth.parse_limit_resets(_cedar([_grant(resets_left=0, usable_now=False)]), _NOW)
+        assert (entry["left"], entry["total"], entry["usable_now"]) == (0, 1, False)
+
+    @pytest.mark.parametrize("left", [-1, 1.5, "1", True, float("nan"), 10**400, None])
+    def test_an_unreadable_count_leaves_the_grant_out(self, left):
+        assert oauth.parse_limit_resets(_cedar([_grant(resets_left=left)]), _NOW) is None
+
+    def test_a_missing_total_counts_what_is_left(self):
+        grant = _grant()
+        del grant["resets_total"]
+        assert oauth.parse_limit_resets(_cedar([grant]), _NOW)["total"] == 1
+
+    def test_flags_are_strict_booleans(self):
+        entry = oauth.parse_limit_resets(
+            _cedar([_grant(usable_now="yes", paused="no")], eligible="true"), _NOW
+        )
+        # Only a real true counts: "no" is not a pause, "yes" not usable.
+        assert (entry["usable_now"], entry["paused"], entry["eligible"]) == (False, False, False)
+
+    def test_a_label_that_is_not_text_is_none(self):
+        assert oauth.parse_limit_resets(_cedar([_grant(label=7)]), _NOW)["label"] is None
+
+
+class TestLimitResetsSafetyNet:
+    """The autouse guard: no test reads limit resets for real or starts ``claude``."""
+
+    def test_the_resets_read_is_stubbed_unless_a_test_opts_out(self):
+        with patch("claude_swap.oauth.urllib.request.urlopen") as urlopen:
+            assert oauth.request_limit_resets("tok") is None
+        urlopen.assert_not_called()
+
+    def test_the_claude_cli_is_never_started(self):
+        with patch("claude_swap.oauth.subprocess.run") as run:
+            assert oauth._run_claude_version() is None
+        run.assert_not_called()

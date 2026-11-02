@@ -5,12 +5,19 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import re
+import shutil
+import subprocess
+import threading
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 
+from claude_swap.codex_usage import MAX_RESET_CREDITS, finite_float
 from claude_swap.printer import warning as print_warning
 
 OAUTH_BETA_HEADER = "oauth-2025-04-20"
@@ -372,6 +379,205 @@ def request_usage_data(access_token: str) -> dict:
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=5) as resp:
         return json.loads(resp.read().decode())
+
+
+# ---- limit resets ----------------------------------------------------------
+#
+# Some accounts hold a banked "limit reset" (claude.ai Settings > Usage, "Limit
+# resets"). The usage endpoint reports them in a ``cedar_ember`` object, but
+# only when asked (``?cedar_ember=1``) and only to Claude Code's own client:
+# with cswap's User-Agent it answers ``ineligible_reason: "surface"`` and no
+# grants. So this one read mirrors the User-Agent of the Claude Code install
+# the token was issued to. It is a separate, rare call (paced per account by
+# the usage store), never a change to the paced usage poll above, which
+# keeps its own User-Agent and URL: the endpoint budgets polling
+# per surface, and this is Claude Code's surface. Nothing here ever uses a
+# reset; the read only displays.
+
+LIMIT_RESETS_URL = "https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1"
+# The Claude Code version named when none can be read from the install: the
+# one the cedar_ember answer was verified against on 2026-11-02.
+CLAUDE_CODE_VERSION_FALLBACK = "2.1.316"
+CLAUDE_CODE_VERSIONS_DIR = Path(".local") / "share" / "claude" / "versions"  # under the home folder
+CLAUDE_VERSION_TIMEOUT_S = 5.0
+# A version as Claude Code names its installs ("2.1.316"). Nothing else may
+# reach the header: a name with a space or a line break would forge one.
+_VERSION_RE = re.compile(r"\d{1,4}(?:\.\d{1,6}){1,3}")
+
+_CLAUDE_CODE_UA: str | None = None
+_CLAUDE_CODE_UA_LOCK = threading.Lock()
+
+
+def _version_key(version: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in version.split("."))
+
+
+def _run_claude_version(binary: str | None = None) -> str | None:
+    """What ``claude --version`` prints, or None when it cannot be run.
+
+    The menu bar's launch agent may not have ``~/.local/bin`` on its PATH,
+    so the usual install place is tried after the PATH lookup.
+    """
+    if binary is None:
+        binary = shutil.which("claude")
+        if binary is None:
+            fallback = Path.home() / ".local" / "bin" / "claude"
+            binary = str(fallback) if fallback.is_file() else None
+    if binary is None:
+        return None
+    try:
+        done = subprocess.run(
+            [binary, "--version"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=CLAUDE_VERSION_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    return done.stdout if done.returncode == 0 else None
+
+
+def claude_code_version(
+    versions_dir: Path | None = None, run: Callable[[], str | None] | None = None
+) -> str:
+    """The installed Claude Code's version, for the resets read's User-Agent.
+
+    The newest version-named entry under ``~/.local/share/claude/versions``
+    (compared by number: 2.1.316 is newer than 2.1.99), else the first word
+    of ``claude --version``, else ``CLAUDE_CODE_VERSION_FALLBACK``. Only a
+    plain dotted number is ever returned.
+    """
+    folder = versions_dir if versions_dir is not None else Path.home() / CLAUDE_CODE_VERSIONS_DIR
+    try:
+        with os.scandir(folder) as entries:
+            names = [entry.name for entry in entries if _VERSION_RE.fullmatch(entry.name)]
+    except OSError:
+        names = []
+    if names:
+        return max(names, key=_version_key)
+    try:
+        answer = (run or _run_claude_version)()
+    except Exception:
+        answer = None
+    words = answer.split() if isinstance(answer, str) else []
+    if words and _VERSION_RE.fullmatch(words[0]):
+        return words[0]
+    return CLAUDE_CODE_VERSION_FALLBACK
+
+
+def claude_code_user_agent() -> str:
+    """Claude Code's own User-Agent (``claude-cli/2.1.316 (external, cli)``),
+    the version discovered once per process."""
+    global _CLAUDE_CODE_UA
+    with _CLAUDE_CODE_UA_LOCK:
+        if _CLAUDE_CODE_UA is None:
+            _CLAUDE_CODE_UA = f"claude-cli/{claude_code_version()} (external, cli)"
+        return _CLAUDE_CODE_UA
+
+
+def request_limit_resets(access_token: str) -> dict | None:
+    """The account's ``cedar_ember`` object, or None when nothing was learned.
+
+    One GET of the usage endpoint with ``cedar_ember=1&skip_spend=1`` and
+    Claude Code's User-Agent. None on any failure (network, HTTP status, a
+    body that is not JSON, no ``cedar_ember`` object), and also for a
+    ``"surface"`` refusal: then the server did not judge this client's
+    grants at all, which says nothing about whether the account has one.
+    Failures are logged at debug level, without the token. Never raises.
+    """
+    try:
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "anthropic-beta": OAUTH_BETA_HEADER,
+            "User-Agent": claude_code_user_agent(),
+        }
+        req = urllib.request.Request(LIMIT_RESETS_URL, headers=headers)
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception as e:
+        kind, _retry_after = _classify_usage_error(e)
+        _logger.debug("Limit resets read failed: %s", kind)
+        return None
+    cedar = data.get("cedar_ember") if isinstance(data, dict) else None
+    if not isinstance(cedar, dict):
+        _logger.debug("Limit resets read: the answer carried no cedar_ember object")
+        return None
+    if cedar.get("ineligible_reason") == "surface":
+        _logger.debug("Limit resets read: refused for this client (surface)")
+        return None
+    return cedar
+
+
+def _grant_count(value) -> int | None:
+    """A grant's reset count: a whole number in 0..MAX_RESET_CREDITS, else None."""
+    number = finite_float(value)
+    if number is None or not number.is_integer() or not 0 <= number <= MAX_RESET_CREDITS:
+        return None
+    return int(number)
+
+
+def _iso_epoch(value) -> float | None:
+    """An ISO 8601 time as an epoch; one without a zone is UTC. None if unreadable."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        when = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return when.timestamp()
+
+
+def parse_limit_resets(cedar_ember, now: float) -> dict | None:
+    """The ``limit_resets`` entry kept beside an account's usage windows.
+
+    Counted are the grants whose ``ends_at`` is ahead of ``now`` and that
+    are not paused: ``left`` and ``total`` sum their ``resets_left`` and
+    ``resets_total``, ``ends_at`` is the soonest end among them (ISO, UTC),
+    ``label`` the first one's label, ``usable_now`` whether any is usable
+    now, ``eligible`` the answer's own flag. When every live grant is
+    paused, those are counted instead and ``paused`` is true: a paused
+    reset is not a used one. None when the answer is not an object or has
+    no live grant (``no_grant``, ``surface``, every grant ended). A grant
+    without a readable ``ends_at`` or ``resets_left`` is left out: a reset
+    that cannot be dated is not promised. Flags count only when they are
+    ``true`` itself.
+    """
+    if not isinstance(cedar_ember, dict):
+        return None
+    grants = cedar_ember.get("grants")
+    if not isinstance(grants, list):
+        return None
+    live = []  # (grant, ends epoch, left, total)
+    for grant in grants:
+        if not isinstance(grant, dict):
+            continue
+        ends = _iso_epoch(grant.get("ends_at"))
+        left = _grant_count(grant.get("resets_left"))
+        if ends is None or ends <= now or left is None:
+            continue
+        total = _grant_count(grant.get("resets_total"))
+        live.append((grant, ends, left, left if total is None else total))
+    if not live:
+        return None
+    counted = [item for item in live if item[0].get("paused") is not True]
+    paused = not counted
+    if paused:
+        counted = live
+    label = counted[0][0].get("label")
+    soonest = min(ends for _grant, ends, _left, _total in counted)
+    return {
+        "left": sum(left for _grant, _ends, left, _total in counted),
+        "total": sum(total for _grant, _ends, _left, total in counted),
+        "ends_at": datetime.fromtimestamp(soonest, timezone.utc).isoformat(),
+        "label": label if isinstance(label, str) else None,
+        "usable_now": any(grant.get("usable_now") is True for grant, *_rest in counted),
+        "eligible": cedar_ember.get("eligible") is True,
+        "paused": paused,
+    }
 
 
 def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
