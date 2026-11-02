@@ -1821,7 +1821,7 @@ class TestFetchUsageWithLimitResets:
         monkeypatch.setattr(oauth, "request_limit_resets", lambda token: tokens.append(token) or cedar)
         with patch("claude_swap.oauth.request_usage_data", return_value=self._usage()):
             out = oauth.try_fetch_usage_for_account(
-                "1", "a@x.com", self._creds(), is_active=True, limit_resets=True,
+                "1", "a@x.com", self._creds(), is_active=True, limit_resets=lambda: True,
             )
         assert out.error is None and out.usage["five_hour"]["pct"] == 12.0
         assert out.limit_resets == oauth.LimitResetsRead(cedar)
@@ -1841,7 +1841,7 @@ class TestFetchUsageWithLimitResets:
         err = urllib.error.HTTPError("u", 429, "Too Many", hdrs=None, fp=None)
         with patch("claude_swap.oauth.request_usage_data", side_effect=err):
             out = oauth.try_fetch_usage_for_account(
-                "1", "a@x.com", self._creds(), is_active=True, limit_resets=True,
+                "1", "a@x.com", self._creds(), is_active=True, limit_resets=lambda: True,
             )
         assert out.error == "http-429" and out.limit_resets is None and calls == []
 
@@ -1850,7 +1850,7 @@ class TestFetchUsageWithLimitResets:
         monkeypatch.setattr(oauth, "request_limit_resets", lambda token: calls.append(token))
         with patch("claude_swap.oauth.request_usage_data", return_value={}):
             out = oauth.try_fetch_usage_for_account(
-                "1", "a@x.com", self._creds(), is_active=True, limit_resets=True,
+                "1", "a@x.com", self._creds(), is_active=True, limit_resets=lambda: True,
             )
         assert (out.usage, out.error, out.limit_resets, calls) == (None, None, None, [])
 
@@ -1858,7 +1858,7 @@ class TestFetchUsageWithLimitResets:
         monkeypatch.setattr(oauth, "request_limit_resets", lambda token: None)
         with patch("claude_swap.oauth.request_usage_data", return_value=self._usage()):
             out = oauth.try_fetch_usage_for_account(
-                "1", "a@x.com", self._creds(), is_active=True, limit_resets=True,
+                "1", "a@x.com", self._creds(), is_active=True, limit_resets=lambda: True,
             )
         assert out.error is None and out.usage is not None
         assert out.limit_resets == oauth.LimitResetsRead(None)
@@ -1870,7 +1870,7 @@ class TestFetchUsageWithLimitResets:
         monkeypatch.setattr(oauth, "request_limit_resets", boom)
         with patch("claude_swap.oauth.request_usage_data", return_value=self._usage()):
             out = oauth.try_fetch_usage_for_account(
-                "1", "a@x.com", self._creds(), is_active=True, limit_resets=True,
+                "1", "a@x.com", self._creds(), is_active=True, limit_resets=lambda: True,
             )
         assert out.error is None and out.usage["seven_day"]["pct"] == 34.0
         assert out.limit_resets == oauth.LimitResetsRead(None)
@@ -1891,8 +1891,48 @@ class TestFetchUsageWithLimitResets:
             out = oauth.try_fetch_usage_for_account(
                 "2", "b@x.com", self._creds(), is_active=False,
                 refresh_via=lambda *_: oauth.RefreshOutcome(refreshed, None),
-                limit_resets=True,
+                limit_resets=lambda: True,
             )
         assert calls == ["old-access", "new-access"]
         assert tokens == ["new-access"]
         assert out.limit_resets == oauth.LimitResetsRead(_cedar())
+
+
+class TestLimitResetsGate:
+    """The resets read is sent only when its gate, asked right before the
+    request, says yes; the gate is never asked when no read would follow."""
+
+    @staticmethod
+    def _creds():
+        return json.dumps({"claudeAiOauth": {"accessToken": "tok", "scopes": ["user:inference"]}})
+
+    def test_a_refused_gate_sends_no_read(self, monkeypatch):
+        sent = []
+        monkeypatch.setattr(oauth, "request_limit_resets", lambda token: sent.append(token))
+        with patch("claude_swap.oauth.request_usage_data", return_value={"seven_day": {"utilization": 1.0}}):
+            out = oauth.try_fetch_usage_for_account("1", "a@x.com", self._creds(), is_active=True,
+                                                    limit_resets=lambda: False)
+        assert (out.limit_resets, sent, out.error) == (None, [], None)
+
+    def test_a_gate_that_raises_sends_no_read_and_the_usage_stands(self, monkeypatch):
+        sent = []
+        monkeypatch.setattr(oauth, "request_limit_resets", lambda token: sent.append(token))
+
+        def broken():
+            raise OSError("store unwritable")
+
+        with patch("claude_swap.oauth.request_usage_data", return_value={"seven_day": {"utilization": 1.0}}):
+            out = oauth.try_fetch_usage_for_account("1", "a@x.com", self._creds(), is_active=True,
+                                                    limit_resets=broken)
+        assert (out.limit_resets, sent, out.error) == (None, [], None)
+        assert out.usage["seven_day"]["pct"] == 1.0
+
+    @pytest.mark.parametrize("usage_answer", [{}, urllib.error.HTTPError("u", 429, "x", hdrs=None, fp=None)])
+    def test_the_gate_is_not_asked_when_no_read_follows(self, monkeypatch, usage_answer):
+        asked = []
+        monkeypatch.setattr(oauth, "request_limit_resets", lambda token: None)
+        kwargs = {"side_effect": usage_answer} if isinstance(usage_answer, Exception) else {"return_value": usage_answer}
+        with patch("claude_swap.oauth.request_usage_data", **kwargs):
+            oauth.try_fetch_usage_for_account("1", "a@x.com", self._creds(), is_active=True,
+                                              limit_resets=lambda: asked.append(1) or True)
+        assert asked == []

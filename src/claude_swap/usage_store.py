@@ -37,6 +37,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from claude_swap.codex_usage import dated_ahead
+from claude_swap.exceptions import LockError
 from claude_swap.locking import FileLock
 from claude_swap import oauth
 from claude_swap.poll_policy import (
@@ -71,7 +72,10 @@ LEGACY_CLAIM_TTL_S = 10.0  # additive-schema overlap with older collectors
 # fetch, paced from the last try whether it answered or not (a failing read
 # must not retry on every poll). Refresh now (and ``list --fresh``) may ask
 # again after ten minutes. The try time is fetch state, kept on the row as
-# ``limitResetsAttemptAt``; the entry itself, with its own ``fetched_at``,
+# ``limitResetsAttemptAt`` and written by ``reserve_limit_resets`` under the
+# lock right before the request is sent: a read whose record is later
+# thrown away (a foreign-credential sentinel, a collector killed mid-fetch)
+# still paces the next one. The entry itself, with its own ``fetched_at``,
 # rides in ``lastGood`` beside the windows.
 LIMIT_RESETS_EVERY_S = 3600.0
 LIMIT_RESETS_MANUAL_EVERY_S = 600.0
@@ -1126,11 +1130,11 @@ class UsageStore:
                 return
             row["lastAttemptAt"] = now
             if rec.error is None:
+                # The resets try was stamped when it was reserved; the
+                # record only fills in what it answered.
                 row["lastGood"] = _with_limit_resets(
                     rec.usage, row.get("lastGood"), rec.limit_resets, now
                 )
-                if rec.limit_resets is not None:
-                    row["limitResetsAttemptAt"] = now
                 row["fetchedAt"] = now
                 # Replace the old, possibly due plan in the outcome transaction
                 # so no collector can slip into a record→replan gap.
@@ -1246,14 +1250,15 @@ class UsageStore:
         identities: dict[str, Identity],
         max_age_s: float,
     ) -> set[str]:
-        """The slots among ``nums`` whose limit-resets read is due.
+        """The slots among ``nums`` whose limit-resets read looks due.
 
         Due when the last try (``limitResetsAttemptAt``, else the stored
         entry's ``fetched_at``) is at least ``max_age_s`` old, unknown, or
         dated ahead of the clock (written under a clock since put back,
         ``codex_usage.dated_ahead``). A row of another account is due. Read
-        without the lock (writes are atomic replaces); call it after
-        ``reserve`` so a just-recorded try is seen.
+        without the lock (writes are atomic replaces): a cheap first cut,
+        so only these slots get a gate. The read itself is sent only after
+        ``reserve_limit_resets`` wins it under the lock.
         """
         now = self.clock()
         rows = self._read_rows()
@@ -1267,6 +1272,41 @@ class UsageStore:
             if _limit_resets_due(row, now, max_age_s):
                 due.add(num)
         return due
+
+    def reserve_limit_resets(
+        self,
+        num: str,
+        identity: Identity,
+        claim_id: str,
+        max_age_s: float,
+    ) -> bool:
+        """Win the right to send one limit-resets read for ``num``, now.
+
+        Asked right before the request is sent. Under the lock: the row must
+        still be this account's and still carry the usage lease ``claim_id``
+        that this fetch holds (a collector whose lease was taken over sends
+        nothing), and the read must be due (``_limit_resets_due``). Then the
+        try is stamped (``limitResetsAttemptAt``) before any byte goes out,
+        so the next read is paced from it whatever becomes of this one's
+        record. A lock that cannot be had, or a store that cannot be
+        written, refuses: no reservation, no read.
+        """
+        try:
+            with self._lock():
+                now = self.clock()
+                rows = self._read_rows()
+                row = rows.get(num)
+                if (
+                    not self._matches(row, identity)
+                    or row.get("claimId") != claim_id
+                    or not _limit_resets_due(row, now, max_age_s)
+                ):
+                    return False
+                row["limitResetsAttemptAt"] = now
+                self._write_rows(rows)
+                return True
+        except (LockError, OSError):
+            return False
 
 
 def _num_or_none(value: object) -> float | None:

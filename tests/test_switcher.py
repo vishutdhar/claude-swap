@@ -12941,11 +12941,14 @@ class TestLimitResetsInTheFetchPass:
         s._usage_store.path.write_text(json.dumps(table))
 
     def _fake(self, calls, grant_for=("2",)):
-        def fake(info, limit_resets=False):
+        """A fetch that asks the resets gate as the real one does, right
+        before it would send the read, and notes whether it was let through."""
+        def fake(info, limit_resets=None):
             num = str(info[0])
-            calls.append((num, limit_resets))
+            allowed = limit_resets is not None and limit_resets()
+            calls.append((num, allowed))
             read = None
-            if limit_resets:
+            if allowed:
                 read = oauth.LimitResetsRead(self.GRANT if num in grant_for else self.NO_GRANT)
             return FetchRecord(usage=dict(self.USAGE), limit_resets=read)
         return fake
@@ -13065,3 +13068,60 @@ class TestLimitResetsInTheFetchPass:
             assert entries[num].last_good == {"seven_day": {"pct": 21.0}}
         # The failed try still paces the next one.
         assert s._usage_store.limit_resets_due(["1", "2"], self.IDENT, 3600.0) == set()
+
+
+class TestLimitResetsPacingSurvivesADiscardedRead:
+    """A resets read that was sent paces the next one even when its record
+    is thrown away: the try is stamped before the request, not after."""
+
+    def _switcher(self, sample_sequence_data):
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        return s
+
+    @pytest.mark.no_limit_resets_fake
+    def test_foreign_active_resets_attempt_remains_paced(
+        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch
+    ):
+        monkeypatch.setattr(oauth, "claude_code_user_agent", lambda: "claude-cli/2.1.316 (external, cli)")
+        s = self._switcher(sample_sequence_data)
+        live = json.dumps({"claudeAiOauth": {"accessToken": "sk-foreign"}})
+        # The ownership oracle already condemned the live credential: it is
+        # another account's, so the fast path serves the sentinel after its
+        # usage (and resets) requests have been made.
+        s._probe_verdicts[
+            s._lineage_key("1", "test@example.com", oauth.credential_fingerprint(live))
+        ] = False
+        resets_sent = []
+
+        def fake_urlopen(req, timeout=0):
+            if req.full_url == oauth.LIMIT_RESETS_URL:
+                resets_sent.append(req.get_header("Authorization"))
+                body = {"cedar_ember": TestLimitResetsInTheFetchPass.NO_GRANT}
+            else:
+                body = {"seven_day": {"utilization": 21.0}}
+            resp = MagicMock()
+            resp.read.return_value = json.dumps(body).encode()
+            resp.__enter__ = lambda r: r
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        with patch.object(
+            ClaudeAccountSwitcher, "_read_active_credentials",
+            return_value=ActiveCredentials(live, False),
+        ), patch.object(
+            ClaudeAccountSwitcher, "_read_account_credentials",
+            return_value=json.dumps({"claudeAiOauth": {"accessToken": "sk-backup"}}),
+        ), patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake_urlopen):
+            first = s._collect_usage_entries(s._build_accounts_info())
+            assert first["1"].sentinel == USAGE_FOREIGN_CREDENTIAL
+            assert resets_sent.count("Bearer sk-foreign") == 1
+            # Every later pass re-measures the slot (the sentinel recorded
+            # nothing), but the resets read waits out its interval.
+            for _ in range(3):
+                again = s._collect_usage_entries(s._build_accounts_info(), fresh=True)
+                assert again["1"].sentinel == USAGE_FOREIGN_CREDENTIAL
+        assert resets_sent.count("Bearer sk-foreign") == 1
+        assert resets_sent.count("Bearer sk-backup") == 1

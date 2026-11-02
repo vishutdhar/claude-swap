@@ -592,8 +592,18 @@ class LimitResetsRead:
     cedar_ember: dict | None
 
 
-def _read_limit_resets(access_token: str) -> LimitResetsRead:
-    """``request_limit_resets`` that cannot fail the usage read it rides on."""
+def _read_limit_resets(
+    access_token: str, gate: Callable[[], bool]
+) -> LimitResetsRead | None:
+    """``request_limit_resets`` behind its gate, unable to fail the usage read
+    it rides on. None when the gate refuses (or fails): no read was made."""
+    try:
+        allowed = gate() is True
+    except Exception as e:
+        _logger.debug("Limit resets reservation failed: %r", e)
+        return None
+    if not allowed:
+        return None
     try:
         return LimitResetsRead(request_limit_resets(access_token))
     except Exception as e:  # the contract says never; a bug must not cost the usage
@@ -840,7 +850,7 @@ def try_fetch_usage_for_account(
     is_active: bool,
     persist_credentials: Callable[[str, str, str], None] | None = None,
     refresh_via: Callable[[str, str, str], RefreshOutcome] | None = None,
-    limit_resets: bool = False,
+    limit_resets: Callable[[], bool] | None = None,
 ) -> UsageOutcome:
     """Fetch usage for an account, refreshing expired tokens for inactive accounts only.
 
@@ -851,10 +861,12 @@ def try_fetch_usage_for_account(
     never consumes a superseded snapshot. ``persist_credentials`` is then
     unused for the refresh (the gate persists internally).
 
-    ``limit_resets`` asks for the rare limit-resets read as well: made only
-    after a usage read that succeeded with window data, with the token that
-    read used, and carried in ``UsageOutcome.limit_resets``. Its failure
-    never fails the usage read.
+    ``limit_resets`` asks for the rare limit-resets read as well. It is the
+    read's gate (``UsageStore.reserve_limit_resets``), asked right before
+    the request and only after a usage read that succeeded with window
+    data; the read is sent with the token that read used only when the gate
+    answers True, and is carried in ``UsageOutcome.limit_resets``. Neither
+    the gate nor the read can fail the usage read.
     """
     context = f"for account {account_num}"  # no email: paste-safe for public issues
     oauth = extract_oauth_data(credentials)
@@ -907,9 +919,9 @@ def try_fetch_usage_for_account(
 
     def succeeded(data: dict, token: str) -> UsageOutcome:
         usage = build_usage_result(data)
-        if not limit_resets or usage is None:
+        if limit_resets is None or usage is None:
             return UsageOutcome(usage)
-        return UsageOutcome(usage, limit_resets=_read_limit_resets(token))
+        return UsageOutcome(usage, limit_resets=_read_limit_resets(token, limit_resets))
 
     try:
         data = request_usage_data(access_token)

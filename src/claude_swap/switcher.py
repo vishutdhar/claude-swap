@@ -12,7 +12,8 @@ import threading
 import sys
 import tempfile
 import time
-from collections.abc import Collection
+import functools
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -4073,13 +4074,13 @@ class ClaudeAccountSwitcher:
         email: str,
         creds: str,
         org_uuid: str = "",
-        limit_resets: bool = False,
+        limit_resets: Callable[[], bool] | None = None,
     ) -> FetchRecord:
         """Usage fetch for the active/default account, refreshing an expired
         token under Claude Code's own lock protocol.
 
-        ``limit_resets`` asks for the rare limit-resets read with a
-        successful usage read (see ``_fetch_account_usage``).
+        ``limit_resets`` is the gate of the rare limit-resets read made
+        with a successful usage read (see ``_fetch_account_usage``).
 
         Claude Code 2.1.218 is built to *adopt* an externally rotated
         credential rather than collide with it: its refresh takes the
@@ -4818,14 +4819,15 @@ class ClaudeAccountSwitcher:
     def _fetch_account_usage(
         self,
         account_info: tuple[int, str, str, str, bool, str, str],
-        limit_resets: bool = False,
+        limit_resets: Callable[[], bool] | None = None,
     ) -> FetchRecord:
         """One network fetch for one account. Never raises.
 
-        ``limit_resets`` asks for the rare limit-resets read as well, made
-        with the same credential right after a successful usage read and
-        carried in ``FetchRecord.limit_resets`` (the collector decides when
-        it is due: ``UsageStore.limit_resets_due``).
+        ``limit_resets``, when given, is the gate of the rare limit-resets
+        read: asked right after a successful usage read, it reserves the
+        read in the store (``UsageStore.reserve_limit_resets``), and only
+        then is the read sent with the same credential. Its answer rides in
+        ``FetchRecord.limit_resets``.
         """
         num, email, _, org_uuid, is_active, creds, _alias = account_info
 
@@ -4911,11 +4913,12 @@ class ClaudeAccountSwitcher:
     def _run_usage_fetches(
         self,
         infos: list[tuple[int, str, str, str, bool, str, str]],
-        limit_resets: Collection[str] = (),
+        limit_resets: Mapping[str, Callable[[], bool]] | None = None,
     ) -> dict[str, FetchRecord]:
         """Fetch the given accounts in parallel, staggering request starts so
-        N accounts never hit the endpoint in the same instant. The slots
-        named in ``limit_resets`` also get the rare limit-resets read."""
+        N accounts never hit the endpoint in the same instant. A slot with a
+        gate in ``limit_resets`` may also get the rare limit-resets read."""
+        gates = limit_resets or {}
         def fetch_one(
             idx_info: tuple[int, tuple[int, str, str, str, bool, str, str]]
         ) -> tuple[str, FetchRecord]:
@@ -4924,7 +4927,7 @@ class ClaudeAccountSwitcher:
                 time.sleep(idx * _FETCH_STAGGER_S)
             num = str(info[0])
             return num, self._fetch_account_usage(
-                info, limit_resets=num in limit_resets
+                info, limit_resets=gates.get(num)
             )
 
         with ThreadPoolExecutor() as executor:
@@ -5042,15 +5045,21 @@ class ClaudeAccountSwitcher:
 
         if claims:
             pre = entries
-            # Decided after reserve, from what the store holds now, so a try
-            # another collector recorded a moment ago is seen.
-            resets_due = store.limit_resets_due(
-                claims,
-                identities,
-                LIMIT_RESETS_MANUAL_EVERY_S if fresh else LIMIT_RESETS_EVERY_S,
+            # The slots whose resets read looks due get a gate; the read is
+            # sent only once its gate has reserved it under the store lock,
+            # fenced by this fetch's lease (see reserve_limit_resets).
+            resets_every = (
+                LIMIT_RESETS_MANUAL_EVERY_S if fresh else LIMIT_RESETS_EVERY_S
             )
+            resets_gates = {
+                num: functools.partial(
+                    store.reserve_limit_resets,
+                    num, identities[num], claims[num], resets_every,
+                )
+                for num in store.limit_resets_due(claims, identities, resets_every)
+            }
             records = self._run_usage_fetches(
-                [info_by_num[num] for num in claims], limit_resets=resets_due
+                [info_by_num[num] for num in claims], limit_resets=resets_gates
             )
             plans, floors = self._plans_after_fetch(records, pre, info_by_num)
             accepted = store.record(
