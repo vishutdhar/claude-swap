@@ -2379,3 +2379,30 @@ def test_resets_pill_appears_and_disappears_in_place_without_height_change(app, 
     assert [v.frame().size.height for v in views] == heights
     assert _pcts(app) == ["56%", "67%"]
     assert len(source.takes) == 2
+
+
+@pytest.mark.parametrize("bars", [True, False], ids=["panels", "text-rows"])
+def test_title_stays_ur_free_after_in_place_refresh(capp, codex, cshown, on_screen, bars):
+    capp.settings.show_usage_bars = bars
+    capp.rebuild_menu()
+    after = _snap(
+        _entry_resets("1", "a@x.com", active=True, left=1, pct=55.0),
+        _entry_resets("2", "b@x.com", left=0, pct=66.0),
+    )
+    cshown(_Source(after))
+    codex.state = _codex_state(credits=3)
+    items = list(capp.menu._menu.itemArray())
+    assert _row(capp).accessibilityPerformPress()
+    assert _pump(lambda: not _row(capp).busy)
+    assert list(capp.menu._menu.itemArray()) == items  # redrawn in place
+    # The dropdown carries every count; the title carries none.
+    if bars:
+        assert [i.view().panel.badge_text for i in _account_items(capp)] == ["UR 1", "UR 0", "UR 3"]
+    else:
+        titles = [i.title() for i in _account_items(capp)]
+        assert titles[0].endswith("· UR 1") and titles[1].endswith("· UR 0")
+        assert titles[2].startswith("Codex · 7d 56% · UR 3")
+    assert capp.title == "⇄ a · 55% · Codex 56%"
+    _close(capp)  # and after the full rebuild the close owes
+    capp.on_sync_tick(None)
+    assert capp.title == "⇄ a · 55% · Codex 56%"
