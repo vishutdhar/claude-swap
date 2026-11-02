@@ -13082,18 +13082,22 @@ class TestLimitResetsPacingSurvivesADiscardedRead:
         return s
 
     @pytest.mark.no_limit_resets_fake
-    def test_foreign_active_resets_attempt_remains_paced(
-        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch
+    @pytest.mark.parametrize("verdict", ["known before the pass", "found by this pass's probe"])
+    def test_known_foreign_credential_never_reserves_or_reads_resets(
+        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch, verdict
     ):
         monkeypatch.setattr(oauth, "claude_code_user_agent", lambda: "claude-cli/2.1.316 (external, cli)")
         s = self._switcher(sample_sequence_data)
         live = json.dumps({"claudeAiOauth": {"accessToken": "sk-foreign"}})
-        # The ownership oracle already condemned the live credential: it is
-        # another account's, so the fast path serves the sentinel after its
-        # usage (and resets) requests have been made.
-        s._probe_verdicts[
-            s._lineage_key("1", "test@example.com", oauth.credential_fingerprint(live))
-        ] = False
+        key = s._lineage_key("1", "test@example.com", oauth.credential_fingerprint(live))
+        if verdict == "known before the pass":
+            s._probe_verdicts[key] = False
+        else:
+            # The ownership probe after the usage read condemns it.
+            monkeypatch.setattr(
+                s, "_resync_rotated_backup",
+                lambda *_a, **_k: s._probe_verdicts.__setitem__(key, False),
+            )
         resets_sent = []
 
         def fake_urlopen(req, timeout=0):
@@ -13115,16 +13119,15 @@ class TestLimitResetsPacingSurvivesADiscardedRead:
             ClaudeAccountSwitcher, "_read_account_credentials",
             return_value=json.dumps({"claudeAiOauth": {"accessToken": "sk-backup"}}),
         ), patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake_urlopen):
-            first = s._collect_usage_entries(s._build_accounts_info())
-            assert first["1"].sentinel == USAGE_FOREIGN_CREDENTIAL
-            assert resets_sent.count("Bearer sk-foreign") == 1
-            # Every later pass re-measures the slot (the sentinel recorded
-            # nothing), but the resets read waits out its interval.
-            for _ in range(3):
-                again = s._collect_usage_entries(s._build_accounts_info(), fresh=True)
-                assert again["1"].sentinel == USAGE_FOREIGN_CREDENTIAL
-        assert resets_sent.count("Bearer sk-foreign") == 1
-        assert resets_sent.count("Bearer sk-backup") == 1
+            for fresh in (False, True, True):
+                entries = s._collect_usage_entries(s._build_accounts_info(), fresh=fresh)
+                assert entries["1"].sentinel == USAGE_FOREIGN_CREDENTIAL
+        # Someone else's token never carries a resets read, and the slot is
+        # not stamped: once its own credential is back, it is read at once.
+        assert "Bearer sk-foreign" not in resets_sent
+        assert resets_sent == ["Bearer sk-backup"]
+        row = json.loads(s._usage_store.path.read_text())["accounts"]["1"]
+        assert "limitResetsAttemptAt" not in row
 
 
 class TestLimitResetsAuthFailuresStayIsolated:

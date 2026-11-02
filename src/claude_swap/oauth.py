@@ -671,6 +671,24 @@ def _read_limit_resets(
         return LimitResetsRead(None)
 
 
+def read_limit_resets_for(
+    credentials: str, gate: Callable[[], bool]
+) -> LimitResetsRead | None:
+    """The limit-resets read made with ``credentials``' access token, behind
+    its gate; None when the gate refuses or there is no token.
+
+    For a caller that must settle who owns a credential between its usage
+    read and its resets read (the active account's ownership probe): it
+    reads with the token the usage read used, as long as nothing refreshed
+    it in between (``try_fetch_usage_for_account`` with ``is_active=True``
+    never does).
+    """
+    token = extract_access_token(credentials)
+    if not token:
+        return None
+    return _read_limit_resets(token, gate)
+
+
 def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
     """Map a usage-fetch exception to ``(kind, retry_after_s)``.
 

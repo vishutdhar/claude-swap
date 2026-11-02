@@ -2045,3 +2045,22 @@ class TestLimitResetsGate:
             oauth.try_fetch_usage_for_account("1", "a@x.com", self._creds(), is_active=True,
                                               limit_resets=lambda: asked.append(1) or True)
         assert asked == []
+
+
+class TestReadLimitResetsFor:
+    """``read_limit_resets_for``: the resets read with a credential's own token."""
+
+    def test_reads_with_the_credentials_access_token_behind_the_gate(self, monkeypatch):
+        tokens = []
+        monkeypatch.setattr(oauth, "request_limit_resets", lambda token: tokens.append(token) or _cedar())
+        creds = json.dumps({"claudeAiOauth": {"accessToken": "tok-live"}})
+        assert oauth.read_limit_resets_for(creds, lambda: True) == oauth.LimitResetsRead(_cedar())
+        assert oauth.read_limit_resets_for(creds, lambda: False) is None
+        assert tokens == ["tok-live"]
+
+    @pytest.mark.parametrize("creds", ["", "not json", json.dumps({"claudeAiOauth": {}})])
+    def test_no_token_no_gate_no_read(self, monkeypatch, creds):
+        asked, sent = [], []
+        monkeypatch.setattr(oauth, "request_limit_resets", lambda token: sent.append(token))
+        assert oauth.read_limit_resets_for(creds, lambda: asked.append(1) or True) is None
+        assert (asked, sent) == ([], [])

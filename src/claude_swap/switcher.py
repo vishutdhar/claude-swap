@@ -4143,9 +4143,11 @@ class ClaudeAccountSwitcher:
         # one wins, the loser gets invalid_grant and strikes a live account.
         force_refresh: FetchRecord | None = None
         if not oauth.is_oauth_token_expired(oauth_data.get("expiresAt")):
+            # No limit-resets gate here: the resets read waits for the
+            # ownership verdict below, so a credential that is another
+            # account's never reserves the slot's read nor carries one.
             outcome = oauth.try_fetch_usage_for_account(
                 account_num, email, creds, is_active=True,
-                limit_resets=limit_resets,
             )
             if outcome.error != "http-401":
                 if outcome.usage is not None:
@@ -4182,11 +4184,16 @@ class ClaudeAccountSwitcher:
                         return FetchRecord(
                             sentinel=USAGE_FOREIGN_CREDENTIAL
                         )
+                resets = (
+                    oauth.read_limit_resets_for(creds, limit_resets)
+                    if limit_resets is not None and outcome.usage is not None
+                    else None
+                )
                 return FetchRecord(
                     usage=outcome.usage,
                     error=outcome.error,
                     retry_after_s=outcome.retry_after_s,
-                    limit_resets=outcome.limit_resets,
+                    limit_resets=resets,
                 )
             # A locally-valid token the server rejects: revoked out-of-band
             # (measured: a sibling machine rotating a synced lineage kills
