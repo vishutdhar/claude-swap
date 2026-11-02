@@ -507,21 +507,34 @@ def right_run(right: float, widths: list[float], gap: float) -> tuple[list[float
 
 
 def badge_rect(
-    x: float, text_top: float, text_w: float, text_h: float, pixel: float
+    x: float, text_top: float, text_w: float, text_h: float, pixel: float,
+    *, line_top: float, line_bottom: float,
 ) -> tuple[float, float, float, float]:
     """(x, y, w, h) of the usage-resets pill round its text.
 
     ``x`` is the pill's left end, where ``right_run`` put it, and
     ``text_top`` the top of the text's line. The text sits ``BADGE_PAD_X``
-    in from each end and ``BADGE_PAD_Y`` from the top and bottom. Each edge
-    then moves to the nearest whole device pixel (``pixel`` points wide), so
-    a one-pixel outline covers one row of pixels and stays sharp.
+    in from each end and ``BADGE_PAD_Y`` from the top and bottom; a text
+    size below zero counts as zero. Each edge then moves to the nearest
+    whole device pixel (``pixel`` points wide, above zero), so a one-pixel
+    outline covers one row of pixels and stays sharp. However tall the
+    font, the pill stays inside the header line, ``line_top`` to
+    ``line_bottom``.
     """
+    if not (pixel > 0 and math.isfinite(pixel)):
+        raise ValueError(f"a device pixel is a size above zero, not {pixel!r}")
+    text_w, text_h = max(0.0, text_w), max(0.0, text_h)
+
     def snap(value: float) -> float:
         return math.floor(value / pixel + 0.5) * pixel
 
+    # The line's own edges, moved inward to whole pixels; a hair of slack
+    # keeps an edge already on a pixel where it is.
+    line_lo = math.ceil(line_top / pixel - 1e-9) * pixel
+    line_hi = math.floor(line_bottom / pixel + 1e-9) * pixel
     left, right = snap(x), snap(x + text_w + 2 * BADGE_PAD_X)
-    top, bottom = snap(text_top - BADGE_PAD_Y), snap(text_top + text_h + BADGE_PAD_Y)
+    top = min(max(snap(text_top - BADGE_PAD_Y), line_lo), line_hi)
+    bottom = max(min(snap(text_top + text_h + BADGE_PAD_Y), line_hi), top)
     return left, top, right - left, bottom - top
 
 

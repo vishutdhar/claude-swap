@@ -28,6 +28,7 @@ from AppKit import (
     NSBezierPath,
     NSBitmapImageFileTypePNG,
     NSColor,
+    NSColorSpace,
     NSCompositingOperationClear,
     NSFont,
     NSFontAttributeName,
@@ -59,6 +60,7 @@ CARD_ALPHA = 0.16  # the active account's accent card
 EXHAUSTED_FILL_ALPHA = 0.62  # an exhausted account's bar fills
 EXHAUSTED_OVER_ALPHA = 0.85  # an exhausted account's red over-limit percent
 TICK_ALPHA = 0.55  # the pace tick, label colour
+UNKNOWN_BADGE_ALPHA = 0.9  # an unknown usage-resets count: the secondary colour at this share of its alpha
 
 
 def live_view_count() -> int:
@@ -128,9 +130,24 @@ def _stroke_rounded(rect, radius: float, color, width: float) -> None:
 
 
 def _device_pixel(view) -> float:
-    """One device pixel in points: 0.5 on a Retina screen, 1 on a standard one."""
-    pixel = view.convertSizeFromBacking_((1.0, 1.0)).width
-    return pixel if pixel > 0 else 1.0
+    """One device pixel in points: 0.5 on a Retina screen, 1 on a standard one.
+
+    AppKit answers for the view's screen, or for the main screen when the
+    view has no window. Without a usable answer (none, zero or below, not a
+    number, or more than a point) a whole point stands in, so the badge
+    still draws.
+    """
+    size = view.convertSizeFromBacking_((1.0, 1.0))
+    pixel = size.width if size is not None else None
+    if isinstance(pixel, (int, float)) and 0.0 < pixel <= 1.0:
+        return float(pixel)
+    return 1.0
+
+
+def _fainter(color, share: float):
+    """``color`` as the current appearance draws it, at ``share`` of its own alpha."""
+    resolved = color.colorUsingColorSpace_(NSColorSpace.sRGBColorSpace())
+    return resolved.colorWithAlphaComponent_(resolved.alphaComponent() * share)
 
 
 # ---- layout shared by every panel in one menu -----------------------------------------
@@ -459,7 +476,9 @@ def _badge_color(state: str, ink):
     if state == "over":
         return _fill_color("over")
     if state == "unknown":
-        return ink.tertiary
+        # A little fainter than a known count. Not the tertiary colour: on
+        # the menu that falls below the 3:1 a control's outline needs.
+        return _fainter(ink.secondary, UNKNOWN_BADGE_ALPHA)
     return ink.secondary
 
 
@@ -501,7 +520,9 @@ def _draw_header(panel, layout, cols, ink, pixel: float) -> None:
             text.drawAtPoint_((x, centred(font)))
             continue
         text_top = baseline - font.ascender()
-        rect = mp.badge_rect(x, text_top, text.size().width, _line_h(font), pixel)
+        rect = mp.badge_rect(
+            x, text_top, text.size().width, _line_h(font), pixel, line_top=top, line_bottom=top + h
+        )
         _stroke_rounded(rect, mp.BADGE_RADIUS, pill, mp.BADGE_STROKE_PX * pixel)
         text.drawAtPoint_((x + mp.BADGE_PAD_X, text_top))
 
