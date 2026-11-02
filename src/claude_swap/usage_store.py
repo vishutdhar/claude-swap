@@ -1252,9 +1252,9 @@ class UsageStore:
     ) -> set[str]:
         """The slots among ``nums`` whose limit-resets read looks due.
 
-        Due when the last try (``limitResetsAttemptAt``, else the stored
-        entry's ``fetched_at``) is at least ``max_age_s`` old, unknown, or
-        dated ahead of the clock (written under a clock since put back,
+        Due when the last try (``limitResetsAttemptAt``, the reservation's
+        stamp) is at least ``max_age_s`` old, unknown, or dated ahead of the
+        clock (written under a clock since put back,
         ``codex_usage.dated_ahead``). A row of another account is due. Read
         without the lock (writes are atomic replaces): a cheap first cut,
         so only these slots get a gate. The read itself is sent only after
@@ -1392,26 +1392,18 @@ def _finite_or_none(value: object) -> float | None:
 def _limit_resets_due(row: dict, now: float, max_age_s: float) -> bool:
     """Whether a stored row's limit-resets read is due (see ``limit_resets_due``).
 
-    Paced from the last try and nothing else: the entry's shape never makes
-    a read due early. An entry in an older shape (without its ``grants``
-    list, which the menu cannot read) is replaced by the next read due by
-    the interval; a failing read carries it forward without retrying on
-    every fetch.
+    Paced from the last try (``limitResetsAttemptAt``, the reservation's own
+    stamp) and nothing else: not the entry's ``fetched_at``, which a failing
+    read carries forward unchanged and a clock put back can leave in the
+    future, and not the entry's shape (an older, summed entry is replaced
+    by the next read the interval allows). No stamp, or one too far ahead
+    of the clock (``codex_usage.dated_ahead``: a wrong clock's), is due; a
+    stamp a little ahead counts as a try just made.
     """
-    last_good = row.get("lastGood")
-    entry = last_good.get("limit_resets") if isinstance(last_good, dict) else None
-    stamps = [
-        stamp
-        for stamp in (
-            _finite_or_none(row.get("limitResetsAttemptAt")),
-            _finite_or_none(entry.get("fetched_at")) if isinstance(entry, dict) else None,
-        )
-        if stamp is not None
-    ]
-    if not stamps:
+    last = _finite_or_none(row.get("limitResetsAttemptAt"))
+    if last is None or dated_ahead(last, now):
         return True
-    last = max(stamps)
-    return dated_ahead(last, now) or now - last >= max_age_s
+    return now - last >= max_age_s
 
 
 def _with_limit_resets(

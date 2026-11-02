@@ -2177,12 +2177,42 @@ class TestLimitResetsDue:
         assert store.limit_resets_due(["1"], IDENT, manual) == {"1"}
         assert store.limit_resets_due(["1"], IDENT, usage_store.LIMIT_RESETS_EVERY_S) == set()
 
-    def test_the_entry_time_counts_when_the_try_stamp_is_missing(self, store, clock):
+    def test_the_entry_time_never_paces(self, store, clock):
+        # Only the reservation's own stamp paces: an entry, however recent,
+        # with no try stamp beside it is due.
         self._seed(store, oauth.LimitResetsRead(_cedar_with()))
         table = json.loads(store.path.read_text(encoding="utf-8"))
         del table["accounts"]["1"]["limitResetsAttemptAt"]
         store.path.write_text(json.dumps(table), encoding="utf-8")
         clock.advance(60)
+        assert store.limit_resets_due(["1"], IDENT, usage_store.LIMIT_RESETS_EVERY_S) == {"1"}
+
+    def test_future_entry_failed_refresh_is_paced_from_new_reservation(self, store, clock):
+        # The clock is put back two hours after a good read: the entry and the
+        # stamp are now dated ahead. The stamp is dropped (a wrong clock's), so
+        # the next fetch reserves a read; it fails and carries the entry, still
+        # dated ahead, forward. The fetches after it are paced from the new
+        # reservation, not kept due by the entry's time.
+        every = usage_store.LIMIT_RESETS_EVERY_S
+        self._seed(store, oauth.LimitResetsRead(_cedar_with()))
+        clock.advance(-7200)
+        assert store.limit_resets_due(["1"], IDENT, every) == {"1"}
+        _resets_pass(store, "1", oauth.LimitResetsRead(None))
+        row = json.loads(store.path.read_text())["accounts"]["1"]
+        assert row["lastGood"]["limit_resets"]["fetched_at"] > clock.now + 7000  # still ahead
+        for _ in range(3):
+            clock.advance(60)
+            claim = store.claim(["1"], IDENT)["1"]
+            assert store.limit_resets_due(["1"], IDENT, every) == set()
+            assert store.reserve_limit_resets("1", IDENT["1"], claim, every) is False
+        clock.advance(every)
+        assert store.limit_resets_due(["1"], IDENT, every) == {"1"}
+
+    def test_a_stamp_a_little_ahead_counts_as_just_made(self, store, clock):
+        # Within the slack the other clocks allow (codex_usage.dated_ahead),
+        # a stamp ahead of the clock is a try just made, not a wrong clock's.
+        self._seed(store, oauth.LimitResetsRead(NO_GRANT))
+        clock.advance(-200)
         assert store.limit_resets_due(["1"], IDENT, usage_store.LIMIT_RESETS_EVERY_S) == set()
 
     def test_a_stamp_dated_ahead_of_the_clock_is_due(self, store, clock):
