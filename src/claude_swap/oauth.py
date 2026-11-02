@@ -694,6 +694,15 @@ def _read_limit_resets(access_token: str, gate: LimitResetsGate) -> LimitResetsR
 
     The read carries the server's ids for the attestation at record time;
     its ``cedar_ember`` is None whenever no resets answer was had.
+
+    Accepted residual: the probe is paced by the slot's stored account
+    (step 1), because whose token it is is known only from the probe
+    itself. Slots whose stored accounts are stale and whose tokens are one
+    real account's (a duplicated token in the roster, an operator error)
+    each send one profile probe per interval; that account's resets
+    request still goes out once (step 3). The overrun is bounded at one
+    extra probe, cswap's existing ownership call, per duplicate slot per
+    interval.
     """
     try:
         reserved = gate.reserve() is True
@@ -702,6 +711,8 @@ def _read_limit_resets(access_token: str, gate: LimitResetsGate) -> LimitResetsR
         return None
     if not reserved:
         return None
+    # Accepted residual (see above): paced per slot, as the token's account
+    # is not known until this answers.
     try:
         profile = fetch_oauth_profile(access_token)
     except Exception as e:  # it never raises; a bug must not cost the usage

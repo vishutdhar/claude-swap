@@ -14023,9 +14023,11 @@ class TestLimitResetsContention(_ResetsNetHelpers):
 
     @pytest.mark.no_limit_resets_fake
     @pytest.mark.no_oauth_profile_fake
-    def test_two_stale_slots_same_actual_account_send_once(
+    def test_two_stale_slots_same_actual_account_profile_per_slot_resets_once(
         self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch
     ):
+        # Accepted residual: one profile probe per slot per interval, the
+        # account's resets request once (see oauth._read_limit_resets).
         # Slots 2 and 3 still name accounts that have since left them; both
         # tokens now belong to one real account, X.
         monkeypatch.setattr(oauth, "claude_code_user_agent", lambda: "claude-cli/2.1.316 (external, cli)")
