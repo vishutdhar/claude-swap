@@ -1829,3 +1829,79 @@ def test_codex_block_renders_in_both_appearances(tmp_path):
             path = tmp_path / f"{appearance}-{highlighted}.png"
             pv.render_png([account, _codex_panel(alias="a-twelve-chr")], str(path), appearance, highlighted=highlighted)
             assert path.stat().st_size > 1000
+
+
+# --- the UR pill on a Claude account -----------------------------------------------------
+
+def _account_with_resets(left=2, active=True, usable=True, disabled=False):
+    usage = {
+        "five_hour": {"pct": 12.0}, "seven_day": {"pct": 40.0},
+        "limit_resets": {
+            "grants": [{
+                "id": "g", "label": "Free limit reset", "left": left, "total": max(left, 1),
+                "ends_at": "2099-01-01T00:00:00+00:00", "usable_now": usable, "paused": False,
+            }],
+            "eligible": True, "fetched_at": _NOW - 60,
+        },
+    }
+    return mp.build_account_panel(("1", "me@example.com", active, usage, usage, "proton", disabled, _NOW - 9), _NOW)
+
+
+def test_account_pill_draws_before_active_then_the_age(monkeypatch):
+    view, spots, strokes = _header_geometry(monkeypatch, _account_with_resets())
+    pixel = view.convertSizeFromBacking_((1.0, 1.0)).width
+    (((x, y, w, h), radius, width),) = strokes  # one pill, the account's
+    assert (radius, width) == (mp.BADGE_RADIUS, pixel)
+    badge, active, age = spots["UR 2"], spots["ACTIVE"], spots["9s ago"]
+    assert badge.x < active.x < age.x  # the pill, then ACTIVE, then the age
+    assert badge.font.isEqual_(pv._fonts()["tag"])
+    assert badge.x - x == pytest.approx(mp.BADGE_PAD_X, abs=pixel / 2)
+    assert active.x - (x + w) == pytest.approx(mp.AGE_GAP, abs=pixel / 2)  # one gap to ACTIVE
+    assert badge.y + badge.font.ascender() == pytest.approx(age.y + age.font.ascender())
+
+
+def test_account_pill_has_the_codex_pills_geometry_and_the_codex_pill_stays(monkeypatch):
+    account, codex = _account_with_resets(left=2), _codex_panel(credits=2)
+    layout = pv.PanelLayout([account, codex])
+    view, a_spots, a_strokes = _header_geometry(monkeypatch, account, layout)
+    _v, c_spots, c_strokes = _header_geometry(monkeypatch, codex, layout)
+    pixel = view.convertSizeFromBacking_((1.0, 1.0)).width
+    ((a_rect, a_radius, a_width),) = a_strokes
+    ((c_rect, c_radius, c_width),) = c_strokes
+    assert (a_rect[1], a_rect[2], a_rect[3]) == (c_rect[1], c_rect[2], c_rect[3])  # same y, width, height
+    assert (a_radius, a_width) == (c_radius, c_width)
+    assert a_spots["UR 2"].y - a_rect[1] == pytest.approx(c_spots["UR 2"].y - c_rect[1])
+    # Each pill's left edge is snapped to its own device pixel: the text
+    # inset agrees to within half a pixel, as the Codex tests hold it.
+    assert a_spots["UR 2"].x - a_rect[0] == pytest.approx(c_spots["UR 2"].x - c_rect[0], abs=pixel / 2)
+    # The Codex pill is where it was: its right end one gap before the age,
+    # the age at the right edge of the header.
+    cols = layout.columns
+    age = c_spots["9s ago"]
+    assert age.x + pv._width("9s ago", pv._fonts()["meta"]) == pytest.approx(cols.reset_right)
+    assert age.x - (c_rect[0] + c_rect[2]) == pytest.approx(mp.AGE_GAP, abs=0.5)
+
+
+def test_account_without_a_grant_draws_no_pill(monkeypatch):
+    plain = mp.build_account_panel(
+        ("1", "me@example.com", True, {"five_hour": {"pct": 12.0}}, None, "proton", False, _NOW - 9), _NOW
+    )
+    _view, spots, strokes = _header_geometry(monkeypatch, plain)
+    assert strokes == []
+    assert not any(text.startswith("UR ") for text in spots)
+
+
+def test_account_pill_before_a_held_or_paused_word(monkeypatch):
+    _view, spots, _strokes = _header_geometry(monkeypatch, _account_with_resets(active=False, disabled=True))
+    assert spots["UR 2"].x < spots["paused"].x < spots["9s ago"].x
+
+
+def test_account_pill_colours(monkeypatch):
+    assert _is(_colour_of(_drawn(monkeypatch, _account_with_resets(left=0, usable=False)), "UR 0"), "systemRedColor")
+    assert _is(_colour_of(_drawn(monkeypatch, _account_with_resets(left=2)), "UR 2"), "secondaryLabelColor")
+    dim = _colour_of(_drawn(monkeypatch, _account_with_resets(usable=False)), "UR 2")
+    secondary = AppKit.NSColor.secondaryLabelColor().colorUsingColorSpace_(AppKit.NSColorSpace.sRGBColorSpace())
+    resolved = dim.colorUsingColorSpace_(AppKit.NSColorSpace.sRGBColorSpace())
+    assert resolved.alphaComponent() == pytest.approx(secondary.alphaComponent() * pv.UNKNOWN_BADGE_ALPHA)
+    highlighted = _drawn(monkeypatch, _account_with_resets(left=0, usable=False), highlighted=True)
+    assert _is(_colour_of(highlighted, "UR 0"), "selectedMenuItemTextColor")

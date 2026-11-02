@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import time
 import urllib.error
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
@@ -1500,3 +1502,657 @@ class TestConsumeBusyIsDeterministic:
             k for k in oauth._DETERMINISTIC_REFRESH_ERRORS if k not in ERROR_NOTES
         ]
         assert not missing, missing
+
+
+# ---- limit resets (the cedar_ember read) -------------------------------------------
+
+_REAL_RUN_CLAUDE_VERSION = getattr(oauth, "_run_claude_version", None)  # before the autouse guard stubs it
+
+_NOW = datetime(2026, 11, 2, 12, 0, tzinfo=timezone.utc).timestamp()
+
+
+def _grant(**overrides) -> dict:
+    """One grant as the server sent it on 2026-11-02 (account 3)."""
+    grant = {
+        "id": "free_reset_oct_2026",
+        "label": "Free limit reset",
+        "resets_total": 1,
+        "resets_left": 1,
+        "starts_at": "2026-10-21T00:45:00+00:00",
+        "ends_at": "2026-12-01T04:59:00+00:00",
+        "clears": ["seven_day", "seven_day_overage_included"],
+        "paused": False,
+        "usable_now": True,
+        "use_requires_limit": False,
+    }
+    grant.update(overrides)
+    return grant
+
+
+def _cedar(grants=(), **overrides) -> dict:
+    cedar = {
+        "eligible": bool(grants),
+        "ineligible_reason": None if grants else "no_grant",
+        "at_limit": False,
+        "exhausted": [],
+        "grants": list(grants),
+        "next_grant_id": None,
+        "weekly_resets_at": "2026-11-05T10:00:00+00:00",
+        "cooldown_until": None,
+        "event_props": None,
+    }
+    cedar.update(overrides)
+    return cedar
+
+
+def _json_response(payload: dict) -> MagicMock:
+    resp = MagicMock()
+    resp.read.return_value = json.dumps(payload).encode()
+    resp.__enter__ = lambda s: s
+    resp.__exit__ = MagicMock(return_value=False)
+    return resp
+
+
+class TestClaudeCodeVersion:
+    """The Claude Code version the resets read names in its User-Agent."""
+
+    def test_newest_version_name_in_the_versions_folder_wins_by_number(self, tmp_path):
+        for name in ("2.1.99", "2.1.316", "2.1.310", "notes.txt", "2.1.400.partial", "3.0.0-beta"):
+            (tmp_path / name).write_text("")
+        (tmp_path / "2.1.311").mkdir()  # a folder named by a version counts as well
+        ran = []
+        version = oauth.claude_code_version(tmp_path, run=lambda: ran.append(1) or "9.9.9")
+        assert version == "2.1.316"  # numeric order: 316 > 311 > 310 > 99
+        assert ran == []  # the folder answered; the CLI is never started
+
+    def test_empty_or_missing_folder_asks_the_cli(self, tmp_path):
+        (tmp_path / "README").write_text("")
+        assert oauth.claude_code_version(tmp_path, run=lambda: "2.1.400 (Claude Code)\n") == "2.1.400"
+        missing = tmp_path / "nowhere"
+        assert oauth.claude_code_version(missing, run=lambda: "2.1.401 (Claude Code)") == "2.1.401"
+
+    @pytest.mark.parametrize("answer", [None, "", "Claude Code", "v2", "2.1.316(Claude", 7])
+    def test_a_cli_without_a_usable_answer_falls_back_to_the_constant(self, tmp_path, answer):
+        assert oauth.claude_code_version(tmp_path, run=lambda: answer) == oauth.CLAUDE_CODE_VERSION_FALLBACK
+        assert oauth.CLAUDE_CODE_VERSION_FALLBACK == "2.1.316"
+
+    def test_only_the_first_word_of_the_cli_answer_is_used(self, tmp_path):
+        # Whatever else the CLI prints, a line break or a second header
+        # never reaches the User-Agent.
+        answer = "2.1.316\r\nX-Injected: 1"
+        assert oauth.claude_code_version(tmp_path, run=lambda: answer) == "2.1.316"
+
+    def test_a_cli_that_raises_falls_back_to_the_constant(self, tmp_path):
+        def boom():
+            raise OSError("no such file")
+
+        assert oauth.claude_code_version(tmp_path, run=boom) == oauth.CLAUDE_CODE_VERSION_FALLBACK
+
+    def test_a_name_that_could_break_the_header_is_never_a_version(self, tmp_path):
+        (tmp_path / "2.1.999 x").write_text("")
+        (tmp_path / "2.1.998\tX").write_text("")
+        assert oauth.claude_code_version(tmp_path, run=lambda: None) == oauth.CLAUDE_CODE_VERSION_FALLBACK
+
+    def test_run_claude_version_reads_the_binary_answer(self, tmp_path):
+        fake = tmp_path / "claude"
+        fake.write_text('#!/bin/sh\n[ "$1" = "--version" ] && echo "2.1.512 (Claude Code)"\n')
+        fake.chmod(0o755)
+        assert _REAL_RUN_CLAUDE_VERSION(str(fake)).strip() == "2.1.512 (Claude Code)"
+        assert _REAL_RUN_CLAUDE_VERSION(str(tmp_path / "absent")) is None
+
+    def test_version_discovery_handles_dangling_symlinks(self, tmp_path):
+        # The installs are files named by version (a folder counts too). A
+        # version-named link whose target is gone, or is neither a file nor
+        # a folder, is no install and is skipped.
+        versions = tmp_path / "versions"
+        versions.mkdir()
+        (versions / "2.1.400").write_text("")
+        (versions / "2.1.450").mkdir()
+        (tmp_path / "real").write_text("")
+        (versions / "2.1.500").symlink_to(tmp_path / "real")
+        (versions / "2.1.999").symlink_to(tmp_path / "gone")
+        os.mkfifo(tmp_path / "pipe")
+        (versions / "2.1.998").symlink_to(tmp_path / "pipe")
+        assert oauth.claude_code_version(versions, run=lambda: "9.9.9") == "2.1.500"
+        only_dangling = tmp_path / "only"
+        only_dangling.mkdir()
+        (only_dangling / "2.1.999").symlink_to(tmp_path / "gone")
+        assert oauth.claude_code_version(only_dangling, run=lambda: "2.1.401") == "2.1.401"
+
+    def test_version_timeout_falls_back(self, tmp_path, monkeypatch):
+        hung = tmp_path / "claude"
+        hung.write_text("#!/bin/sh\nexec sleep 30\n")
+        hung.chmod(0o755)
+        monkeypatch.setattr(oauth, "CLAUDE_VERSION_TIMEOUT_S", 0.3)
+        started = time.monotonic()
+        assert _REAL_RUN_CLAUDE_VERSION(str(hung)) is None
+        assert time.monotonic() - started < 5.0  # the hung binary is not waited out
+        version = oauth.claude_code_version(tmp_path / "none", run=lambda: _REAL_RUN_CLAUDE_VERSION(str(hung)))
+        assert version == oauth.CLAUDE_CODE_VERSION_FALLBACK
+
+    def test_version_lookup_uses_path_then_local_bin(self, tmp_path, monkeypatch):
+        def fake_claude(folder, version):
+            folder.mkdir(parents=True, exist_ok=True)
+            binary = folder / "claude"
+            binary.write_text(f'#!/bin/sh\necho "{version} (Claude Code)"\n')
+            binary.chmod(0o755)
+            return binary
+
+        on_path = fake_claude(tmp_path / "path-bin", "2.1.601")
+        home = tmp_path / "home"
+        local = fake_claude(home / ".local" / "bin", "2.1.602")
+        monkeypatch.setattr("pathlib.Path.home", lambda: home)  # the suite pins Path.home itself
+        asked = []
+        monkeypatch.setattr(oauth.shutil, "which", lambda name: asked.append(name) or str(on_path))
+        assert _REAL_RUN_CLAUDE_VERSION().split()[0] == "2.1.601"  # the PATH answer first
+        assert asked == ["claude"]
+        monkeypatch.setattr(oauth.shutil, "which", lambda name: None)
+        assert _REAL_RUN_CLAUDE_VERSION().split()[0] == "2.1.602"  # then ~/.local/bin
+        local.unlink()
+        with patch("claude_swap.oauth.subprocess.run") as run:
+            assert _REAL_RUN_CLAUDE_VERSION() is None  # neither: nothing is started
+        run.assert_not_called()
+
+    def test_user_agent_is_claude_codes_own_and_read_once(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(oauth, "claude_code_version", lambda: calls.append(1) or "2.1.316")
+        monkeypatch.setattr(oauth, "_CLAUDE_CODE_UA", None)
+        assert oauth.claude_code_user_agent() == "claude-cli/2.1.316 (external, cli)"
+        assert oauth.claude_code_user_agent() == "claude-cli/2.1.316 (external, cli)"
+        assert calls == [1]  # one discovery per process
+
+
+@pytest.mark.no_limit_resets_fake
+class TestRequestLimitResets:
+    """``request_limit_resets``: the one call that carries Claude Code's User-Agent."""
+
+    @pytest.fixture(autouse=True)
+    def _ua(self, monkeypatch):
+        monkeypatch.setattr(oauth, "claude_code_user_agent", lambda: "claude-cli/2.1.316 (external, cli)")
+
+    def _call(self, answer):
+        seen = []
+
+        def fake_urlopen(req, timeout=0):
+            seen.append((req, timeout))
+            if isinstance(answer, BaseException):
+                raise answer
+            return _json_response(answer)
+
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = oauth.request_limit_resets("tok-123")
+        return result, seen
+
+    def test_query_string_and_headers(self):
+        _result, seen = self._call({"cedar_ember": _cedar([_grant()])})
+        ((req, timeout),) = seen
+        assert req.full_url == "https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1"
+        assert req.get_method() == "GET"
+        assert req.get_header("Authorization") == "Bearer tok-123"
+        assert req.get_header("Anthropic-beta") == oauth.OAUTH_BETA_HEADER
+        assert req.get_header("User-agent") == "claude-cli/2.1.316 (external, cli)"
+        assert 0 < timeout <= 10
+
+    def test_returns_the_cedar_ember_object(self):
+        cedar = _cedar([_grant()])
+        result, _seen = self._call({"five_hour": {"utilization": 3.0}, "cedar_ember": cedar})
+        assert result == cedar
+
+    def test_no_grant_answer_is_returned(self):
+        cedar = _cedar()
+        result, _seen = self._call({"cedar_ember": cedar})
+        assert result == cedar
+
+    def test_surface_refusal_is_no_answer(self):
+        # The server did not judge this client's grants at all: nothing is known.
+        cedar = _cedar(eligible=False, ineligible_reason="surface")
+        result, _seen = self._call({"cedar_ember": cedar})
+        assert result is None
+
+    @pytest.mark.parametrize("payload", [{}, {"cedar_ember": None}, {"cedar_ember": []}, ["x"]])
+    def test_missing_or_malformed_cedar_ember_is_none(self, payload):
+        result, _seen = self._call(payload)
+        assert result is None
+
+    @pytest.mark.parametrize("error", [
+        urllib.error.HTTPError("u", 429, "Too Many", hdrs=None, fp=None),
+        urllib.error.HTTPError("u", 401, "Unauthorized", hdrs=None, fp=None),
+        urllib.error.URLError("down"),
+        TimeoutError(),
+        ValueError("bad json"),
+    ])
+    def test_any_failure_is_none_and_never_raises(self, error):
+        result, _seen = self._call(error)
+        assert result is None
+
+    def test_a_failing_user_agent_lookup_is_none_too(self, monkeypatch):
+        def boom():
+            raise RuntimeError("version lookup broke")
+
+        monkeypatch.setattr(oauth, "claude_code_user_agent", boom)
+        with patch("claude_swap.oauth.urllib.request.urlopen") as urlopen:
+            assert oauth.request_limit_resets("tok") is None
+        urlopen.assert_not_called()
+
+    def test_the_paced_usage_poll_keeps_its_own_user_agent_and_url(self):
+        seen = []
+
+        def fake_urlopen(req, timeout=0):
+            seen.append(req)
+            return _json_response({"seven_day": {"utilization": 1.0}})
+
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake_urlopen):
+            oauth.request_usage_data("tok")
+        (req,) = seen
+        assert req.full_url == "https://api.anthropic.com/api/oauth/usage"
+        assert req.get_header("User-agent") == "claude-swap/1.0"
+
+
+def _summary(cedar, at=None):
+    """What the menu reads: the answer parsed at ``_NOW``, summed up at ``at``."""
+    return oauth.summarize_limit_resets(oauth.parse_limit_resets(cedar, _NOW), _NOW if at is None else at)
+
+
+class TestParseLimitResets:
+    """``parse_limit_resets`` keeps the live grants; ``summarize_limit_resets``
+    sums them up for the menu. These pin what the menu ends up reading."""
+
+    def test_one_live_grant(self):
+        entry = _summary(_cedar([_grant()]))
+        assert entry == {
+            "left": 1,
+            "total": 1,
+            "ends_at": "2026-12-01T04:59:00+00:00",
+            "label": "Free limit reset",
+            "usable_now": True,
+            "eligible": True,
+            "paused": False,
+        }
+
+    def test_no_grant_and_surface_answers_are_none(self):
+        assert _summary(_cedar()) is None
+        assert _summary(_cedar(eligible=False, ineligible_reason="surface")) is None
+
+    @pytest.mark.parametrize("value", [None, [], "grants", 3, {"grants": "x"}, {"grants": [None, 4]}])
+    def test_non_dict_or_malformed_input_is_none(self, value):
+        assert _summary(value) is None
+
+    def test_a_grant_whose_ends_at_has_passed_is_left_out(self):
+        passed = _grant(ends_at="2026-11-02T11:59:59+00:00")
+        assert _summary(_cedar([passed])) is None
+        both = _summary(_cedar([passed, _grant(resets_left=2, resets_total=2)]))
+        assert (both["left"], both["total"]) == (2, 2)
+
+    @pytest.mark.parametrize("ends_at", [None, "", "soon", 12345, "2026-13-45T00:00:00+00:00"])
+    def test_a_grant_without_a_readable_ends_at_is_left_out(self, ends_at):
+        assert _summary(_cedar([_grant(ends_at=ends_at)])) is None
+
+    def test_a_naive_ends_at_reads_as_utc(self):
+        entry = _summary(_cedar([_grant(ends_at="2026-12-01T04:59:00")]))
+        assert entry["ends_at"] == "2026-12-01T04:59:00+00:00"
+
+    def test_a_paused_grant_is_left_out_of_the_count(self):
+        paused = _grant(id="b", label="Paused one", resets_left=2, resets_total=2, paused=True,
+                        usable_now=False, ends_at="2026-11-10T00:00:00+00:00")
+        entry = _summary(_cedar([paused, _grant()]))
+        assert (entry["left"], entry["total"], entry["paused"]) == (1, 1, False)
+        assert entry["ends_at"] == "2026-12-01T04:59:00+00:00"  # the paused grant's date is not used
+        assert entry["label"] == "Free limit reset"
+
+    def test_every_live_grant_paused_is_described_and_marked_paused(self):
+        # Nothing usable to count, but a paused reset is not a used one: the
+        # entry describes the paused grants and says so, for a dimmed pill.
+        paused = _grant(paused=True, usable_now=False)
+        entry = _summary(_cedar([paused]))
+        assert (entry["left"], entry["total"], entry["paused"], entry["usable_now"]) == (1, 1, True, False)
+
+    def test_two_grants_are_summed_with_the_soonest_end(self):
+        later = _grant(id="a", label="First listed", resets_left=1, resets_total=1,
+                       ends_at="2026-12-01T04:59:00+00:00", usable_now=False)
+        sooner = _grant(id="b", label="Second listed", resets_left=2, resets_total=3,
+                        ends_at="2026-11-20T00:00:00Z", usable_now=True)
+        entry = _summary(_cedar([later, sooner]))
+        assert (entry["left"], entry["total"]) == (3, 4)
+        assert entry["ends_at"] == "2026-11-20T00:00:00+00:00"
+        assert entry["label"] == "First listed"
+        assert entry["usable_now"] is True  # any grant usable now
+
+    def test_a_used_grant_counts_zero_left(self):
+        entry = _summary(_cedar([_grant(resets_left=0, usable_now=False)]))
+        assert (entry["left"], entry["total"], entry["usable_now"]) == (0, 1, False)
+
+    @pytest.mark.parametrize("left", [-1, 1.5, "1", True, float("nan"), 10**400, None])
+    def test_an_unreadable_count_leaves_the_grant_out(self, left):
+        assert _summary(_cedar([_grant(resets_left=left)])) is None
+
+    def test_a_missing_total_counts_what_is_left(self):
+        grant = _grant()
+        del grant["resets_total"]
+        assert _summary(_cedar([grant]))["total"] == 1
+
+    def test_flags_are_strict_booleans(self):
+        entry = _summary(_cedar([_grant(usable_now="yes", paused="no")], eligible="true"))
+        # Only a real true counts: "no" is not a pause, "yes" not usable.
+        assert (entry["usable_now"], entry["paused"], entry["eligible"]) == (False, False, False)
+
+    def test_a_label_that_is_not_text_is_none(self):
+        assert _summary(_cedar([_grant(label=7)]))["label"] is None
+
+
+class TestLimitResetsGrants:
+    """The entry keeps each live grant, so the menu sums them up at the time
+    it draws: a grant that ends between reads drops out on its own."""
+
+    def test_parse_keeps_each_live_grant(self):
+        passed = _grant(id="old", ends_at="2026-11-01T00:00:00+00:00")
+        entry = oauth.parse_limit_resets(_cedar([_grant(), passed, _grant(id="b", paused=True, resets_left=2,
+                                                                         resets_total=3, usable_now=False)]), _NOW)
+        assert entry == {
+            "grants": [
+                {"id": "free_reset_oct_2026", "label": "Free limit reset", "left": 1, "total": 1,
+                 "ends_at": "2026-12-01T04:59:00+00:00", "usable_now": True, "paused": False},
+                {"id": "b", "label": "Free limit reset", "left": 2, "total": 3,
+                 "ends_at": "2026-12-01T04:59:00+00:00", "usable_now": False, "paused": True},
+            ],
+            "eligible": True,
+        }
+
+    def test_remaining_grant_stays_visible_after_earliest_grant_expires(self):
+        spent = _grant(id="spent", resets_left=0, usable_now=False, ends_at="2026-11-02T12:00:30+00:00")
+        live = _grant(id="live", resets_left=1, ends_at="2026-12-01T04:59:00+00:00")
+        entry = oauth.parse_limit_resets(_cedar([spent, live]), _NOW)
+        later = oauth.summarize_limit_resets(entry, _NOW + 31)  # the spent grant has ended
+        assert (later["left"], later["usable_now"], later["paused"]) == (1, True, False)
+        assert later["ends_at"] == "2026-12-01T04:59:00+00:00"
+        assert oauth.summarize_limit_resets(entry, _iso_ts("2026-12-01T04:59:00+00:00")) is None  # both ended
+
+    def test_use_by_is_the_soonest_grant_that_still_has_resets(self):
+        spent = _grant(id="spent", resets_left=0, usable_now=False, ends_at="2026-11-02T12:00:30+00:00")
+        live = _grant(id="live", resets_left=1, ends_at="2026-12-01T04:59:00+00:00")
+        now = oauth.summarize_limit_resets(oauth.parse_limit_resets(_cedar([spent, live]), _NOW), _NOW)
+        assert (now["left"], now["total"]) == (1, 2)
+        assert now["ends_at"] == "2026-12-01T04:59:00+00:00"  # not the spent grant's date
+        only_spent = _summary(_cedar([spent]))
+        assert (only_spent["left"], only_spent["ends_at"]) == (0, "2026-11-02T12:00:30+00:00")
+
+    @pytest.mark.parametrize("entry", [
+        None, "x", {}, {"grants": "x"}, {"grants": [None, 3]},
+        {"left": 1, "ends_at": "2026-12-01T04:59:00+00:00", "usable_now": True},  # the older, summed shape
+        {"grants": [{"left": True, "total": 1, "ends_at": "2026-12-01T04:59:00+00:00"}]},
+        {"grants": [{"left": 1, "total": 1, "ends_at": "soon"}]},
+    ])
+    def test_a_stored_entry_that_cannot_be_read_sums_to_nothing(self, entry):
+        assert oauth.summarize_limit_resets(entry, _NOW) is None
+
+
+def _iso_ts(text):
+    return datetime.fromisoformat(text).timestamp()
+
+
+class TestLimitResetsSafetyNet:
+    """The autouse guard: no test reads limit resets for real or starts ``claude``."""
+
+    def test_the_resets_read_is_stubbed_unless_a_test_opts_out(self):
+        with patch("claude_swap.oauth.urllib.request.urlopen") as urlopen:
+            assert oauth.request_limit_resets("tok") is None
+        urlopen.assert_not_called()
+
+    def test_the_claude_cli_is_never_started(self):
+        with patch("claude_swap.oauth.subprocess.run") as run:
+            assert oauth._run_claude_version() is None
+        run.assert_not_called()
+
+
+class _Gate:
+    """An ``oauth.LimitResetsGate`` for tests: answers each step as told (an
+    exception is raised) and notes what it was asked."""
+
+    def __init__(self, reserve=True, admit=True):
+        self._reserve, self._admit, self.asked = reserve, admit, []
+
+    def reserve(self):
+        self.asked.append("reserve")
+        if isinstance(self._reserve, BaseException):
+            raise self._reserve
+        return self._reserve
+
+    def admit(self, account_uuid):
+        self.asked.append(("admit", account_uuid))
+        if isinstance(self._admit, BaseException):
+            raise self._admit
+        return self._admit
+
+
+def _profile_by_token(token):
+    """The profile probe's answer: each token is its own account."""
+    return {"uuid": f"acct-{token}", "email": "x@example.com", "organizationUuid": None}
+
+
+class TestFetchUsageWithLimitResets:
+    """``try_fetch_usage_for_account(limit_resets=gate)``: the rare read rides
+    on a successful usage read, with the token that read used."""
+
+    @pytest.fixture(autouse=True)
+    def _profiles(self, monkeypatch):
+        monkeypatch.setattr(oauth, "fetch_oauth_profile", _profile_by_token)
+
+    @staticmethod
+    def _creds(access="old-access", refresh="old-refresh", expires_in_ms=3_600_000):
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        return json.dumps({
+            "claudeAiOauth": {
+                "accessToken": access,
+                "refreshToken": refresh,
+                "expiresAt": now_ms + expires_in_ms,
+                "scopes": ["user:profile", "user:inference"],
+            },
+            "organizationUuid": "org-1",
+        })
+
+    @staticmethod
+    def _usage():
+        return {"five_hour": {"utilization": 12.0}, "seven_day": {"utilization": 34.0}}
+
+    def test_reads_resets_after_a_successful_usage_read_with_the_same_token(self, monkeypatch):
+        tokens = []
+        cedar = _cedar([_grant()])
+        monkeypatch.setattr(oauth, "request_limit_resets", lambda token: tokens.append(token) or cedar)
+        with patch("claude_swap.oauth.request_usage_data", return_value=self._usage()):
+            out = oauth.try_fetch_usage_for_account(
+                "1", "a@x.com", self._creds(), is_active=True, limit_resets=_Gate(),
+            )
+        assert out.error is None and out.usage["five_hour"]["pct"] == 12.0
+        assert out.limit_resets == oauth.LimitResetsRead(cedar, "acct-old-access", None)
+        assert tokens == ["old-access"]
+        assert "limit_resets" not in out.usage  # the store merges it, with its own clock
+
+    def test_not_asked_means_not_read(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(oauth, "request_limit_resets", lambda token: calls.append(token))
+        with patch("claude_swap.oauth.request_usage_data", return_value=self._usage()):
+            out = oauth.try_fetch_usage_for_account("1", "a@x.com", self._creds(), is_active=True)
+        assert out.limit_resets is None and calls == []
+
+    def test_a_failed_usage_read_never_reads_resets(self, monkeypatch):
+        calls, gate = [], _Gate()
+        monkeypatch.setattr(oauth, "request_limit_resets", lambda token: calls.append(token))
+        err = urllib.error.HTTPError("u", 429, "Too Many", hdrs=None, fp=None)
+        with patch("claude_swap.oauth.request_usage_data", side_effect=err):
+            out = oauth.try_fetch_usage_for_account(
+                "1", "a@x.com", self._creds(), is_active=True, limit_resets=gate,
+            )
+        assert out.error == "http-429" and out.limit_resets is None and calls == []
+        assert gate.asked == []
+
+    def test_a_usage_answer_with_no_windows_reads_no_resets(self, monkeypatch):
+        calls, gate = [], _Gate()
+        monkeypatch.setattr(oauth, "request_limit_resets", lambda token: calls.append(token))
+        with patch("claude_swap.oauth.request_usage_data", return_value={}):
+            out = oauth.try_fetch_usage_for_account(
+                "1", "a@x.com", self._creds(), is_active=True, limit_resets=gate,
+            )
+        assert (out.usage, out.error, out.limit_resets, calls, gate.asked) == (None, None, None, [], [])
+
+    def test_a_failed_resets_read_is_recorded_as_tried_and_the_usage_stands(self, monkeypatch):
+        monkeypatch.setattr(oauth, "request_limit_resets", lambda token: None)
+        with patch("claude_swap.oauth.request_usage_data", return_value=self._usage()):
+            out = oauth.try_fetch_usage_for_account(
+                "1", "a@x.com", self._creds(), is_active=True, limit_resets=_Gate(),
+            )
+        assert out.error is None and out.usage is not None
+        assert out.limit_resets == oauth.LimitResetsRead(None, "acct-old-access", None)
+
+    def test_a_resets_read_that_raises_never_fails_the_usage_read(self, monkeypatch):
+        def boom(token):
+            raise RuntimeError("broken")
+
+        monkeypatch.setattr(oauth, "request_limit_resets", boom)
+        with patch("claude_swap.oauth.request_usage_data", return_value=self._usage()):
+            out = oauth.try_fetch_usage_for_account(
+                "1", "a@x.com", self._creds(), is_active=True, limit_resets=_Gate(),
+            )
+        assert out.error is None and out.usage["seven_day"]["pct"] == 34.0
+        assert out.limit_resets == oauth.LimitResetsRead(None, "acct-old-access", None)
+
+    def test_after_a_401_refresh_the_resets_read_uses_the_new_token(self, monkeypatch):
+        tokens, probed = [], []
+        monkeypatch.setattr(oauth, "request_limit_resets", lambda token: tokens.append(token) or _cedar())
+        monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: probed.append(token) or _profile_by_token(token))
+        calls = []
+
+        def usage(token):
+            calls.append(token)
+            if len(calls) == 1:
+                raise urllib.error.HTTPError("u", 401, "Unauthorized", hdrs=None, fp=None)
+            return self._usage()
+
+        refreshed = self._creds(access="new-access", refresh="new-refresh")
+        with patch("claude_swap.oauth.request_usage_data", side_effect=usage):
+            out = oauth.try_fetch_usage_for_account(
+                "2", "b@x.com", self._creds(), is_active=False,
+                refresh_via=lambda *_: oauth.RefreshOutcome(refreshed, None),
+                limit_resets=_Gate(),
+            )
+        assert calls == ["old-access", "new-access"]
+        assert probed == tokens == ["new-access"]
+        assert out.limit_resets == oauth.LimitResetsRead(_cedar(), "acct-new-access", None)
+
+
+class TestLimitResetsGate:
+    """The resets read's gate, through ``try_fetch_usage_for_account``."""
+
+    @staticmethod
+    def _creds():
+        return json.dumps({"claudeAiOauth": {"accessToken": "tok", "scopes": ["user:inference"]}})
+
+    @pytest.mark.parametrize("reserve", [False, OSError("store unwritable")])
+    def test_a_refused_or_failing_reservation_sends_nothing(self, monkeypatch, reserve):
+        sent, probed = [], []
+        monkeypatch.setattr(oauth, "request_limit_resets", lambda token: sent.append(token))
+        monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: probed.append(token))
+        with patch("claude_swap.oauth.request_usage_data", return_value={"seven_day": {"utilization": 1.0}}):
+            out = oauth.try_fetch_usage_for_account("1", "a@x.com", self._creds(), is_active=True,
+                                                    limit_resets=_Gate(reserve=reserve))
+        assert (out.limit_resets, sent, probed, out.error) == (None, [], [], None)
+        assert out.usage["seven_day"]["pct"] == 1.0
+
+    @pytest.mark.parametrize("usage_answer", [{}, urllib.error.HTTPError("u", 429, "x", hdrs=None, fp=None)])
+    def test_the_gate_is_not_asked_when_no_read_follows(self, monkeypatch, usage_answer):
+        gate = _Gate()
+        monkeypatch.setattr(oauth, "request_limit_resets", lambda token: None)
+        kwargs = {"side_effect": usage_answer} if isinstance(usage_answer, Exception) else {"return_value": usage_answer}
+        with patch("claude_swap.oauth.request_usage_data", **kwargs):
+            oauth.try_fetch_usage_for_account("1", "a@x.com", self._creds(), is_active=True, limit_resets=gate)
+        assert gate.asked == []
+
+
+class TestReadLimitResetsFor:
+    """``read_limit_resets_for``: the resets read with a credential's own token."""
+
+    def test_reads_with_the_credentials_access_token_behind_the_gate(self, monkeypatch):
+        tokens = []
+        monkeypatch.setattr(oauth, "request_limit_resets", lambda token: tokens.append(token) or _cedar())
+        monkeypatch.setattr(oauth, "fetch_oauth_profile", _profile_by_token)
+        creds = json.dumps({"claudeAiOauth": {"accessToken": "tok-live"}})
+        assert oauth.read_limit_resets_for(creds, _Gate()) == oauth.LimitResetsRead(_cedar(), "acct-tok-live", None)
+        assert oauth.read_limit_resets_for(creds, _Gate(reserve=False)) is None
+        assert tokens == ["tok-live"]
+
+    @pytest.mark.parametrize("creds", ["", "not json", json.dumps({"claudeAiOauth": {}})])
+    def test_no_token_no_gate_no_read(self, monkeypatch, creds):
+        sent, gate = [], _Gate()
+        monkeypatch.setattr(oauth, "request_limit_resets", lambda token: sent.append(token))
+        assert oauth.read_limit_resets_for(creds, gate) is None
+        assert (gate.asked, sent) == ([], [])
+
+
+class TestLimitResetsUsableNow:
+    def test_spent_usable_grant_does_not_make_remaining_resets_usable(self):
+        spent = _grant(id="a", resets_left=0, usable_now=True)
+        waiting = _grant(id="b", resets_left=1, usable_now=False)
+        summary = _summary(_cedar([spent, waiting]))
+        assert (summary["left"], summary["usable_now"]) == (1, False)
+
+    def test_usable_needs_a_live_unpaused_grant_with_resets_left(self):
+        usable = _grant(id="u", resets_left=1, usable_now=True, ends_at="2026-11-02T12:00:30+00:00")
+        waiting = _grant(id="w", resets_left=1, usable_now=False)
+        entry = oauth.parse_limit_resets(_cedar([usable, waiting]), _NOW)
+        assert oauth.summarize_limit_resets(entry, _NOW)["usable_now"] is True
+        assert oauth.summarize_limit_resets(entry, _NOW + 31)["usable_now"] is False  # the usable one ended
+        paused = _summary(_cedar([_grant(paused=True, usable_now=True)]))
+        assert (paused["paused"], paused["usable_now"]) == (True, False)
+
+
+
+class TestLimitResetsProbeFirst:
+    """``_read_limit_resets``: reserve, probe, admit, then read, each step
+    only when the one before it allows."""
+
+    def _wire(self, monkeypatch, profile, cedar=None):
+        calls = []
+        monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: calls.append(("profile", token)) or (
+            profile(token) if callable(profile) else profile))
+        monkeypatch.setattr(oauth, "request_limit_resets", lambda token: calls.append(("resets", token)) or (
+            _cedar() if cedar is None else cedar))
+        return calls
+
+    def test_the_probe_runs_before_the_read_with_the_same_token(self, monkeypatch):
+        calls = self._wire(monkeypatch, {"uuid": "acct-9", "email": "a@x.com", "organizationUuid": "org-9"})
+        gate = _Gate()
+        read = oauth._read_limit_resets("tok-1", gate)
+        assert calls == [("profile", "tok-1"), ("resets", "tok-1")]
+        assert gate.asked == ["reserve", ("admit", "acct-9")]
+        assert read == oauth.LimitResetsRead(_cedar(), "acct-9", "org-9")
+
+    @pytest.mark.parametrize("profile", [None, {}, {"uuid": ""}])
+    def test_no_resets_request_when_the_probe_names_no_account(self, monkeypatch, profile):
+        calls = self._wire(monkeypatch, profile)
+        gate = _Gate()
+        assert oauth._read_limit_resets("tok-1", gate) == oauth.LimitResetsRead(None)
+        assert calls == [("profile", "tok-1")]
+        assert gate.asked == ["reserve"]  # nothing to admit
+
+    def test_a_probe_that_raises_sends_no_resets_request(self, monkeypatch):
+        sent = []
+        monkeypatch.setattr(oauth, "request_limit_resets", lambda token: sent.append(token))
+
+        def boom(token):
+            raise RuntimeError("broken")
+
+        monkeypatch.setattr(oauth, "fetch_oauth_profile", boom)
+        assert oauth._read_limit_resets("tok-1", _Gate()) == oauth.LimitResetsRead(None)
+        assert sent == []
+
+    @pytest.mark.parametrize("admit", [False, OSError("unwritable")])
+    def test_an_account_not_admitted_is_not_asked(self, monkeypatch, admit):
+        calls = self._wire(monkeypatch, {"uuid": "acct-9", "email": "a@x.com", "organizationUuid": "org-9"})
+        read = oauth._read_limit_resets("tok-1", _Gate(admit=admit))
+        assert calls == [("profile", "tok-1")]
+        assert read == oauth.LimitResetsRead(None, "acct-9", "org-9")
+
+    def test_a_resets_read_that_did_not_answer_keeps_the_ids(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: {"uuid": "acct-9", "email": "a", "organizationUuid": None})
+        monkeypatch.setattr(oauth, "request_limit_resets", lambda token: calls.append(token))
+        assert oauth._read_limit_resets("tok-1", _Gate()) == oauth.LimitResetsRead(None, "acct-9", None)
+        assert calls == ["tok-1"]

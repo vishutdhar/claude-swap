@@ -2262,28 +2262,31 @@ def test_settings_ignore_wrong_type_codex_alias(tmp_path: Path):
 def test_format_title_codex_segment():
     s = menubar.MenuBarSettings(show_account_name=True, title_pct="5h")
     title = menubar.format_title("loc@papaya.asia", _USAGE, s, now=_CODEX_NOW, codex=_codex())
-    assert title == "⇄ loc · 42% · Codex 56% · UR 2"
+    assert title == "⇄ loc · 42% · Codex 56%"
 
 
 def test_format_title_codex_uses_the_longest_window():
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="off")
     both = (_cu.CodexWindow("5h", 12.0, 300, _CODEX_NOW + 3600), _cu.CodexWindow("7d", 56.0, 10080, _CODEX_NOW + 86400))
-    assert menubar.format_title("a@x.com", None, s, now=_CODEX_NOW, codex=_codex(windows=both)) == "⇄ Codex 56% · UR 2"
+    assert menubar.format_title("a@x.com", None, s, now=_CODEX_NOW, codex=_codex(windows=both)) == "⇄ Codex 56%"
 
 
-def test_format_title_codex_passed_reset_drops_pct_keeps_ur():
+def test_format_title_codex_passed_reset_omits_the_segment():
+    # No current pct: no Codex segment at all, not a bare name.
+    s = menubar.MenuBarSettings(show_account_name=True, title_pct="off")
+    title = menubar.format_title("loc@x.com", None, s, now=_CODEX_NOW, codex=_codex(pct=97.0, resets_in=-30))
+    assert title == "⇄ loc"
+    bare = menubar.MenuBarSettings(show_account_name=False, title_pct="off")
+    assert menubar.format_title("a@x.com", None, bare, now=_CODEX_NOW, codex=_codex(resets_in=-30)) == "⇄"
+
+
+@pytest.mark.parametrize("credits, credits_age", [(2, 60.0), (0, 60.0), (None, 60.0), (3, 25 * 3600)])
+def test_format_title_never_shows_the_codex_usage_resets(credits, credits_age):
+    # The owner reads the count in the dropdown only: any count, known,
+    # zero, unknown or stale, leaves the title as the pct alone.
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="off")
-    title = menubar.format_title("a@x.com", None, s, now=_CODEX_NOW, codex=_codex(pct=97.0, resets_in=-30))
-    assert title == "⇄ Codex · UR 2"
-    assert "97" not in title and "0%" not in title
-
-
-def test_format_title_codex_unknown_count():
-    s = menubar.MenuBarSettings(show_account_name=False, title_pct="off")
-    stale = _codex(credits=3, credits_age=25 * 3600)
-    assert menubar.format_title("a@x.com", None, s, now=_CODEX_NOW, codex=stale) == "⇄ Codex 56% · UR ?"
-    never = _codex(credits=None)
-    assert menubar.format_title("a@x.com", None, s, now=_CODEX_NOW, codex=never) == "⇄ Codex 56% · UR ?"
+    state = _codex(credits=credits, credits_age=credits_age)
+    assert menubar.format_title("a@x.com", None, s, now=_CODEX_NOW, codex=state) == "⇄ Codex 56%"
 
 
 def test_format_title_codex_off():
@@ -2300,12 +2303,12 @@ def test_format_title_codex_off():
 def test_format_title_codex_alias():
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="off")
     title = menubar.format_title("a@x.com", None, s, now=_CODEX_NOW, codex=_codex(credits=0), codex_alias="Review")
-    assert title == "⇄ Review 56% · UR 0"
+    assert title == "⇄ Review 56%"
 
 
 def test_format_title_codex_without_an_active_account():
     s = menubar.MenuBarSettings()
-    assert menubar.format_title(None, None, s, now=_CODEX_NOW, codex=_codex()) == "⇄ Codex 56% · UR 2"
+    assert menubar.format_title(None, None, s, now=_CODEX_NOW, codex=_codex()) == "⇄ Codex 56%"
 
 
 @pytest.mark.parametrize("stored, shown", [
@@ -2323,13 +2326,13 @@ def test_long_codex_alias_bounds_status_title_width():
     alias = "review-" + "x" * 60 + "-end"
     assert menubar.codex_alias_name(alias) == alias  # the alias rule is left alone
     title = menubar.format_title("a@x.com", None, s, now=_CODEX_NOW, codex=_codex(), codex_alias=alias)
-    assert title == "⇄ review…x-end 56% · UR 2"  # 12 characters, cut in the middle
+    assert title == "⇄ review…x-end 56%"  # 12 characters, cut in the middle
     passed = menubar.format_title(
         "a@x.com", None, s, now=_CODEX_NOW, codex=_codex(resets_in=-30), codex_alias=alias
     )
-    assert passed == "⇄ review…x-end · UR 2"
+    assert passed == "⇄"  # no current pct: no segment, so no name either
     whole = menubar.format_title("a@x.com", None, s, now=_CODEX_NOW, codex=_codex(), codex_alias="a-twelve-chr")
-    assert whole == "⇄ a-twelve-chr 56% · UR 2"
+    assert whole == "⇄ a-twelve-chr 56%"
 
 
 def test_the_menu_bar_reads_rollouts_from_the_codex_home(tmp_path, monkeypatch):
@@ -2337,3 +2340,216 @@ def test_the_menu_bar_reads_rollouts_from_the_codex_home(tmp_path, monkeypatch):
     assert menubar.default_codex_monitor(tmp_path, log).sessions_dir == Path.home() / ".codex" / "sessions"
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "alt-home"))
     assert menubar.default_codex_monitor(tmp_path, log).sessions_dir == tmp_path / "alt-home" / "sessions"
+
+
+# --- limit resets on the Claude accounts (the UR tag) --------------------------------
+
+import time as _time  # noqa: E402
+
+_UR_NOW = _dt.datetime(2026, 11, 2, 12, 0, tzinfo=_dt.timezone.utc).timestamp()
+
+
+def _one_grant(left=1, ends_at="2026-11-20T12:00:00+00:00", usable=True, paused=False, id="g"):
+    return {
+        "id": id, "label": "Free limit reset", "left": left,
+        "total": left if type(left) is int and left > 1 else 1, "ends_at": ends_at,
+        "usable_now": usable, "paused": paused,
+    }
+
+
+def _resets(*grants, **kwargs):
+    """The stored entry: each live grant, as the usage store keeps it."""
+    return {"grants": list(grants) or [_one_grant(**kwargs)], "eligible": True, "fetched_at": _UR_NOW - 60}
+
+
+def _with_resets(usage=None, **kwargs):
+    return {**(_USAGE if usage is None else usage), "limit_resets": _resets(**kwargs)}
+
+
+@pytest.fixture
+def new_york(monkeypatch):
+    """Local time in New York, as on the owner's Mac, for the spoken date."""
+    monkeypatch.setenv("TZ", "America/New_York")
+    _time.tzset()
+    yield
+    monkeypatch.undo()
+    _time.tzset()
+
+
+@pytest.mark.parametrize("kwargs, badge", [
+    ({}, ("UR 1", "ok")),
+    ({"left": 2}, ("UR 2", "ok")),
+    ({"left": 0, "usable": False}, ("UR 0", "over")),  # used: red, like the Codex zero
+    ({"usable": False}, ("UR 1", "unknown")),  # held but not usable right now: dimmed
+    ({"paused": True, "usable": False}, ("UR 1", "unknown")),
+    ({"left": 0, "paused": True}, ("UR 0", "unknown")),  # a paused reset is not a used one
+])
+def test_limit_resets_badge_states(kwargs, badge):
+    assert menubar.limit_resets_badge(_with_resets(**kwargs), _UR_NOW) == badge
+
+
+@pytest.mark.parametrize("usage", [
+    None, "token expired", {}, _USAGE,
+    {**_USAGE, "limit_resets": None},
+    {**_USAGE, "limit_resets": "UR 1"},
+    {**_USAGE, "limit_resets": {"fetched_at": 1.0}},  # no grant reading at all
+])
+def test_no_badge_without_a_grant(usage):
+    assert menubar.limit_resets_badge(usage, _UR_NOW) is None
+    assert menubar.limit_resets_spoken(usage, _UR_NOW) is None
+
+
+@pytest.mark.parametrize("left", [True, -1, 1.5, "1", None, 10**7])
+def test_no_badge_for_an_unreadable_count(left):
+    assert menubar.limit_resets_badge(_with_resets(left=left), _UR_NOW) is None
+
+
+@pytest.mark.parametrize("ends_at", [None, "", "soon", 5, "2026-11-02T11:59:59+00:00", "2026-11-02T12:00:00+00:00"])
+def test_no_badge_once_the_grant_has_ended_or_cannot_be_dated(ends_at):
+    assert menubar.limit_resets_badge(_with_resets(ends_at=ends_at), _UR_NOW) is None
+
+
+def test_remaining_grant_stays_visible_after_earliest_grant_expires(new_york):
+    # A spent grant that ends in 30 seconds and a live one until December:
+    # once the first has ended the pill, the text and VoiceOver still show
+    # the second, without waiting for the next read.
+    spent = _one_grant(left=0, usable=False, ends_at="2026-11-02T12:00:30+00:00", id="spent")
+    live = _one_grant(left=1, ends_at="2026-12-01T04:59:00+00:00", id="live")
+    usage = {**_USAGE, "limit_resets": _resets(spent, live)}
+    for at in (_UR_NOW, _UR_NOW + 31):
+        assert menubar.limit_resets_badge(usage, at) == ("UR 1", "ok")
+        assert menubar.limit_resets_spoken(usage, at) == "1 limit reset, use by Nov 30"
+    assert menubar.format_account_label(2, "a@x.com", usage, _UR_NOW + 31).endswith("$ 30% · UR 1")
+    december = _dt.datetime(2026, 12, 1, 4, 59, tzinfo=_dt.timezone.utc).timestamp()
+    assert menubar.limit_resets_badge(usage, december) is None  # both ended
+
+
+def test_spent_usable_grant_does_not_make_remaining_resets_usable(new_york):
+    spent = _one_grant(left=0, usable=True, id="a")
+    waiting = _one_grant(left=1, usable=False, id="b", ends_at="2026-11-25T12:00:00+00:00")
+    usage = {**_USAGE, "limit_resets": _resets(spent, waiting)}
+    assert menubar.limit_resets_badge(usage, _UR_NOW) == ("UR 1", "unknown")  # dimmed
+    assert menubar.limit_resets_spoken(usage, _UR_NOW) == "1 limit reset, not usable now, use by Nov 25"
+
+
+def test_badge_while_the_grant_is_still_live():
+    usage = _with_resets(ends_at="2026-11-02T12:00:01+00:00")
+    assert menubar.limit_resets_badge(usage, _UR_NOW) == ("UR 1", "ok")
+
+
+def test_limit_resets_spoken_says_the_local_use_by_date(new_york):
+    # The grant the server reported on 2026-11-02: ends 04:59 UTC on Dec 1,
+    # which is 11:59 PM on Nov 30 in New York (claude.ai: "Expires Nov 30").
+    usage = _with_resets(ends_at="2026-12-01T04:59:00+00:00")
+    assert menubar.limit_resets_spoken(usage, _UR_NOW) == "1 limit reset, use by Nov 30"
+
+
+@pytest.mark.parametrize("kwargs, spoken", [
+    ({"left": 2}, "2 limit resets, use by Nov 20"),
+    ({"left": 0, "usable": False}, "no limit resets left"),
+    ({"usable": False}, "1 limit reset, not usable now, use by Nov 20"),
+    ({"paused": True, "usable": False}, "1 limit reset, paused, use by Nov 20"),
+])
+def test_limit_resets_spoken_states(new_york, kwargs, spoken):
+    assert menubar.limit_resets_spoken(_with_resets(**kwargs), _UR_NOW) == spoken
+
+
+def test_format_account_label_appends_the_resets_after_the_windows():
+    label = menubar.format_account_label(2, "loc@papaya.asia", _with_resets(), _UR_NOW)
+    assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30% · UR 1"
+    zero = menubar.format_account_label(2, "loc@papaya.asia", _with_resets(left=0), _UR_NOW)
+    assert zero.endswith("$ 30% · UR 0")
+
+
+def test_format_account_label_without_a_grant_is_unchanged():
+    assert menubar.format_account_label(2, "loc@papaya.asia", _USAGE, _UR_NOW) == (
+        "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30%"
+    )
+
+
+@pytest.mark.parametrize("left", [1, 0])
+def test_format_title_never_shows_an_accounts_limit_resets(left):
+    # The owner reads the pill in the dropdown only; the title keeps the pcts.
+    s = menubar.MenuBarSettings(show_account_name=True, title_pct="both", title_scoped=True)
+    usage = {**_with_resets(left=left), "scoped": [{"name": "Fable", "pct": 55.0}]}
+    assert menubar.format_title("loc@papaya.asia", usage, s, now=_UR_NOW) == "⇄ loc · 42% · 18% · Fable 55%"
+    codex = _cu.CodexState(
+        True,
+        _cu.CodexReading((_cu.CodexWindow("7d", 56.0, 10080, _UR_NOW + 86400),), "pro", _UR_NOW - 9, "rollout"),
+        2, _UR_NOW - 60, None,
+    )
+    five = menubar.MenuBarSettings(show_account_name=True, title_pct="5h")
+    title = menubar.format_title("loc@papaya.asia", _with_resets(left=left), five, now=_UR_NOW, codex=codex)
+    assert title == "⇄ loc · 42% · Codex 56%"
+
+
+def test_there_is_no_limit_resets_title_setting():
+    import dataclasses
+
+    assert "title_resets" not in {f.name for f in dataclasses.fields(menubar.MenuBarSettings)}
+
+
+def test_a_settings_file_written_with_title_resets_still_loads(tmp_path: Path):
+    # A build that had the setting wrote it to the file; it is now an
+    # unknown key, ignored, and the next save leaves it out.
+    path = tmp_path / "menubar_settings.json"
+    path.write_text(
+        json.dumps({"title_resets": False, "title_codex": False, "title_pct": "5h"}), encoding="utf-8"
+    )
+    loaded = menubar.MenuBarSettings.load(path)
+    assert (loaded.title_codex, loaded.title_pct) == (False, "5h")
+    assert not hasattr(loaded, "title_resets")
+    loaded.save(path)
+    assert "title_resets" not in json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_format_usage_log_gains_the_resets():
+    usage = {
+        "five_hour": {"pct": 35.0, "clock": "06:59"},
+        "seven_day": {"pct": 55.0, "clock": "Jul 3"},
+        "limit_resets": _resets(),
+    }
+    assert menubar.format_usage_log("a@x.com", usage, _UR_NOW) == (
+        "usage a@x.com: 5h 35% (resets 06:59) · 7d 55% (resets Jul 3) · UR 1"
+    )
+    assert menubar.format_usage_log("a@x.com", {"limit_resets": _resets()}, _UR_NOW) is None  # no window
+
+
+def _attested_resets(account_uuid="uuid-1", org_uuid=""):
+    return {**_resets(), "account_uuid": account_uuid, "org_uuid": org_uuid}
+
+
+def _acct_with_ids(entry, account_uuid="uuid-1", org_uuid="", active=True, number="1"):
+    acct = _FakeAcct(number, "a@x.com", active, entry)
+    acct.account_uuid, acct.account_org_uuid = account_uuid, org_uuid
+    return acct
+
+
+def test_adapt_snapshot_hands_the_resets_entry_to_the_menu():
+    lg = {"seven_day": {"pct": 20.0}, "limit_resets": _attested_resets()}
+    accts = [_acct_with_ids(_FakeEntry(last_good=lg, fetched_at=123.0))]
+    snap = menubar._adapt_snapshot(_FakeSnap(accts))
+    (entry,) = snap["accounts"]
+    assert entry[3]["limit_resets"] == lg["limit_resets"]  # the display usage the rows read
+    assert entry[4]["limit_resets"] == lg["limit_resets"]  # the last good the log reads
+    assert snap["active_usage"]["limit_resets"] == lg["limit_resets"]  # and the title
+
+
+@pytest.mark.parametrize("stored, slot", [
+    (("uuid-1", ""), ("uuid-9", "")),  # the slot now holds another account
+    (("uuid-1", "org-1"), ("uuid-1", "org-2")),  # same account, another organization
+    (("uuid-1", ""), ("", "")),  # the slot has no stored uuid (a token-only account)
+    ((None, None), ("uuid-1", "")),  # an entry with no attested ids at all
+])
+def test_display_hides_entry_whose_attested_ids_differ_from_slot(stored, slot):
+    entry = _resets()
+    if stored != (None, None):
+        entry = {**entry, "account_uuid": stored[0], "org_uuid": stored[1]}
+    lg = {"seven_day": {"pct": 20.0}, "limit_resets": entry}
+    snap = menubar._adapt_snapshot(_FakeSnap([_acct_with_ids(_FakeEntry(last_good=lg), *slot)]))
+    (row,) = snap["accounts"]
+    for usage in (row[3], row[4], snap["active_usage"]):
+        assert "limit_resets" not in usage
+        assert usage["seven_day"] == {"pct": 20.0}  # the windows stay
+    assert "limit_resets" in lg  # the stored entry itself is left alone
+    assert menubar.format_account_label("1", "a@x.com", row[3], _UR_NOW).endswith("7d 20%")

@@ -574,6 +574,29 @@ def block_real_oauth_profile_fetch(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def block_real_limit_resets_read(request, monkeypatch):
+    """Safety net: no test may make a live limit-resets read or start ``claude``.
+
+    Every usage fetch that is due for its rare limit-resets read calls
+    ``oauth.request_limit_resets``, so any test driving the real fetch path
+    would open an HTTPS connection with Claude Code's User-Agent. It answers
+    None here (a failed read, which keeps whatever was stored). Tests of
+    the read itself opt out with ``@pytest.mark.no_limit_resets_fake`` and
+    mock ``urlopen`` beneath it. The version lookup's ``claude --version``
+    is never run by any test (the throwaway home has no versions folder,
+    so the lookup would reach the real binary on the PATH), and the
+    once-per-process User-Agent is forgotten so no test inherits another's.
+    """
+    monkeypatch.setattr("claude_swap.oauth._run_claude_version", lambda *a, **k: None)
+    monkeypatch.setattr("claude_swap.oauth._CLAUDE_CODE_UA", None)
+    if request.node.get_closest_marker("no_limit_resets_fake"):
+        yield
+        return
+    monkeypatch.setattr("claude_swap.oauth.request_limit_resets", lambda token: None)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _no_real_codex(monkeypatch):
     """Safety net: no test may find or start the real ``codex`` CLI.
 

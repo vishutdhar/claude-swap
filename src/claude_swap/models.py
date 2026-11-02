@@ -181,6 +181,13 @@ class AccountSnapshot:
     usage: UsageEntry
     alias: str = ""
     disabled: bool = False  # held out of auto-rotation (still a valid explicit target)
+    # The slot's stored account uuid and organization, taken together from
+    # one read of the roster after the collection ("" for a token-only
+    # account): what a limit-resets entry's attested ids must name. Kept
+    # apart from ``org_uuid``, which is the identity the usage was collected
+    # under.
+    account_uuid: str = ""
+    account_org_uuid: str = ""
 
     @property
     def display_tag(self) -> str:

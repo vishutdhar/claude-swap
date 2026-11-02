@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import time
+import urllib.error
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
@@ -1963,7 +1964,7 @@ class TestListFresh:
         with live, backup, patch.object(
             s,
             "_fetch_account_usage",
-            side_effect=lambda info: FetchRecord(usage=self.NEW[str(info[0])]),
+            side_effect=lambda info, **_: FetchRecord(usage=self.NEW[str(info[0])]),
         ) as fetch:
             payload = s.list_accounts(json_output=True, **kwargs)
         fetched = sorted(str(c.args[0][0]) for c in fetch.call_args_list)
@@ -2050,7 +2051,7 @@ class TestListFresh:
         live, backup = self._creds()
         with live, backup, patch.object(
             s, "_fetch_account_usage",
-            side_effect=lambda info: outcomes[str(info[0])],
+            side_effect=lambda info, **_: outcomes[str(info[0])],
         ):
             payload = s.list_accounts(json_output=True, fresh=True)
         after = s._usage_store.entries(self.IDENT)
@@ -2158,7 +2159,7 @@ class TestListFresh:
         with live, backup, patch.object(
             s,
             "_fetch_account_usage",
-            side_effect=lambda info: FetchRecord(usage=self.NEW[str(info[0])]),
+            side_effect=lambda info, **_: FetchRecord(usage=self.NEW[str(info[0])]),
         ) as fetch:
             entries = s._collect_usage_entries(s._build_accounts_info(), fresh=True)
         assert [str(c.args[0][0]) for c in fetch.call_args_list] == ["1"]
@@ -2302,7 +2303,7 @@ class TestActiveAccountRefresh:
             locks_held_during_post["config"] = config_lock_dir().is_dir()
             return oauth.RefreshOutcome(self._REFRESHED, None)
 
-        def mock_fetch(account_num, email, credentials, is_active):
+        def mock_fetch(account_num, email, credentials, is_active, **_):
             from claude_swap.claude_locks import config_lock_dir
             assert is_active is True
             assert credentials == self._REFRESHED  # rotated token used for usage
@@ -2372,7 +2373,7 @@ class TestActiveAccountRefresh:
             }
         })
 
-        def mock_fetch(account_num, email, credentials, is_active):
+        def mock_fetch(account_num, email, credentials, is_active, **_):
             assert credentials == cc_rotated
             return oauth.UsageOutcome({"five_hour": {"pct": 7}})
 
@@ -2703,7 +2704,7 @@ class TestActiveAccountRefresh:
         })
         fetch_calls = []
 
-        def mock_fetch(account_num, email, credentials, is_active):
+        def mock_fetch(account_num, email, credentials, is_active, **_):
             fetch_calls.append(credentials)
             if credentials == valid_but_revoked:
                 return oauth.UsageOutcome(None, error="http-401")
@@ -8258,7 +8259,7 @@ class TestActiveRefreshProvenance:
             "expiresAt": 9_999_999_999_000,
         }})
 
-        def mock_fetch(account_num, email, credentials, is_active):
+        def mock_fetch(account_num, email, credentials, is_active, **_):
             assert is_active is True
             assert credentials == refreshed  # rotated under the locks
             return oauth.UsageOutcome({"five_hour": {"pct": 10}})
@@ -12878,3 +12879,1195 @@ class TestSessionShellGuardCoversEveryMutator:
         s = self._switcher(sample_sequence_data, monkeypatch)
         with pytest.raises(SwitchError):
             s.unset_alias("2")
+
+
+def _resets_stamps(s) -> dict:
+    """The per-account limit-resets try stamps in a switcher's usage cache."""
+    return s._usage_store.attempts.read()
+
+
+def _profiles(owners):
+    """A stand-in for ``oauth.fetch_oauth_profile`` answering by token."""
+    def fetch(token):
+        uuid = owners.get(token)
+        return {"uuid": uuid, "email": "x@example.com", "organizationUuid": None} if uuid else None
+    return fetch
+
+
+def _age_resets_stamps(s, seconds) -> None:
+    """Move every account's resets try stamp ``seconds`` into the past."""
+    attempts = s._usage_store.attempts
+    stamps = attempts.read()
+    if stamps:
+        attempts.path.write_text(json.dumps({"attempts": {u: t - seconds for u, t in stamps.items()}}))
+
+
+class TestLimitResetsInTheFetchPass:
+    """The rare limit-resets read rides on the per-account usage fetch:
+    asked for only when a slot's last try is an hour old (ten minutes for
+    Refresh now / ``list --fresh``), and never touching the paced poll."""
+
+    IDENT = {
+        "1": ("test@example.com", ""),
+        "2": ("account2@example.com", ""),
+    }
+    USAGE = {"five_hour": {"pct": 11.0}, "seven_day": {"pct": 21.0}}
+    GRANT = {
+        "eligible": True, "ineligible_reason": None, "at_limit": False, "exhausted": [],
+        "grants": [{
+            "id": "free_reset_oct_2026", "label": "Free limit reset",
+            "resets_total": 1, "resets_left": 1,
+            "starts_at": "2026-10-21T00:45:00+00:00", "ends_at": "2099-12-01T04:59:00+00:00",
+            "paused": False, "usable_now": True, "use_requires_limit": False,
+        }],
+        "next_grant_id": None, "weekly_resets_at": None, "cooldown_until": None,
+    }
+    NO_GRANT = {"eligible": False, "ineligible_reason": "no_grant", "grants": []}
+
+    def _switcher(self, sample_sequence_data):
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        return s
+
+    LIVE = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+    BACKUP = json.dumps({"claudeAiOauth": {"accessToken": "sk-backup"}})
+
+    def _creds(self):
+        return (
+            patch.object(
+                ClaudeAccountSwitcher, "_read_active_credentials",
+                return_value=ActiveCredentials(self.LIVE, False),
+            ),
+            patch.object(ClaudeAccountSwitcher, "_read_account_credentials", return_value=self.BACKUP),
+        )
+
+    def _pass(self, s, fake, **kwargs):
+        live, backup = self._creds()
+        with live, backup, patch.object(s, "_fetch_account_usage", side_effect=fake):
+            return s._collect_usage_entries(s._build_accounts_info(), **kwargs)
+
+    def _age(self, s, seconds, *, poll_due=False):
+        """Move every stored time ``seconds`` into the past; with
+        ``poll_due`` also make every row stale and due for a plain pass."""
+        _age_resets_stamps(s, seconds)
+        table = json.loads(s._usage_store.path.read_text())
+        for row in table["accounts"].values():
+            for key in ("fetchedAt", "lastAttemptAt"):
+                if isinstance(row.get(key), (int, float)):
+                    row[key] -= seconds
+            if isinstance(row.get("lastGood"), dict) and "limit_resets" in row["lastGood"]:
+                row["lastGood"]["limit_resets"]["fetched_at"] -= seconds
+            if poll_due:
+                row["nextPollAt"] = None
+        s._usage_store.path.write_text(json.dumps(table))
+
+    def _fake(self, calls, grant_for=("2",)):
+        """A fetch that asks the resets gate as the real one does, right
+        before it would send the read, and notes whether it was let through."""
+        def fake(info, limit_resets=None):
+            num = str(info[0])
+            # As the real read does: reserve, then admit the account the
+            # probe names (the slot's own here).
+            allowed = bool(
+                limit_resets is not None
+                and limit_resets.reserve()
+                and limit_resets.admit(f"uuid-{num}")
+            )
+            calls.append((num, allowed))
+            read = None
+            if allowed:
+                # Attested as the slot's own account, as the profile probe
+                # answers for the slot's own token (sample data: uuid-<n>).
+                read = oauth.LimitResetsRead(
+                    self.GRANT if num in grant_for else self.NO_GRANT, f"uuid-{num}", None,
+                )
+            return FetchRecord(usage=dict(self.USAGE), limit_resets=read)
+        return fake
+
+    def test_first_pass_asks_every_fetched_slot_then_paces_hourly(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        s = self._switcher(sample_sequence_data)
+        calls = []
+        entries = self._pass(s, self._fake(calls))
+        assert sorted(calls) == [("1", True), ("2", True)]
+        assert entries["2"].last_good["limit_resets"]["grants"][0]["left"] == 1
+        assert "limit_resets" not in entries["1"].last_good  # no grant, no key
+
+        # A plain pass that fetches usage again half an hour later: no resets read.
+        self._age(s, 1800, poll_due=True)
+        calls.clear()
+        entries = self._pass(s, self._fake(calls))
+        assert sorted(calls) == [("1", False), ("2", False)]
+        assert entries["2"].last_good["limit_resets"]["grants"][0]["left"] == 1  # carried with the new windows
+
+        # An hour after the last try, the next usage fetch asks again.
+        self._age(s, 1800, poll_due=True)
+        calls.clear()
+        self._pass(s, self._fake(calls))
+        assert sorted(calls) == [("1", True), ("2", True)]
+
+    def test_refresh_now_asks_again_after_ten_minutes_not_sooner(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        s = self._switcher(sample_sequence_data)
+        calls = []
+        self._pass(s, self._fake(calls))
+        self._age(s, 599)
+        calls.clear()
+        self._pass(s, self._fake(calls), fresh=True)
+        assert sorted(calls) == [("1", False), ("2", False)]  # re-measured, resets not asked
+        self._age(s, 1)
+        calls.clear()
+        self._pass(s, self._fake(calls), fresh=True)
+        assert sorted(calls) == [("1", True), ("2", True)]
+
+    def test_a_slot_not_fetched_this_pass_is_never_asked(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        s = self._switcher(sample_sequence_data)
+        calls = []
+        self._pass(s, self._fake(calls), fetch={"2"})
+        assert calls == [("2", True)]
+
+    @pytest.mark.no_limit_resets_fake
+    @pytest.mark.no_oauth_profile_fake
+    def test_the_paced_poll_is_unchanged_and_the_resets_read_is_its_own_request(
+        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch
+    ):
+        monkeypatch.setattr(oauth, "claude_code_user_agent", lambda: "claude-cli/2.1.316 (external, cli)")
+        s = self._switcher(sample_sequence_data)
+        seen = []
+        profile_url = "https://api.anthropic.com/api/oauth/profile"
+        owners = {"Bearer sk-active": "uuid-1", "Bearer sk-backup": "uuid-2"}
+
+        def fake_urlopen(req, timeout=0):
+            token = req.get_header("Authorization")
+            seen.append((req.full_url, req.get_header("User-agent"), token))
+            if req.full_url == oauth.LIMIT_RESETS_URL:
+                cedar = self.GRANT if token == "Bearer sk-backup" else self.NO_GRANT
+                body = {"five_hour": {"utilization": 99.0}, "cedar_ember": cedar}
+            elif req.full_url == profile_url:
+                body = {"account": {"uuid": owners[token], "email": "x@example.com"}}
+            else:
+                body = {"five_hour": {"utilization": 11.0}, "seven_day": {"utilization": 21.0}}
+            resp = MagicMock()
+            resp.read.return_value = json.dumps(body).encode()
+            resp.__enter__ = lambda r: r
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        # Slot 1's backup holds the live lineage: no ownership probe runs,
+        # so every profile request below is a resets attestation.
+        with patch.object(
+            ClaudeAccountSwitcher, "_read_active_credentials",
+            return_value=ActiveCredentials(self.LIVE, False),
+        ), patch.object(
+            ClaudeAccountSwitcher, "_read_account_credentials",
+            side_effect=lambda num, email: self.LIVE if str(num) == "1" else self.BACKUP,
+        ), patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake_urlopen):
+            entries = s._collect_usage_entries(s._build_accounts_info())
+            polls = [x for x in seen if x[0] == "https://api.anthropic.com/api/oauth/usage"]
+            resets = [x for x in seen if x[0] == oauth.LIMIT_RESETS_URL]
+            profiles = [x for x in seen if x[0] == profile_url]
+            assert sorted(polls) == [
+                ("https://api.anthropic.com/api/oauth/usage", "claude-swap/1.0", "Bearer sk-active"),
+                ("https://api.anthropic.com/api/oauth/usage", "claude-swap/1.0", "Bearer sk-backup"),
+            ]
+            assert sorted(resets) == [
+                (oauth.LIMIT_RESETS_URL, "claude-cli/2.1.316 (external, cli)", "Bearer sk-active"),
+                (oauth.LIMIT_RESETS_URL, "claude-cli/2.1.316 (external, cli)", "Bearer sk-backup"),
+            ]
+            # Each answer is attested with the token that asked for it.
+            assert sorted(t for _u, _a, t in profiles) == sorted(t for _u, _a, t in resets)
+            assert len(seen) == 6
+            # The windows come from the paced poll only, never from the resets answer.
+            assert entries["2"].last_good["five_hour"]["pct"] == 11.0
+            assert entries["2"].last_good["limit_resets"]["grants"][0]["left"] == 1
+            assert "limit_resets" not in entries["1"].last_good
+
+            # Re-measured at once (list --fresh): two polls, no resets read.
+            seen.clear()
+            s._collect_usage_entries(s._build_accounts_info(), fresh=True)
+            assert [x[0] for x in seen] == ["https://api.anthropic.com/api/oauth/usage"] * 2
+
+    @pytest.mark.no_limit_resets_fake
+    def test_a_failing_resets_read_leaves_the_usage_read_good(
+        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch
+    ):
+        monkeypatch.setattr(oauth, "claude_code_user_agent", lambda: "claude-cli/2.1.316 (external, cli)")
+        s = self._switcher(sample_sequence_data)
+
+        def fake_urlopen(req, timeout=0):
+            if req.full_url == oauth.LIMIT_RESETS_URL:
+                raise urllib.error.HTTPError(req.full_url, 429, "Too Many", hdrs=None, fp=None)
+            resp = MagicMock()
+            resp.read.return_value = json.dumps({"seven_day": {"utilization": 21.0}}).encode()
+            resp.__enter__ = lambda r: r
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        live, backup = self._creds()
+        with live, backup, patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake_urlopen):
+            entries = s._collect_usage_entries(s._build_accounts_info())
+        for num in ("1", "2"):
+            assert entries[num].last_error is None and entries[num].consecutive_failures == 0
+            assert entries[num].last_good == {"seven_day": {"pct": 21.0}}
+        # The failed try still paces the next one.
+        assert s._usage_store.limit_resets_due({"1": "uuid-1", "2": "uuid-2"}, 3600.0) == set()
+
+
+class TestLimitResetsPacingSurvivesADiscardedRead:
+    """A resets read that was sent paces the next one even when its record
+    is thrown away: the try is stamped before the request, not after."""
+
+    def _switcher(self, sample_sequence_data):
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        return s
+
+    @pytest.mark.no_limit_resets_fake
+    @pytest.mark.parametrize("verdict", ["known before the pass", "found by this pass's probe"])
+    def test_known_foreign_credential_never_reserves_or_reads_resets(
+        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch, verdict
+    ):
+        monkeypatch.setattr(oauth, "claude_code_user_agent", lambda: "claude-cli/2.1.316 (external, cli)")
+        monkeypatch.setattr(oauth, "fetch_oauth_profile", _profiles({"sk-backup": "uuid-2", "sk-foreign": "uuid-F"}))
+        s = self._switcher(sample_sequence_data)
+        live = json.dumps({"claudeAiOauth": {"accessToken": "sk-foreign"}})
+        key = s._lineage_key("1", "test@example.com", oauth.credential_fingerprint(live))
+        if verdict == "known before the pass":
+            s._probe_verdicts[key] = False
+        else:
+            # The ownership probe after the usage read condemns it.
+            monkeypatch.setattr(
+                s, "_resync_rotated_backup",
+                lambda *_a, **_k: s._probe_verdicts.__setitem__(key, False),
+            )
+        resets_sent = []
+
+        def fake_urlopen(req, timeout=0):
+            if req.full_url == oauth.LIMIT_RESETS_URL:
+                resets_sent.append(req.get_header("Authorization"))
+                body = {"cedar_ember": TestLimitResetsInTheFetchPass.NO_GRANT}
+            else:
+                body = {"seven_day": {"utilization": 21.0}}
+            resp = MagicMock()
+            resp.read.return_value = json.dumps(body).encode()
+            resp.__enter__ = lambda r: r
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        with patch.object(
+            ClaudeAccountSwitcher, "_read_active_credentials",
+            return_value=ActiveCredentials(live, False),
+        ), patch.object(
+            ClaudeAccountSwitcher, "_read_account_credentials",
+            return_value=json.dumps({"claudeAiOauth": {"accessToken": "sk-backup"}}),
+        ), patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake_urlopen):
+            for fresh in (False, True, True):
+                entries = s._collect_usage_entries(s._build_accounts_info(), fresh=fresh)
+                assert entries["1"].sentinel == USAGE_FOREIGN_CREDENTIAL
+        # Someone else's token never carries a resets read, and the slot is
+        # not stamped: once its own credential is back, it is read at once.
+        assert "Bearer sk-foreign" not in resets_sent
+        assert resets_sent == ["Bearer sk-backup"]
+        assert "uuid-1" not in _resets_stamps(s)  # the slot's account is not stamped
+
+
+class TestLimitResetsAuthFailuresStayIsolated:
+    """A 401 or 403 from the resets read is about that read only: it never
+    refreshes a token, strikes a slot or backs the usage poll off."""
+
+    def _switcher(self, sample_sequence_data):
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        return s
+
+    @pytest.mark.no_limit_resets_fake
+    @pytest.mark.parametrize("status", [401, 403])
+    def test_resets_401_403_never_refresh_quarantine_or_backoff(
+        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch, status
+    ):
+        monkeypatch.setattr(oauth, "claude_code_user_agent", lambda: "claude-cli/2.1.316 (external, cli)")
+        monkeypatch.setattr(oauth, "fetch_oauth_profile", _profiles({"sk-active": "uuid-1", "sk-backup": "uuid-2"}))
+        s = self._switcher(sample_sequence_data)
+        future = int(time.time() * 1000) + 3_600_000
+        # Both credentials could be refreshed: a 401 on a usage read would.
+        live = json.dumps({"claudeAiOauth": {"accessToken": "sk-active", "refreshToken": "rt-a", "expiresAt": future}})
+        backup = json.dumps({"claudeAiOauth": {"accessToken": "sk-backup", "refreshToken": "rt-b", "expiresAt": future}})
+        urls, consumed = [], []
+
+        def fake_urlopen(req, timeout=0):
+            urls.append(req.full_url)
+            if req.full_url == oauth.LIMIT_RESETS_URL:
+                raise urllib.error.HTTPError(req.full_url, status, "refused", hdrs=None, fp=None)
+            if "oauth/usage" not in req.full_url:
+                raise AssertionError(f"unexpected request {req.full_url}")
+            resp = MagicMock()
+            resp.read.return_value = json.dumps({"seven_day": {"utilization": 21.0}}).encode()
+            resp.__enter__ = lambda r: r
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        def consume(*args, **kwargs):
+            consumed.append(args)
+            return oauth.RefreshOutcome(None, "transient")
+
+        with patch.object(
+            ClaudeAccountSwitcher, "_read_active_credentials", return_value=ActiveCredentials(live, False),
+        ), patch.object(
+            # Slot 1's backup holds the live lineage: no ownership probe.
+            ClaudeAccountSwitcher, "_read_account_credentials",
+            side_effect=lambda num, email: live if str(num) == "1" else backup,
+        ), patch.object(
+            ClaudeAccountSwitcher, "consume_backup_grant", side_effect=consume,
+        ), patch.object(
+            ClaudeAccountSwitcher, "_write_credentials",
+        ) as write_live, patch.object(
+            ClaudeAccountSwitcher, "_write_account_credentials",
+        ) as write_backup, patch(
+            "claude_swap.oauth.try_refresh_oauth_credentials",
+            side_effect=AssertionError("a resets refusal must never refresh"),
+        ), patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake_urlopen):
+            entries = s._collect_usage_entries(s._build_accounts_info())
+
+        assert urls.count(oauth.LIMIT_RESETS_URL) == 2  # one read per slot, refused
+        assert not any("oauth/token" in u for u in urls)
+        assert consumed == []
+        write_live.assert_not_called()
+        write_backup.assert_not_called()
+        for num in ("1", "2"):
+            entry = entries[num]
+            assert entry.sentinel is None
+            assert (entry.last_error, entry.consecutive_failures, entry.backoff_until) == (None, 0, None)
+            assert entry.auth_dead_strikes == 0 and entry.struck_fingerprint is None
+            assert entry.last_good == {"seven_day": {"pct": 21.0}}
+
+
+class TestActivePathResets:
+    """The active account's resets read, made after its usage read and the
+    ownership verdict: never without a good usage read, never once the
+    pass has lost the slot's lease."""
+
+    IDENT1 = {"1": ("test@example.com", "")}
+
+    def _switcher(self, sample_sequence_data):
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        return s
+
+    def _run(self, s, usage_answer, extra=()):
+        sent = []
+        profiles = patch.object(oauth, "fetch_oauth_profile", _profiles({"sk-active": "uuid-1", "sk-backup": "uuid-2"}))
+        extra = (profiles, *extra)
+
+        def fake_urlopen(req, timeout=0):
+            token = req.get_header("Authorization")
+            if req.full_url == oauth.LIMIT_RESETS_URL:
+                sent.append(token)
+                body = {"cedar_ember": TestLimitResetsInTheFetchPass.GRANT}
+            elif token == "Bearer sk-active" and isinstance(usage_answer, Exception):
+                raise usage_answer
+            else:
+                body = usage_answer if token == "Bearer sk-active" else {"seven_day": {"utilization": 21.0}}
+            resp = MagicMock()
+            resp.read.return_value = json.dumps(body).encode()
+            resp.__enter__ = lambda r: r
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        with patch.object(
+            ClaudeAccountSwitcher, "_read_active_credentials",
+            return_value=ActiveCredentials(_oauth_creds("sk-active", 7200), False),
+        ), patch.object(
+            ClaudeAccountSwitcher, "_read_account_credentials", return_value=_oauth_creds("sk-backup", 7200),
+        ), patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake_urlopen):
+            for cm in extra:
+                cm.__enter__()
+            try:
+                s._collect_usage_entries(s._build_accounts_info())
+            finally:
+                for cm in reversed(extra):
+                    cm.__exit__(None, None, None)
+        return sent
+
+    @pytest.mark.no_limit_resets_fake
+    @pytest.mark.parametrize("usage_answer", [
+        urllib.error.HTTPError("u", 429, "Too Many", hdrs=None, fp=None),
+        {},  # an answer with no window data
+    ], ids=["usage-429", "usage-empty"])
+    def test_active_failed_or_empty_usage_never_reserves_resets(
+        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch, usage_answer
+    ):
+        monkeypatch.setattr(oauth, "claude_code_user_agent", lambda: "claude-cli/2.1.316 (external, cli)")
+        s = self._switcher(sample_sequence_data)
+        sent = self._run(s, usage_answer)
+        assert "Bearer sk-active" not in sent
+        assert sent == ["Bearer sk-backup"]  # the other slot is read as usual
+        row = json.loads(s._usage_store.path.read_text())["accounts"]["1"]
+        assert "uuid-1" not in _resets_stamps(s)
+
+    @pytest.mark.no_limit_resets_fake
+    def test_active_lease_taken_over_during_probe_never_sends_resets(
+        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch
+    ):
+        monkeypatch.setattr(oauth, "claude_code_user_agent", lambda: "claude-cli/2.1.316 (external, cli)")
+        s = self._switcher(sample_sequence_data)
+        taken = []
+
+        def probe_while_another_collector_takes_the_slot(*_args, **_kwargs):
+            taken.append(s._usage_store.claim(["1"], self.IDENT1)["1"])
+
+        monkeypatch.setattr(s, "_resync_rotated_backup", probe_while_another_collector_takes_the_slot)
+        sent = self._run(s, {"seven_day": {"utilization": 30.0}})
+        assert taken  # the lease moved while the probe ran
+        assert "Bearer sk-active" not in sent
+        row = json.loads(s._usage_store.path.read_text())["accounts"]["1"]
+        assert "uuid-1" not in _resets_stamps(s)
+        assert row["claimId"] == taken[0]  # the other collector's lease is untouched
+
+
+class _ResetsNetHelpers:
+    """A collect pass over a fake network that answers usage polls, resets
+    reads and profile probes, for the attestation tests below."""
+
+    GRANT_A = TestLimitResetsInTheFetchPass.GRANT  # one reset left
+    GRANT_B = {**TestLimitResetsInTheFetchPass.GRANT,
+               "grants": [{**TestLimitResetsInTheFetchPass.GRANT["grants"][0], "resets_left": 3, "resets_total": 3}]}
+    # Whose account each token is, as the profile endpoint answers.
+    OWNERS = {"sk-active": "uuid-1", "sk-a2": "uuid-2", "sk-b": "uuid-B"}
+
+    def _switcher(self, sample_sequence_data, slot2=None):
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        sample_sequence_data["accounts"]["2"].update(slot2 or {})
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        return s
+
+    def _net(self, log, profile_fails=False, profile_error=None, on_profile=None):
+        """A fake network: usage polls, resets reads and profile probes, logged
+        as (kind, token, user agent). ``profile_error`` is raised by the
+        profile probe; ``on_profile(token)`` runs while it is in flight."""
+        def fake_urlopen(req, timeout=0):
+            token = (req.get_header("Authorization") or "").removeprefix("Bearer ")
+            url = req.full_url
+            if url == oauth.LIMIT_RESETS_URL:
+                log.append(("resets", token, req.get_header("User-agent")))
+                body = {"cedar_ember": self.GRANT_B if token == "sk-b" else self.GRANT_A}
+            elif url == "https://api.anthropic.com/api/oauth/profile":
+                log.append(("profile", token, req.get_header("User-agent")))
+                if on_profile is not None:
+                    on_profile(token)
+                if profile_fails:
+                    raise urllib.error.HTTPError(url, 500, "down", hdrs=None, fp=None)
+                if profile_error is not None:
+                    raise profile_error
+                body = {"account": {"uuid": self.OWNERS[token], "email": "x@example.com"}}
+            elif url == "https://api.anthropic.com/api/oauth/usage":
+                log.append(("usage", token, req.get_header("User-agent")))
+                body = {"seven_day": {"utilization": 21.0}}
+            else:
+                log.append(("unexpected", url, None))
+                raise AssertionError(f"unexpected request {url}")
+            resp = MagicMock()
+            resp.read.return_value = json.dumps(body).encode()
+            resp.__enter__ = lambda r: r
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+        return fake_urlopen
+
+    def _pass(self, s, log, backup_for_2="sk-a2", session=None, fresh=False, profile_fails=False,
+              profile_error=None, on_profile=None, fetch=None):
+        """One collect pass. Slot 1 is active (its backup holds the same
+        lineage, so no ownership probe runs); slot 2 reads ``backup_for_2``,
+        or ``session()`` from its session profile when given."""
+        live = _oauth_creds("sk-active", 7200)
+        backups = {"1": live, "2": _oauth_creds(backup_for_2, 7200)}
+        patches = [
+            patch.object(ClaudeAccountSwitcher, "_read_active_credentials",
+                         return_value=ActiveCredentials(live, False)),
+            patch.object(ClaudeAccountSwitcher, "_read_account_credentials",
+                         side_effect=lambda num, email: backups[str(num)]),
+            patch.object(ClaudeAccountSwitcher, "_live_session_pids", return_value=[]),
+            patch("claude_swap.oauth.urllib.request.urlopen",
+                  side_effect=self._net(log, profile_fails=profile_fails,
+                                        profile_error=profile_error, on_profile=on_profile)),
+        ]
+        if session is not None:
+            patches += [
+                patch("claude_swap.session.read_session_credentials",
+                      side_effect=lambda _dir: _oauth_creds(session(), 7200)),
+                # What the identity check answers when it cannot read the
+                # profile's identity: "not drifted".
+                patch("claude_swap.session.session_identity_drifted", return_value=False),
+            ]
+        for p in patches:
+            p.start()
+        try:
+            return s._collect_usage_entries(s._build_accounts_info(), fetch=fetch, fresh=fresh)
+        finally:
+            for p in reversed(patches):
+                p.stop()
+
+    def _row(self, s, num="2"):
+        return json.loads(s._usage_store.path.read_text())["accounts"][num]
+
+    def _left(self, s, num="2"):
+        entry = (self._row(s, num).get("lastGood") or {}).get("limit_resets")
+        return entry["grants"][0]["left"] if entry else None
+
+    def _age(self, s, seconds):
+        _age_resets_stamps(s, seconds)
+        table = json.loads(s._usage_store.path.read_text())
+        for row in table["accounts"].values():
+            for key in ("fetchedAt", "lastAttemptAt"):
+                if isinstance(row.get(key), (int, float)):
+                    row[key] -= seconds
+            row["nextPollAt"] = None
+        s._usage_store.path.write_text(json.dumps(table))
+
+
+
+class TestLimitResetsProfileAttestation(_ResetsNetHelpers):
+    """A resets answer is kept for a slot only when the server says the token
+    that asked belongs to the slot's account: the profile probe, with the
+    same token, must name the slot's stored uuid and organization. Pacing
+    never depends on it: the reservation stamp stands whatever happens."""
+
+    @pytest.mark.no_limit_resets_fake
+    @pytest.mark.no_oauth_profile_fake
+    def test_the_profile_probe_uses_the_resets_token_and_the_poll_is_unchanged(
+        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch
+    ):
+        monkeypatch.setattr(oauth, "claude_code_user_agent", lambda: "claude-cli/2.1.316 (external, cli)")
+        s = self._switcher(sample_sequence_data)
+        log = []
+        entries = self._pass(s, log)
+        resets = sorted(t for kind, t, _ua in log if kind == "resets")
+        profiles = sorted(t for kind, t, _ua in log if kind == "profile")
+        assert resets == profiles == ["sk-a2", "sk-active"]  # each answer attested with its own token
+        assert {ua for kind, _t, ua in log if kind == "usage"} == {"claude-swap/1.0"}
+        assert {ua for kind, _t, ua in log if kind == "resets"} == {"claude-cli/2.1.316 (external, cli)"}
+        assert {ua for kind, _t, ua in log if kind == "profile"} == {"claude-swap/1.0"}
+        entry = entries["2"].last_good["limit_resets"]
+        assert (entry["account_uuid"], entry["org_uuid"]) == ("uuid-2", "")  # the attested ids kept
+
+    @pytest.mark.no_limit_resets_fake
+    @pytest.mark.no_oauth_profile_fake
+    def test_swap_rollback_after_resets_fetch_never_keeps_foreign_grant(
+        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch
+    ):
+        monkeypatch.setattr(oauth, "claude_code_user_agent", lambda: "claude-cli/2.1.316 (external, cli)")
+        s = self._switcher(sample_sequence_data)
+        log = []
+        self._pass(s, log)  # slot 2 is A: A's one reset is kept
+        assert self._left(s) == 1
+        self._age(s, 3600)
+        before = _resets_stamps(s)["uuid-2"]
+        # A same-email swap has written B's credential but not yet B's
+        # metadata: every local read says slot 2 is A and holds B's token.
+        self._pass(s, log, backup_for_2="sk-b")
+        assert ("resets", "sk-b", "claude-cli/2.1.316 (external, cli)") in log
+        assert self._left(s) == 1  # B's three resets were never kept as A's
+        stamp = _resets_stamps(s)["uuid-2"]
+        assert stamp > before  # the try paces the next one
+        # The swap rolls back: A's credential again. The slot waits out its
+        # interval and still shows A's own entry.
+        log.clear()
+        self._pass(s, log, fresh=True)
+        assert [k for k, _t, _u in log if k == "resets"] == []
+        assert self._left(s) == 1 and _resets_stamps(s)["uuid-2"] == stamp
+
+    @pytest.mark.no_limit_resets_fake
+    @pytest.mark.no_oauth_profile_fake
+    def test_session_attribution_rejects_stale_plaintext_after_keychain_failure(
+        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch
+    ):
+        monkeypatch.setattr(oauth, "claude_code_user_agent", lambda: "claude-cli/2.1.316 (external, cli)")
+        s = self._switcher(sample_sequence_data)
+        log = []
+        self._pass(s, log, session=lambda: "sk-a2")  # the profile holds A: kept
+        assert self._left(s) == 1
+        self._age(s, 3600)
+        # /login put A back in the Keychain, the Keychain read fails, and the
+        # plaintext fallback still holds B: every session read returns B.
+        self._pass(s, log, session=lambda: "sk-b")
+        assert self._left(s) == 1
+        assert isinstance(_resets_stamps(s).get("uuid-2"), float)
+
+    @pytest.mark.no_limit_resets_fake
+    @pytest.mark.no_oauth_profile_fake
+    def test_unreadable_session_identity_is_unknown(
+        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch
+    ):
+        # The identity check reads "not drifted" when it cannot read the
+        # profile's identity at all; the server's answer decides instead.
+        monkeypatch.setattr(oauth, "claude_code_user_agent", lambda: "claude-cli/2.1.316 (external, cli)")
+        s = self._switcher(sample_sequence_data)
+        log = []
+        self._pass(s, log, session=lambda: "sk-b")
+        assert ("profile", "sk-b", "claude-swap/1.0") in log
+        assert self._left(s) is None  # nothing recorded for slot 2
+        assert isinstance(_resets_stamps(s).get("uuid-2"), float)  # and still paced
+
+    @pytest.mark.no_limit_resets_fake
+    @pytest.mark.no_oauth_profile_fake
+    def test_flapping_session_keychain_preserves_resets_request_interval(
+        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch
+    ):
+        monkeypatch.setattr(oauth, "claude_code_user_agent", lambda: "claude-cli/2.1.316 (external, cli)")
+        s = self._switcher(sample_sequence_data)
+        log = []
+        flip = iter(["sk-a2", "sk-b"] * 10)
+        for _ in range(4):  # Refresh now, again and again, while reads flap
+            self._pass(s, log, session=lambda: next(flip), fresh=True)
+        slot2 = [t for kind, t, _u in log if kind == "resets" and t in ("sk-a2", "sk-b")]
+        assert len(slot2) == 1  # one request per interval, whatever attribution said
+
+    @pytest.mark.no_limit_resets_fake
+    @pytest.mark.no_oauth_profile_fake
+    def test_profile_probe_failure_keeps_stamp_and_previous_entry(
+        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch
+    ):
+        monkeypatch.setattr(oauth, "claude_code_user_agent", lambda: "claude-cli/2.1.316 (external, cli)")
+        s = self._switcher(sample_sequence_data)
+        log = []
+        self._pass(s, log)
+        assert self._left(s) == 1
+        self._age(s, 3600)
+        before, stamp = self._row(s), _resets_stamps(s)["uuid-2"]
+        self._pass(s, log, backup_for_2="sk-b", profile_fails=True)
+        after = self._row(s)
+        assert after["lastGood"]["limit_resets"] == before["lastGood"]["limit_resets"]
+        assert _resets_stamps(s)["uuid-2"] > stamp
+        assert after["lastError"] is None  # the usage read stands
+
+    @pytest.mark.no_limit_resets_fake
+    @pytest.mark.no_oauth_profile_fake
+    def test_a_slot_without_a_stored_uuid_never_reads_resets(
+        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch
+    ):
+        # A token-only account (add-token) or a legacy row: no uuid to attest
+        # against, so no read at all and no try stamped.
+        monkeypatch.setattr(oauth, "claude_code_user_agent", lambda: "claude-cli/2.1.316 (external, cli)")
+        s = self._switcher(sample_sequence_data, {"uuid": ""})
+        log = []
+        self._pass(s, log)
+        assert [t for kind, t, _u in log if kind == "resets"] == ["sk-active"]
+        assert set(_resets_stamps(s)) == {"uuid-1"}  # only the active slot's account
+
+
+class TestAttestLimitResetsRule:
+    """``_attest_limit_resets``: an answer stays only when the server's ids
+    are the slot's stored uuid and organization, read now."""
+
+    def test_each_mismatch_drops_the_answer(self, temp_home, sample_sequence_data):
+        sample_sequence_data["accounts"]["1"]["organizationUuid"] = "org-1"
+        sample_sequence_data["accounts"]["2"]["uuid"] = ""  # a token-only slot
+        sample_sequence_data["accounts"]["3"] = {"email": "c@example.com", "uuid": "uuid-3"}
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        cedar = TestLimitResetsInTheFetchPass.GRANT
+
+        def rec(uuid, org):
+            return FetchRecord(usage={"seven_day": {"pct": 1.0}}, limit_resets=oauth.LimitResetsRead(cedar, uuid, org))
+
+        cases = {
+            "1": rec("uuid-1", "org-1"),  # both match: kept
+            "2": rec("uuid-2", None),  # the slot has no stored uuid
+            "3": rec("uuid-3", "org-x"),  # same account, another organization
+            "4": rec("uuid-9", None),  # another account (and an unknown slot)
+        }
+        kept = s._attest_limit_resets(cases)
+        assert kept["1"].limit_resets == cases["1"].limit_resets
+        assert [kept[n].limit_resets for n in ("2", "3", "4")] == [None, None, None]
+        assert all(kept[n].usage == cases[n].usage for n in cases)  # the usage always stands
+        mismatched_account = s._attest_limit_resets({"1": rec("uuid-9", "org-1")})
+        assert mismatched_account["1"].limit_resets is None
+        unattested = s._attest_limit_resets({"1": rec(None, None)})
+        assert unattested["1"].limit_resets is None
+
+
+
+class TestLimitResetsAfterReplacement:
+    """An entry the server attested for one account is never shown for the
+    account that takes its slot."""
+
+    @pytest.mark.parametrize("replacement", [
+        {"uuid": ""},  # add-token over the slot: a token-only account
+        {"uuid": "uuid-9"},  # another OAuth account under the same name
+    ], ids=["token-only", "new-uuid"])
+    def test_add_token_replacement_never_carries_previous_credentials_grant(
+        self, temp_home, mock_claude_config, sample_sequence_data, replacement
+    ):
+        from claude_swap import menubar
+
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        ident = {"2": ("account2@example.com", "")}
+        # Account A's attested grant, recorded while it held slot 2.
+        claim = s._usage_store.claim(["2"], ident)["2"]
+        assert s._usage_store.reserve_limit_resets("2", ident["2"], claim, 3600.0, account_uuid="uuid-2")
+        s._usage_store.record(
+            {"2": FetchRecord(usage={"seven_day": {"pct": 5.0}},
+                              limit_resets=oauth.LimitResetsRead(TestLimitResetsInTheFetchPass.GRANT, "uuid-2", ""))},
+            ident, claims={"2": claim},
+        )
+        # Slot 2 is replaced, keeping its name and organization.
+        sample_sequence_data["accounts"]["2"].update(replacement)
+        s._write_json(s.sequence_file, sample_sequence_data)
+
+        calls = []
+
+        def fetch(info, limit_resets=None):
+            calls.append((str(info[0]), limit_resets is not None))
+            return FetchRecord(usage={"seven_day": {"pct": 6.0}})
+
+        live = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        with patch.object(ClaudeAccountSwitcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(live, False)), \
+             patch.object(ClaudeAccountSwitcher, "_read_account_credentials", return_value=live), \
+             patch.object(s, "_fetch_account_usage", side_effect=fetch):
+            snap = s.accounts_snapshot(fresh=True)
+        acc = {a.number: a for a in snap.accounts}["2"]
+        assert acc.account_uuid == replacement["uuid"]
+        assert acc.usage.last_good["limit_resets"]  # still stored (no write needed) ...
+        row = {r[0]: r for r in menubar._adapt_snapshot(snap)["accounts"]}["2"]
+        assert "limit_resets" not in row[3] and "limit_resets" not in row[4]  # ... never shown
+        if replacement["uuid"] == "":
+            assert ("2", True) not in calls  # and a token-only slot is never read
+
+
+class TestLimitResetsPacedPerAccount:
+    """The resets interval belongs to the account, not to the slot's cache
+    row: a row replaced after a swap must not let the account ask again."""
+
+    OWNERS = {"sk-active": ("uuid-1", ""), "sk-a": ("uuid-A", "org-A"), "sk-b": ("uuid-B", "org-B")}
+
+    @pytest.mark.no_limit_resets_fake
+    @pytest.mark.no_oauth_profile_fake
+    # Whatever the resets read does, the pacing was settled before it.
+    @pytest.mark.parametrize("resets_fail", [False, True], ids=["answered", "failing"])
+    def test_swap_between_metadata_and_backup_read_preserves_resets_interval(
+        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch, resets_fail
+    ):
+        monkeypatch.setattr(oauth, "claude_code_user_agent", lambda: "claude-cli/2.1.316 (external, cli)")
+        # Slots 2 and 3 share an email in two organizations: account A
+        # (org-A) and account B (org-B). They have just been swapped: slot 2
+        # now holds B and slot 3 holds A.
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        sample_sequence_data["sequence"] = [1, 2, 3]
+        sample_sequence_data["accounts"]["2"] = {"email": "shared@example.com", "uuid": "uuid-B", "organizationUuid": "org-B"}
+        sample_sequence_data["accounts"]["3"] = {"email": "shared@example.com", "uuid": "uuid-A", "organizationUuid": "org-A"}
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        live = _oauth_creds("sk-active", 7200)
+        backups = {"1": live, "2": _oauth_creds("sk-b", 7200), "3": _oauth_creds("sk-a", 7200)}
+        log = []
+
+        def fake_urlopen(req, timeout=0):
+            token = (req.get_header("Authorization") or "").removeprefix("Bearer ")
+            if req.full_url == oauth.LIMIT_RESETS_URL:
+                log.append(("resets", token))
+                if resets_fail:
+                    raise urllib.error.HTTPError(req.full_url, 429, "Too Many", hdrs=None, fp=None)
+                body = {"cedar_ember": TestLimitResetsInTheFetchPass.GRANT}
+            elif req.full_url == "https://api.anthropic.com/api/oauth/profile":
+                log.append(("profile", token))
+                uuid, org = self.OWNERS[token]
+                body = {"account": {"uuid": uuid, "email": "x@example.com"},
+                        **({"organization": {"uuid": org}} if org else {})}
+            else:
+                body = {"seven_day": {"utilization": 21.0}}
+            resp = MagicMock()
+            resp.read.return_value = json.dumps(body).encode()
+            resp.__enter__ = lambda r: r
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        with patch.object(ClaudeAccountSwitcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(live, False)), \
+             patch.object(ClaudeAccountSwitcher, "_read_account_credentials",
+                          side_effect=lambda num, email: backups[str(num)]), \
+             patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake_urlopen):
+            # The pass that read the roster before the swap (slot 2 = A,
+            # slot 3 = B) and the backups after it.
+            infos = s._build_accounts_info()
+            before_swap = {"2": "org-A", "3": "org-B"}
+            stale = [i if str(i[0]) not in before_swap else i[:3] + (before_swap[str(i[0])],) + i[4:] for i in infos]
+            s._collect_usage_entries(stale)
+            # A second later, from the swapped roster: each slot's row is
+            # replaced for its new identity.
+            s._collect_usage_entries(s._build_accounts_info(), fresh=True)
+            s._collect_usage_entries(s._build_accounts_info(), fresh=True)
+        for token in ("sk-a", "sk-b", "sk-active"):
+            assert log.count(("resets", token)) == 1, (token, log)
+            assert log.count(("profile", token)) == 1, (token, log)  # the probe comes first
+
+
+class TestSnapshotIdsReadTogether:
+    def test_org_change_during_collection_hides_previous_org_resets(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        from claude_swap import menubar
+
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        sample_sequence_data["accounts"]["2"].update({"uuid": "uuid-2", "organizationUuid": "org-A"})
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        ident = {"2": ("account2@example.com", "org-A")}
+        # Account A's grant in org A, attested and stored.
+        claim = s._usage_store.claim(["2"], ident)["2"]
+        assert s._usage_store.reserve_limit_resets("2", ident["2"], claim, 3600.0, account_uuid="uuid-2")
+        s._usage_store.record(
+            {"2": FetchRecord(usage={"seven_day": {"pct": 5.0}},
+                              limit_resets=oauth.LimitResetsRead(TestLimitResetsInTheFetchPass.GRANT, "uuid-2", "org-A"))},
+            ident, claims={"2": claim},
+            plans={"2": (time.time() + 600.0, 600.0)},  # as a collector records it: no floor pending
+        )
+        fetched = []
+
+        def fetch(info, limit_resets=None):
+            fetched.append(str(info[0]))
+            if str(info[0]) == "2":
+                # While the pass runs, slot 2 moves to the same account in org B.
+                sample_sequence_data["accounts"]["2"]["organizationUuid"] = "org-B"
+                s._write_json(s.sequence_file, sample_sequence_data)
+            return FetchRecord(usage={"seven_day": {"pct": 6.0}})
+
+        live = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        with patch.object(ClaudeAccountSwitcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(live, False)), \
+             patch.object(ClaudeAccountSwitcher, "_read_account_credentials", return_value=live), \
+             patch.object(s, "_fetch_account_usage", side_effect=fetch):
+            snap = s.accounts_snapshot(fresh=True)
+        assert "2" in fetched  # the slot moved while this pass fetched it
+        acc = {a.number: a for a in snap.accounts}["2"]
+        assert acc.usage.last_good["limit_resets"]  # the org A entry is still stored
+        row = {r[0]: r for r in menubar._adapt_snapshot(snap)["accounts"]}["2"]
+        assert "limit_resets" not in row[3] and "limit_resets" not in row[4]
+
+
+
+class TestLimitResetsProfileProbeFailures(_ResetsNetHelpers):
+    """The profile probe's own failures, and a lease lost while it runs."""
+
+    @pytest.mark.no_limit_resets_fake
+    @pytest.mark.no_oauth_profile_fake
+    @pytest.mark.parametrize("error", [
+        urllib.error.HTTPError("p", 401, "Unauthorized", hdrs=None, fp=None),
+        urllib.error.HTTPError("p", 403, "Forbidden", hdrs=None, fp=None),
+        urllib.error.HTTPError("p", 429, "Too Many", hdrs=None, fp=None),
+        urllib.error.URLError(TimeoutError("timed out")),
+    ], ids=["401", "403", "429", "timeout"])
+    def test_profile_401_403_429_timeout_preserves_poll_state(
+        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch, error
+    ):
+        monkeypatch.setattr(oauth, "claude_code_user_agent", lambda: "claude-cli/2.1.316 (external, cli)")
+        s = self._switcher(sample_sequence_data)
+        log = []
+        self._pass(s, log)  # A's grant, attested and kept
+        self._age(s, 3600)
+        before, stamp = self._row(s), _resets_stamps(s)["uuid-2"]
+        log.clear()
+        entries = self._pass(s, log, backup_for_2="sk-b", profile_error=error)
+        assert ("profile", "sk-b", "claude-swap/1.0") in log
+        assert not any(kind == "unexpected" for kind, _t, _u in log)  # no token refresh, nothing else
+        after = self._row(s)
+        assert after["lastGood"]["limit_resets"] == before["lastGood"]["limit_resets"]
+        assert _resets_stamps(s)["uuid-2"] > stamp  # the try stands
+        entry = entries["2"]
+        assert (entry.last_error, entry.consecutive_failures, entry.backoff_until) == (None, 0, None)
+        assert entry.auth_dead_strikes == 0 and entry.sentinel is None
+        assert entry.last_good["seven_day"] == {"pct": 21.0}  # the poll's windows
+
+    @pytest.mark.no_limit_resets_fake
+    @pytest.mark.no_oauth_profile_fake
+    def test_profile_probe_overruns_lease_without_duplicate_resets(
+        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch
+    ):
+        monkeypatch.setattr(oauth, "claude_code_user_agent", lambda: "claude-cli/2.1.316 (external, cli)")
+        s = self._switcher(sample_sequence_data)
+        ident = ("account2@example.com", "")
+        taken = []
+
+        def another_collector_takes_the_slot(token):
+            if token != "sk-a2" or taken:
+                return
+            claim = s._usage_store.claim(["2"], {"2": ident})["2"]
+            taken.append((claim, s._usage_store.reserve_limit_resets(
+                "2", ident, claim, 3600.0, account_uuid="uuid-2")))
+
+        log = []
+        self._pass(s, log, on_profile=another_collector_takes_the_slot)
+        ((claim, won),) = taken
+        assert won is None  # the account's try is already stamped
+        row = self._row(s)
+        assert row["claimId"] == claim  # the late writer was fenced out
+        assert self._left(s) is None  # and its answer not written over the new lease
+        # The other collector's lease ends; the slot is fetched again soon
+        # after, and its account waits out the interval.
+        table = json.loads(s._usage_store.path.read_text())
+        table["accounts"]["2"]["claimUntil"] = 0.0
+        s._usage_store.path.write_text(json.dumps(table))
+        self._pass(s, log, fresh=True)
+        assert [t for kind, t, _u in log if kind == "resets" and t == "sk-a2"] == ["sk-a2"]
+        assert [t for kind, t, _u in log if kind == "profile" and t == "sk-a2"] == ["sk-a2"]
+
+
+class TestLimitResetsProbeBeforeRead:
+    """The profile probe runs before the resets read, so the account the
+    token really belongs to is paced before anything is asked about it."""
+
+    OWNERS = {"sk-active": ("uuid-1", ""), "sk-a": ("uuid-A", "org-A"), "sk-b": ("uuid-B", "org-B")}
+
+    @pytest.mark.no_limit_resets_fake
+    @pytest.mark.no_oauth_profile_fake
+    def test_partial_swap_cannot_refetch_an_already_paced_account(
+        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch
+    ):
+        monkeypatch.setattr(oauth, "claude_code_user_agent", lambda: "claude-cli/2.1.316 (external, cli)")
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        sample_sequence_data["sequence"] = [1, 2, 3]
+        sample_sequence_data["accounts"]["2"] = {"email": "shared@example.com", "uuid": "uuid-A", "organizationUuid": "org-A"}
+        sample_sequence_data["accounts"]["3"] = {"email": "shared@example.com", "uuid": "uuid-B", "organizationUuid": "org-B"}
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        live = _oauth_creds("sk-active", 7200)
+        backups = {"1": live, "2": _oauth_creds("sk-a", 7200), "3": _oauth_creds("sk-b", 7200)}
+        log = []
+
+        def fake_urlopen(req, timeout=0):
+            token = (req.get_header("Authorization") or "").removeprefix("Bearer ")
+            if req.full_url == oauth.LIMIT_RESETS_URL:
+                log.append(("resets", token))
+                body = {"cedar_ember": TestLimitResetsInTheFetchPass.GRANT}
+            elif req.full_url == "https://api.anthropic.com/api/oauth/profile":
+                log.append(("profile", token))
+                uuid, org = self.OWNERS[token]
+                body = {"account": {"uuid": uuid, "email": "x@example.com"},
+                        **({"organization": {"uuid": org}} if org else {})}
+            else:
+                body = {"seven_day": {"utilization": 21.0}}
+            resp = MagicMock()
+            resp.read.return_value = json.dumps(body).encode()
+            resp.__enter__ = lambda r: r
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        with patch.object(ClaudeAccountSwitcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(live, False)), \
+             patch.object(ClaudeAccountSwitcher, "_read_account_credentials",
+                          side_effect=lambda num, email: backups[str(num)]), \
+             patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake_urlopen):
+            s._collect_usage_entries(s._build_accounts_info(), fetch={"2"})  # A is read
+            assert log.count(("resets", "sk-a")) == 1
+            # A swap half done: A's credential has landed in slot 3 while the
+            # roster still says slot 3 is B, whose read is due.
+            backups["3"] = _oauth_creds("sk-a", 7200)
+            log.clear()
+            s._collect_usage_entries(s._build_accounts_info(), fetch={"3"})
+        assert log.count(("profile", "sk-a")) == 1  # the probe names A ...
+        assert ("resets", "sk-a") not in log  # ... already read this interval: nothing asked
+        assert "uuid-B" in _resets_stamps(s)  # B's slot spent its try
+
+    @pytest.mark.no_limit_resets_fake
+    @pytest.mark.no_oauth_profile_fake
+    def test_an_account_read_through_another_slot_is_paced_for_its_own(
+        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch
+    ):
+        monkeypatch.setattr(oauth, "claude_code_user_agent", lambda: "claude-cli/2.1.316 (external, cli)")
+        monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: {
+            "uuid": self.OWNERS[token][0], "email": "x@example.com", "organizationUuid": self.OWNERS[token][1] or None})
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        sample_sequence_data["sequence"] = [1, 2, 3]
+        sample_sequence_data["accounts"]["2"] = {"email": "shared@example.com", "uuid": "uuid-A", "organizationUuid": "org-A"}
+        sample_sequence_data["accounts"]["3"] = {"email": "shared@example.com", "uuid": "uuid-B", "organizationUuid": "org-B"}
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        live = _oauth_creds("sk-active", 7200)
+        # A's credential sits in slot 3 (B's) before A's own slot is read.
+        backups = {"1": live, "2": _oauth_creds("sk-a", 7200), "3": _oauth_creds("sk-a", 7200)}
+        sent = []
+
+        def fake_urlopen(req, timeout=0):
+            if req.full_url == oauth.LIMIT_RESETS_URL:
+                sent.append((req.get_header("Authorization") or "").removeprefix("Bearer "))
+                body = {"cedar_ember": TestLimitResetsInTheFetchPass.GRANT}
+            else:
+                body = {"seven_day": {"utilization": 21.0}}
+            resp = MagicMock()
+            resp.read.return_value = json.dumps(body).encode()
+            resp.__enter__ = lambda r: r
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        with patch.object(ClaudeAccountSwitcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(live, False)), \
+             patch.object(ClaudeAccountSwitcher, "_read_account_credentials",
+                          side_effect=lambda num, email: backups[str(num)]), \
+             patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake_urlopen):
+            entries = s._collect_usage_entries(s._build_accounts_info(), fetch={"3"})
+            assert sent == ["sk-a"]  # A was asked, through B's slot ...
+            assert "limit_resets" not in entries["3"].last_good  # ... its answer not kept as B's
+            assert {"uuid-A", "uuid-B"} <= set(_resets_stamps(s))
+            s._collect_usage_entries(s._build_accounts_info(), fetch={"2"})
+        assert sent == ["sk-a"]  # A's own slot waits out A's interval
+
+
+class TestLimitResetsReservationOwnsItsStamp(_ResetsNetHelpers):
+    """A reservation owns the stamp it wrote: a probe that outlives its
+    interval, while a newer collector reserves the same account, sends
+    nothing."""
+
+    @pytest.mark.no_limit_resets_fake
+    @pytest.mark.no_oauth_profile_fake
+    @pytest.mark.parametrize("fresh, every", [(False, 3600.0), (True, 600.0)], ids=["hourly", "refresh-now"])
+    def test_probe_outlives_resets_interval_and_newer_reservation_blocks_old_request(
+        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch, fresh, every
+    ):
+        monkeypatch.setattr(oauth, "claude_code_user_agent", lambda: "claude-cli/2.1.316 (external, cli)")
+        s = self._switcher(sample_sequence_data)
+        now = [time.time()]
+        s._usage_store.clock = lambda: now[0]
+        ident = ("account2@example.com", "")
+        newer = []
+
+        def stall_past_the_interval(token):
+            if token != "sk-a2" or newer:
+                return
+            # The probe hangs past the interval; meanwhile another collector
+            # takes the slot over, reserves the account and sends its read.
+            now[0] += every + 1
+            claim = s._usage_store.claim(["2"], {"2": ident})["2"]
+            newer.append(s._usage_store.reserve_limit_resets("2", ident, claim, every, account_uuid="uuid-2"))
+
+        log = []
+        self._pass(s, log, fresh=fresh, on_profile=stall_past_the_interval)
+        assert newer and newer[0]  # the newer collector won the account's read
+        assert ("profile", "sk-a2", "claude-swap/1.0") in log
+        assert [t for kind, t, _u in log if kind == "resets" and t == "sk-a2"] == []  # the old one sends nothing
+
+
+
+class TestLimitResetsTrimKeepsTheRoster(_ResetsNetHelpers):
+    @pytest.mark.no_limit_resets_fake
+    @pytest.mark.no_oauth_profile_fake
+    def test_forward_clock_jump_trim_preserves_recent_attempt_after_correction(
+        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch
+    ):
+        monkeypatch.setattr(oauth, "claude_code_user_agent", lambda: "claude-cli/2.1.316 (external, cli)")
+        s = self._switcher(sample_sequence_data)
+        start = time.time()
+        now = [start]
+        s._usage_store.clock = lambda: now[0]
+        log = []
+        self._pass(s, log, fetch={"2"})  # account 2 is read at T
+        now[0] = start + 8 * 86400  # the clock jumps a week and a day ahead ...
+        self._pass(s, log, fetch={"1"})  # ... while another account's read writes the file
+        now[0] = start + 1  # ... and is put right
+        self._pass(s, log, fetch={"2"}, fresh=True)
+        assert [t for kind, t, _u in log if kind == "resets" and t == "sk-a2"] == ["sk-a2"]
+        assert "uuid-2" in _resets_stamps(s)  # a roster account's stamp is never trimmed
+
+
+class TestLimitResetsContention(_ResetsNetHelpers):
+    """Real contention on the attempts file, and two slots racing for one account."""
+
+    @pytest.mark.no_limit_resets_fake
+    @pytest.mark.no_oauth_profile_fake
+    def test_busy_attempts_lock_times_out_without_requests_or_usage_failure(
+        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch
+    ):
+        from claude_swap import usage_store
+        from claude_swap.locking import FileLock
+
+        monkeypatch.setattr(oauth, "claude_code_user_agent", lambda: "claude-cli/2.1.316 (external, cli)")
+        # The wait is shortened so the test is quick; the holder keeps the lock
+        # for the whole pass, longer than any wait.
+        monkeypatch.setattr(usage_store, "LIMIT_RESETS_LOCK_WAIT_S", 0.3)
+        s = self._switcher(sample_sequence_data)
+        holder = FileLock(s._usage_store.attempts._lock_path, timeout=1.0)
+        assert holder.acquire()
+        log = []
+        try:
+            started = time.monotonic()
+            entries = self._pass(s, log)
+            took = time.monotonic() - started
+        finally:
+            holder.release()
+        assert [k for k, _t, _u in log if k in ("resets", "profile")] == []  # nothing sent
+        assert _resets_stamps(s) == {}
+        assert took < 5.0  # each slot waited its short while, and gave up
+        for num in ("1", "2"):
+            entry = entries[num]
+            assert entry.last_good == {"seven_day": {"pct": 21.0}}  # the usage read is recorded
+            assert (entry.last_error, entry.consecutive_failures, entry.backoff_until) == (None, 0, None)
+
+    @pytest.mark.no_limit_resets_fake
+    @pytest.mark.no_oauth_profile_fake
+    def test_two_stale_slots_same_actual_account_profile_per_slot_resets_once(
+        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch
+    ):
+        # Accepted residual: one profile probe per slot per interval, the
+        # account's resets request once (see oauth._read_limit_resets).
+        # Slots 2 and 3 still name accounts that have since left them; both
+        # tokens now belong to one real account, X.
+        monkeypatch.setattr(oauth, "claude_code_user_agent", lambda: "claude-cli/2.1.316 (external, cli)")
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        sample_sequence_data["sequence"] = [1, 2, 3]
+        sample_sequence_data["accounts"]["2"] = {"email": "two@example.com", "uuid": "uuid-old-2"}
+        sample_sequence_data["accounts"]["3"] = {"email": "three@example.com", "uuid": "uuid-old-3"}
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        live = _oauth_creds("sk-active", 7200)
+        backups = {"1": live, "2": _oauth_creds("sk-x2", 7200), "3": _oauth_creds("sk-x3", 7200)}
+        owners = {"sk-active": "uuid-1", "sk-x2": "uuid-X", "sk-x3": "uuid-X"}
+        log = []
+
+        def fake_urlopen(req, timeout=0):
+            token = (req.get_header("Authorization") or "").removeprefix("Bearer ")
+            if req.full_url == oauth.LIMIT_RESETS_URL:
+                log.append(("resets", token))
+                body = {"cedar_ember": TestLimitResetsInTheFetchPass.GRANT}
+            elif req.full_url == "https://api.anthropic.com/api/oauth/profile":
+                log.append(("profile", token))
+                body = {"account": {"uuid": owners[token], "email": "x@example.com"}}
+            else:
+                body = {"seven_day": {"utilization": 21.0}}
+            resp = MagicMock()
+            resp.read.return_value = json.dumps(body).encode()
+            resp.__enter__ = lambda r: r
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        with patch.object(ClaudeAccountSwitcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(live, False)), \
+             patch.object(ClaudeAccountSwitcher, "_read_account_credentials",
+                          side_effect=lambda num, email: backups[str(num)]), \
+             patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake_urlopen):
+            entries = s._collect_usage_entries(s._build_accounts_info(), fetch={"2", "3"})
+            again = s._collect_usage_entries(s._build_accounts_info(), fetch={"2", "3"}, fresh=True)
+        assert sorted(t for k, t in log if k == "profile") == ["sk-x2", "sk-x3"]  # one probe each
+        assert len([t for k, t in log if k == "resets" and t in ("sk-x2", "sk-x3")]) == 1  # X asked once
+        for result in (entries, again):
+            assert all("limit_resets" not in result[n].last_good for n in ("2", "3"))  # X is neither slot's
+        assert {"uuid-old-2", "uuid-old-3", "uuid-X"} <= set(_resets_stamps(s))

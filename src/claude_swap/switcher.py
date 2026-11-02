@@ -12,6 +12,7 @@ import threading
 import sys
 import tempfile
 import time
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -88,7 +89,10 @@ from claude_swap.process_detection import get_running_instances
 from claude_swap import poll_policy
 from claude_swap.settings import load_settings, parse_model_names, settings_path
 from claude_swap.usage_store import (
+    LIMIT_RESETS_EVERY_S,
+    LIMIT_RESETS_MANUAL_EVERY_S,
     FetchRecord,
+    SlotResetsGate,
     UsageEntry,
     UsageStore,
     with_sentinel,
@@ -330,7 +334,9 @@ class ClaudeAccountSwitcher:
         self.credentials_dir = self.backup_dir / "credentials"
         self.lock_file = self.backup_dir / ".lock"
         self._logger = setup_logging(self.backup_dir, debug=debug)
-        self._usage_store = UsageStore(self.backup_dir / "cache")
+        self._usage_store = UsageStore(
+            self.backup_dir / "cache", roster=self._roster_account_uuids
+        )
         # (settings mtime, (threshold, models)) — see _poll_policy_inputs.
         self._poll_inputs_cache: tuple[float | None, tuple[float, tuple[str, ...]]] | None = None
         self._poll_inputs_override: tuple[float, tuple[str, ...]] | None = None
@@ -1837,6 +1843,8 @@ class ClaudeAccountSwitcher:
             n = str(num)
             if is_active:
                 active_number = n
+            # The slot's stored ids, both from this one read of the roster.
+            stored = (seq_data.get("accounts") or {}).get(n) or {}
             accounts.append(
                 AccountSnapshot(
                     number=n,
@@ -1849,6 +1857,8 @@ class ClaudeAccountSwitcher:
                     usage=entries[n],
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, n),
+                    account_uuid=(stored.get("uuid") or "").strip(),
+                    account_org_uuid=(stored.get("organizationUuid") or "").strip(),
                 )
             )
         return AccountsSnapshot(
@@ -4065,10 +4075,18 @@ class ClaudeAccountSwitcher:
         return accounts_info
 
     def _fetch_active_usage(
-        self, account_num: str, email: str, creds: str, org_uuid: str = ""
+        self,
+        account_num: str,
+        email: str,
+        creds: str,
+        org_uuid: str = "",
+        limit_resets: oauth.LimitResetsGate | None = None,
     ) -> FetchRecord:
         """Usage fetch for the active/default account, refreshing an expired
         token under Claude Code's own lock protocol.
+
+        ``limit_resets`` is the gate of the rare limit-resets read made
+        with a successful usage read (see ``_fetch_account_usage``).
 
         Claude Code 2.1.218 is built to *adopt* an externally rotated
         credential rather than collide with it: its refresh takes the
@@ -4131,6 +4149,9 @@ class ClaudeAccountSwitcher:
         # one wins, the loser gets invalid_grant and strikes a live account.
         force_refresh: FetchRecord | None = None
         if not oauth.is_oauth_token_expired(oauth_data.get("expiresAt")):
+            # No limit-resets gate here: the resets read waits for the
+            # ownership verdict below, so a credential that is another
+            # account's never reserves the slot's read nor carries one.
             outcome = oauth.try_fetch_usage_for_account(
                 account_num, email, creds, is_active=True,
             )
@@ -4169,10 +4190,16 @@ class ClaudeAccountSwitcher:
                         return FetchRecord(
                             sentinel=USAGE_FOREIGN_CREDENTIAL
                         )
+                resets = (
+                    oauth.read_limit_resets_for(creds, limit_resets)
+                    if limit_resets is not None and outcome.usage is not None
+                    else None
+                )
                 return FetchRecord(
                     usage=outcome.usage,
                     error=outcome.error,
                     retry_after_s=outcome.retry_after_s,
+                    limit_resets=resets,
                 )
             # A locally-valid token the server rejects: revoked out-of-band
             # (measured: a sibling machine rotating a synced lineage kills
@@ -4616,11 +4643,13 @@ class ClaudeAccountSwitcher:
 
         outcome = oauth.try_fetch_usage_for_account(
             account_num, email, working, is_active=True,
+            limit_resets=limit_resets,
         )
         return FetchRecord(
             usage=outcome.usage,
             error=outcome.error,
             retry_after_s=outcome.retry_after_s,
+            limit_resets=outcome.limit_resets,
         )
 
     def _resync_rotated_backup(
@@ -4801,16 +4830,27 @@ class ClaudeAccountSwitcher:
         return None
 
     def _fetch_account_usage(
-        self, account_info: tuple[int, str, str, str, bool, str, str]
+        self,
+        account_info: tuple[int, str, str, str, bool, str, str],
+        limit_resets: oauth.LimitResetsGate | None = None,
     ) -> FetchRecord:
-        """One network fetch for one account. Never raises."""
+        """One network fetch for one account. Never raises.
+
+        ``limit_resets``, when given, is the gate of the rare limit-resets
+        read: asked right after a successful usage read, it reserves the
+        read in the store (``UsageStore.reserve_limit_resets``), and only
+        then is the read sent with the same credential. Its answer rides in
+        ``FetchRecord.limit_resets``.
+        """
         num, email, _, org_uuid, is_active, creds, _alias = account_info
 
         # The active/default account owns the live credential — route it
         # through the locked-refresh path (refreshes an expired token under
         # Claude Code's own lock protocol, owner or not).
         if is_active:
-            return self._fetch_active_usage(str(num), email, creds, org_uuid)
+            return self._fetch_active_usage(
+                str(num), email, creds, org_uuid, limit_resets=limit_resets
+            )
 
         from claude_swap.session import (
             read_session_credentials,
@@ -4848,11 +4888,13 @@ class ClaudeAccountSwitcher:
                 if not oauth.is_oauth_token_expired(session_oauth.get("expiresAt")):
                     outcome = oauth.try_fetch_usage_for_account(
                         str(num), email, session_creds, is_active=True,
+                        limit_resets=limit_resets,
                     )
                     return FetchRecord(
                         usage=outcome.usage,
                         error=outcome.error,
                         retry_after_s=outcome.retry_after_s,
+                        limit_resets=outcome.limit_resets,
                     )
                 if has_live_session:
                     # The live claude refreshes lazily on its next API call;
@@ -4871,26 +4913,35 @@ class ClaudeAccountSwitcher:
             refresh_via=(
                 None if has_live_session else self.consume_backup_grant
             ),
+            limit_resets=limit_resets,
         )
         return FetchRecord(
             usage=outcome.usage,
             error=outcome.error,
             retry_after_s=outcome.retry_after_s,
             struck_fp=outcome.struck_fp,
+            limit_resets=outcome.limit_resets,
         )
 
     def _run_usage_fetches(
-        self, infos: list[tuple[int, str, str, str, bool, str, str]]
+        self,
+        infos: list[tuple[int, str, str, str, bool, str, str]],
+        limit_resets: Mapping[str, oauth.LimitResetsGate] | None = None,
     ) -> dict[str, FetchRecord]:
         """Fetch the given accounts in parallel, staggering request starts so
-        N accounts never hit the endpoint in the same instant."""
+        N accounts never hit the endpoint in the same instant. A slot with a
+        gate in ``limit_resets`` may also get the rare limit-resets read."""
+        gates = limit_resets or {}
         def fetch_one(
             idx_info: tuple[int, tuple[int, str, str, str, bool, str, str]]
         ) -> tuple[str, FetchRecord]:
             idx, info = idx_info
             if idx and _FETCH_STAGGER_S:
                 time.sleep(idx * _FETCH_STAGGER_S)
-            return str(info[0]), self._fetch_account_usage(info)
+            num = str(info[0])
+            return num, self._fetch_account_usage(
+                info, limit_resets=gates.get(num)
+            )
 
         with ThreadPoolExecutor() as executor:
             return dict(
@@ -5007,9 +5058,30 @@ class ClaudeAccountSwitcher:
 
         if claims:
             pre = entries
-            records = self._run_usage_fetches(
-                [info_by_num[num] for num in claims]
+            # The slots whose resets read looks due get a gate; the read is
+            # sent only once its gate has reserved it under the store lock,
+            # fenced by this fetch's lease (see reserve_limit_resets).
+            resets_every = (
+                LIMIT_RESETS_MANUAL_EVERY_S if fresh else LIMIT_RESETS_EVERY_S
             )
+            # Paced per account (its stored uuid). A slot with no stored
+            # account uuid (a token-only account, a legacy row) has nothing
+            # to attest an answer against: no read.
+            uuids = {
+                num: uuid
+                for num, (uuid, _org) in self._slot_account_ids().items()
+                if uuid and num in claims
+            }
+            resets_gates = {
+                num: SlotResetsGate(
+                    store, num, identities[num], claims[num], resets_every, uuids[num]
+                )
+                for num in store.limit_resets_due(uuids, resets_every)
+            }
+            records = self._run_usage_fetches(
+                [info_by_num[num] for num in claims], limit_resets=resets_gates
+            )
+            records = self._attest_limit_resets(records)
             plans, floors = self._plans_after_fetch(records, pre, info_by_num)
             accepted = store.record(
                 records, identities, claims, plans, post_429_floors=floors
@@ -5036,6 +5108,78 @@ class ClaudeAccountSwitcher:
             num: with_sentinel(entries[num], sentinels.get(num))
             for num in info_by_num
         }
+
+    def _roster_account_uuids(self) -> set[str] | None:
+        """Every stored account uuid in the roster now; None when the roster
+        cannot be read. Keeps those accounts' limit-resets stamps from the
+        attempts file's trim (``LimitResetsAttempts``)."""
+        try:
+            accounts = (self._get_sequence_data() or {}).get("accounts") or {}
+        except Exception:
+            return None
+        return {
+            (account.get("uuid") or "").strip()
+            for account in accounts.values()
+            if isinstance(account, dict) and (account.get("uuid") or "").strip()
+        }
+
+    def _slot_account_ids(self) -> dict[str, tuple[str, str]]:
+        """Each slot's stored ``(uuid, organizationUuid)``, read now; empty
+        when the roster cannot be read (then nothing is attested)."""
+        try:
+            accounts = (self._get_sequence_data() or {}).get("accounts") or {}
+        except Exception:
+            self._logger.debug("Roster unreadable; no limit resets attested.", exc_info=True)
+            return {}
+        return {
+            str(num): (
+                (account.get("uuid") or "").strip(),
+                (account.get("organizationUuid") or "").strip(),
+            )
+            for num, account in accounts.items()
+            if isinstance(account, dict)
+        }
+
+    def _attest_limit_resets(
+        self, records: dict[str, FetchRecord]
+    ) -> dict[str, FetchRecord]:
+        """Keep a limit-resets answer only for the slot the server says its
+        token belongs to.
+
+        The local sources a fetch takes its credential from (the slot's
+        backup, its session profile, Claude Code's live store) can race
+        with a swap, a ``/login`` or a Keychain failure and hand the fetch
+        another account's credential under this slot's name; the usage read
+        shares those races, which predate this feature. The resets answer
+        does not rely on them: it is kept only when the profile probe made
+        with the same token (``LimitResetsRead.account_uuid``/``org_uuid``)
+        names the slot's stored ``uuid`` and ``organizationUuid``, read now.
+        Anything else (another account, a failed probe, a slot with no
+        stored uuid, an unreadable roster) is not kept: the slot's previous
+        entry stays (the menu checks its ids before showing it) and the
+        reservation stamp stands, so pacing never depends on attribution
+        (the account the probe named was stamped before its resets request,
+        ``SlotResetsGate.admit``).
+        """
+        ids = self._slot_account_ids()
+        out = dict(records)
+        for num, record in records.items():
+            read = record.limit_resets
+            if read is None or read.cedar_ember is None:
+                continue
+            slot_uuid, slot_org = ids.get(num, ("", ""))
+            if (
+                slot_uuid
+                and read.account_uuid == slot_uuid
+                and (read.org_uuid or "") == slot_org
+            ):
+                continue
+            out[num] = dataclasses.replace(record, limit_resets=None)
+            self._logger.debug(
+                "Limit resets answer for account %s not kept: the server did "
+                "not attest the token as this slot's account.", num,
+            )
+        return out
 
     def _slot_token_dead(self, num: str, email: str) -> bool:
         """Is this slot quarantined as refresh-token-dead, right now?

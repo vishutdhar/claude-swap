@@ -1836,7 +1836,7 @@ def test_codex_row_after_accounts_when_present(capp, codex):
     assert last.action() is None and last.state() == 0  # not a switch
     assert last.view().panel.kind == "codex" and last.view().is_last
     assert not items[1].view().is_last  # the last account now has its rule
-    assert capp.title.endswith(" · Codex 56% · UR 2")
+    assert capp.title.endswith(" · Codex 56%")  # the row keeps its UR; the title does not
 
 
 def test_codex_row_is_also_a_text_row(capp):
@@ -1913,7 +1913,8 @@ def test_codex_done_marks_dirty_and_rebuilds(capp, codex):
     capp.on_sync_tick(None)
     panel = _account_items(capp)[-1].view().panel
     assert (panel.badge_text, panel.badge_state) == ("UR 0", "over")
-    assert capp.title.endswith("UR 0")
+    assert capp.title.endswith(" · Codex 56%")  # the count is in the dropdown only
+    assert "UR" not in capp.title
 
 
 def test_codex_done_logs_usage_once_per_change(capp, codex, caplog):
@@ -1943,7 +1944,7 @@ def test_rename_menu_has_codex_entry_and_sets_alias(capp, window, tmp_path):
     assert json.loads((tmp_path / "menubar_settings.json").read_text())["codex_alias"] == "Review"
     assert _account_items(capp)[-1].title().startswith("Review · 7d 56%")
     assert _account_items(capp)[-1].view().panel.name_text == "Review"
-    assert capp.title.endswith(" · Review 56% · UR 2")
+    assert capp.title.endswith(" · Review 56%")
     assert [i.title() for i in _submenu(capp, "Rename account").itemArray()][-1] == "Review  (Codex)"
     assert getattr(capp.switcher, "renames", []) == []  # the account store is never touched
     window.answer = (1, "  ")  # empty: back to "Codex"
@@ -2002,7 +2003,7 @@ def test_a_hand_edited_codex_alias_the_rule_refuses_shows_codex(capp):
     capp.snapshot = _snap(_entry("1", "a@x.com", active=True))
     capp.rebuild_menu()
     assert _account_items(capp)[-1].view().panel.name_text == "Codex"
-    assert capp.title.endswith(" · Codex 56% · UR 2")
+    assert capp.title.endswith(" · Codex 56%")
 
 
 def test_the_codex_panel_switches_nothing(capp, queued, on_screen):
@@ -2030,7 +2031,7 @@ def test_in_place_repaint_includes_codex_row(capp, codex, cshown, on_screen):
     assert [i.view() for i in _account_items(capp)] == views  # the same views, redrawn
     assert _pcts(capp)[:2] == ["55%", "66%"]
     assert views[-1].panel.badge_text == "UR 3"
-    assert capp.title.endswith(" · Codex 56% · UR 3")
+    assert capp.title.endswith(" · Codex 56%") and "UR" not in capp.title
 
 
 def test_in_place_repaint_waits_when_the_codex_block_changed_height(capp, codex, cshown, on_screen):
@@ -2141,7 +2142,7 @@ def test_codex_finishing_after_the_account_read_repaints_the_open_menu(capp, cod
     assert list(capp.menu._menu.itemArray()) == items  # in place, nothing swapped
     assert [i.view() for i in _account_items(capp)] == views
     assert _pcts(capp)[:2] == ["55%", "66%"]
-    assert capp.title.endswith(" · Codex 61% · UR 3")
+    assert capp.title.endswith(" · Codex 61%")
     assert capp._dirty  # the rebuild after the close still runs
 
 
@@ -2297,3 +2298,111 @@ def test_blocked_codex_monitor_does_not_delay_or_drop_account_refreshes(tmp_path
     except ProcessLookupError:
         alive = False
     assert not alive
+
+
+# --- limit resets on the Claude accounts (the UR tag) --------------------------------
+
+def _stored_resets(left):
+    """A stored limit-resets entry holding one grant until 2099."""
+    return {
+        "grants": [{
+            "id": "g", "label": "Free limit reset", "left": left, "total": 1,
+            "ends_at": "2099-01-01T00:00:00+00:00", "usable_now": True, "paused": False,
+        }],
+        "eligible": True, "fetched_at": 1.0,
+    }
+
+
+def _entry_resets(num, email, active=False, left=1, pct=10.0):
+    usage = {"five_hour": {"pct": pct}, "limit_resets": _stored_resets(left)}
+    return (num, email, active, usage, usage, None, False, None)
+
+
+def test_the_title_shows_no_limit_resets_and_the_dropdown_keeps_them(app):
+    app.snapshot = _snap(_entry_resets("1", "a@x.com", active=True), _entry("2", "b@x.com"))
+    app.rebuild_menu()
+    assert app.title.endswith("10%") and "UR" not in app.title
+    assert "Limit resets in title" not in [i.title() for i in _submenu(app, "Settings").itemArray()]
+    panels = [i.view().panel for i in _account_items(app)]
+    assert [(p.num, p.badge_text) for p in panels] == [("1", "UR 1"), ("2", None)]
+
+
+def test_account_panels_carry_the_resets_pill_only_with_a_grant(app):
+    app.settings.show_usage_bars = True
+    app.snapshot = _snap(
+        _entry_resets("1", "a@x.com", active=True, left=0),
+        _entry("2", "b@x.com"),
+        _entry_resets("3", "c@x.com"),
+    )
+    app.rebuild_menu()
+    got = [(i.view().panel.badge_text, i.view().panel.badge_state) for i in _account_items(app)]
+    assert got == [("UR 0", "over"), (None, "ok"), ("UR 1", "ok")]
+
+
+def test_text_rows_carry_the_resets_too(app):
+    app.settings.show_usage_bars = False
+    app.snapshot = _snap(_entry_resets("1", "a@x.com", active=True), _entry("2", "b@x.com"))
+    app.rebuild_menu()
+    titles = [i.title() for i in _account_items(app)]
+    assert titles[0].endswith("5h 10% · UR 1") and "UR" not in titles[1]
+
+
+def test_usage_log_gains_the_resets_and_logs_again_when_only_they_change(app, caplog):
+    with caplog.at_level(logging.INFO, logger="claude-swap"):
+        app._log_usage(_snap(_entry_resets("1", "a@x.com", active=True, left=1)))
+        app._log_usage(_snap(_entry_resets("1", "a@x.com", active=True, left=1)))  # same: not again
+        app._log_usage(_snap(_entry_resets("1", "a@x.com", active=True, left=0)))  # the reset was used
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("usage a@x.com")]
+    assert lines == ["usage a@x.com: 5h 10% · UR 1", "usage a@x.com: 5h 10% · UR 0"]
+
+
+def test_resets_pill_appears_and_disappears_in_place_without_height_change(app, shown, on_screen):
+    with_grant = _snap(_entry("1", "a@x.com", active=True, pct=55.0), _entry_resets("2", "b@x.com", left=1, pct=66.0))
+    without = _snap(_entry("1", "a@x.com", active=True, pct=56.0), _entry("2", "b@x.com", pct=67.0))
+    source = shown(_Source(with_grant, without))
+    items = list(app.menu._menu.itemArray())
+    views = [i.view() for i in _account_items(app)]
+    heights = [v.frame().size.height for v in views]
+    assert views[1].panel.badge_text is None
+
+    assert _row(app).accessibilityPerformPress()
+    assert _pump(lambda: not _row(app).busy)
+    assert views[1].panel.badge_text == "UR 1"  # the pill appears in the open menu
+    assert (list(app.menu._menu.itemArray()), [i.view() for i in _account_items(app)]) == (items, views)
+    assert [v.frame().size.height for v in views] == heights
+    assert not app._rebuild_pending  # nothing to redo when the menu closes
+
+    assert _row(app).accessibilityPerformPress()
+    assert _pump(lambda: not _row(app).busy)
+    assert views[1].panel.badge_text is None  # and goes again
+    assert (list(app.menu._menu.itemArray()), [i.view() for i in _account_items(app)]) == (items, views)
+    assert [v.frame().size.height for v in views] == heights
+    assert _pcts(app) == ["56%", "67%"]
+    assert len(source.takes) == 2
+
+
+@pytest.mark.parametrize("bars", [True, False], ids=["panels", "text-rows"])
+def test_title_stays_ur_free_after_in_place_refresh(capp, codex, cshown, on_screen, bars):
+    capp.settings.show_usage_bars = bars
+    capp.rebuild_menu()
+    after = _snap(
+        _entry_resets("1", "a@x.com", active=True, left=1, pct=55.0),
+        _entry_resets("2", "b@x.com", left=0, pct=66.0),
+    )
+    cshown(_Source(after))
+    codex.state = _codex_state(credits=3)
+    items = list(capp.menu._menu.itemArray())
+    assert _row(capp).accessibilityPerformPress()
+    assert _pump(lambda: not _row(capp).busy)
+    assert list(capp.menu._menu.itemArray()) == items  # redrawn in place
+    # The dropdown carries every count; the title carries none.
+    if bars:
+        assert [i.view().panel.badge_text for i in _account_items(capp)] == ["UR 1", "UR 0", "UR 3"]
+    else:
+        titles = [i.title() for i in _account_items(capp)]
+        assert titles[0].endswith("· UR 1") and titles[1].endswith("· UR 0")
+        assert titles[2].startswith("Codex · 7d 56% · UR 3")
+    assert capp.title == "⇄ a · 55% · Codex 56%"
+    _close(capp)  # and after the full rebuild the close owes
+    capp.on_sync_tick(None)
+    assert capp.title == "⇄ a · 55% · Codex 56%"

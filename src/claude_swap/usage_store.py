@@ -35,6 +35,8 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from claude_swap.codex_usage import dated_ahead, finite_float
+from claude_swap.exceptions import LockError
 from claude_swap.locking import FileLock
 from claude_swap import oauth
 from claude_swap.poll_policy import (
@@ -61,6 +63,150 @@ STALE_OK_S = 300.0  # trusted for switch decisions; older → headroom unknown
 # polling interval.
 CLAIM_TTL_S = 90.0  # in-flight claim window: skip just-claimed accounts
 LEGACY_CLAIM_TTL_S = 10.0  # additive-schema overlap with older collectors
+
+# The limit-resets read (oauth.request_limit_resets) speaks with Claude Code's
+# User-Agent, so it spends Claude Code's polling budget on the usage
+# endpoint, not ours. The resets change rarely (a grant is added, used or
+# ends), so a slot is asked at most once an hour, inside its own usage
+# fetch, paced from the last try whether it answered or not (a failing read
+# must not retry on every poll). Refresh now (and ``list --fresh``) may ask
+# again after ten minutes. The try time is fetch state, kept on the row as
+# in ``LimitResetsAttempts`` and written by ``reserve_limit_resets`` right
+# before the request is sent: a read whose record is later thrown away (a
+# foreign-credential sentinel, a collector killed mid-fetch) still paces the
+# next one. The entry itself, with its own ``fetched_at``, rides in
+# ``lastGood`` beside the windows.
+#
+# The interval belongs to the ACCOUNT, not to the slot's row: a row is
+# replaced whenever its slot's identity changes (a swap, an add over the
+# slot), and a stamp kept on it would go with it. And it lives in its own
+# file, not in usage.json: other writers rewrite usage.json knowing only
+# its schemaVersion and accounts (an older build's store, cswap-renew's
+# heal, an import), and a stamp kept there would be erased by them.
+LIMIT_RESETS_EVERY_S = 3600.0
+LIMIT_RESETS_MANUAL_EVERY_S = 600.0
+LIMIT_RESETS_ATTEMPTS_FILE = "limit_resets_attempts.json"
+LIMIT_RESETS_ATTEMPTS_KEEP_S = 7 * 86400.0  # a departed account's stamp older than this is dropped
+LIMIT_RESETS_LOCK_WAIT_S = 2.0  # a fetch worker waits no longer for the attempts lock
+
+
+class LimitResetsAttempts:
+    """When each account last tried its limit-resets read, and which
+    reservation wrote that.
+
+    ``cache/limit_resets_attempts.json``: ``{"attempts": {"<account uuid>":
+    {"t": epoch, "id": token}}}``, the token the reservation's own (as the
+    Codex launch budget tokens its launches), so a reservation can tell
+    whether the stamp is still its own before it sends. A bare number (no
+    released build wrote one) reads as a stamp with no token, which no
+    reservation owns. Its own file with its own lock sidecar (``<file>.lock``), as
+    the Codex launch budget keeps its log, and written only here, so
+    nothing that rewrites usage.json can erase it, and nothing in it can
+    break a usage read. Every value goes through ``finite_float``: a number
+    too large for a float, or anything not a number, is dropped and never
+    raises. An unreadable file reads as empty: the file only paces a
+    display read, so the worst a lost file costs is one read per account
+    earlier than its interval.
+
+    On write, a stamp is dropped only when its account is no longer in the
+    roster (``roster()``: the stored account uuids, read at that moment) and
+    it is older than LIMIT_RESETS_ATTEMPTS_KEEP_S. A roster account's stamp
+    is never dropped, so a clock that jumps ahead for a while cannot erase a
+    fresh stamp; the file holds the roster plus the accounts that left in
+    the last week. With no roster given, every stamp is judged by age
+    alone; with one that cannot be read (``roster()`` is None, or raises),
+    nothing is dropped.
+    """
+
+    def __init__(
+        self,
+        cache_dir: Path,
+        clock: Callable[[], float],
+        roster: Callable[[], Iterable[str] | None] | None = None,
+    ):
+        self.path = cache_dir / LIMIT_RESETS_ATTEMPTS_FILE
+        self._lock_path = cache_dir / (LIMIT_RESETS_ATTEMPTS_FILE + ".lock")
+        self.clock = clock
+        self._roster = roster
+
+    def _entries(self) -> dict[str, tuple[float, str | None]]:
+        """``{uuid: (stamp, reservation token or None)}``; an unreadable file
+        is empty. Never raises."""
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, RecursionError):
+            return {}
+        stamps = raw.get("attempts") if isinstance(raw, dict) else None
+        out: dict[str, tuple[float, str | None]] = {}
+        if isinstance(stamps, dict):
+            for uuid, value in stamps.items():
+                if isinstance(value, dict):
+                    stamp = finite_float(value.get("t"))
+                    token = value.get("id")
+                    token = token if isinstance(token, str) and token else None
+                else:
+                    stamp, token = finite_float(value), None
+                if isinstance(uuid, str) and uuid and stamp is not None:
+                    out[uuid] = (stamp, token)
+        return out
+
+    def read(self) -> dict[str, float]:
+        """The stamps, by account uuid; an unreadable file is empty. Never raises."""
+        return {uuid: stamp for uuid, (stamp, _token) in self._entries().items()}
+
+    def holds(self, account_uuid: str, token: str | None) -> bool:
+        """Whether ``account_uuid``'s stamp is still the one the reservation
+        ``token`` wrote: no newer reservation has taken the account since."""
+        entry = self._entries().get(account_uuid)
+        return token is not None and entry is not None and entry[1] == token
+
+    def due(self, account_uuid: str, max_age_s: float, stamps: dict[str, float] | None = None) -> bool:
+        """Whether ``account_uuid``'s read is due (``_limit_resets_due``)."""
+        stamps = self.read() if stamps is None else stamps
+        return _limit_resets_due(stamps.get(account_uuid), self.clock(), max_age_s)
+
+    def reserve(self, account_uuid: str, max_age_s: float) -> str | None:
+        """Under the lock: stamp ``account_uuid`` now when its read is due.
+
+        Returns the reservation's token, written beside the stamp; None
+        when it is not due, or the lock cannot be had, or the file cannot
+        be written: no stamp, no read.
+        """
+        if not account_uuid:
+            return None
+        try:
+            with FileLock(self._lock_path, timeout=LIMIT_RESETS_LOCK_WAIT_S):
+                now = self.clock()
+                entries = self._entries()
+                stamp = entries.get(account_uuid, (None, None))[0]
+                if not _limit_resets_due(stamp, now, max_age_s):
+                    return None
+                token = uuid.uuid4().hex
+                entries[account_uuid] = (now, token)
+                self._write(entries, now)
+                return token
+        except (LockError, OSError):
+            return None
+
+    def _roster_now(self) -> set[str] | None:
+        """The roster's account uuids, empty without a roster, None when it
+        cannot be read."""
+        if self._roster is None:
+            return set()
+        try:
+            uuids = self._roster()
+        except Exception:
+            return None
+        return None if uuids is None else set(uuids)
+
+    def _write(self, entries: dict[str, tuple[float, str | None]], now: float) -> None:
+        roster = self._roster_now()
+        kept = {
+            account: {"t": stamp, "id": token}
+            for account, (stamp, token) in entries.items()
+            if roster is None or account in roster or now - stamp <= LIMIT_RESETS_ATTEMPTS_KEEP_S
+        }
+        atomic_write_json(self.path, {"attempts": kept})
 
 
 def _live_claim(
@@ -289,6 +435,10 @@ class FetchRecord:
     # predate the field — those strikes bind unconditionally, the legacy
     # behavior).
     struck_fp: str | None = None
+    # The limit-resets read made with this success, or None when none was
+    # made (or its answer was not attested for this slot and is not kept).
+    # See _with_limit_resets for how it lands in lastGood.
+    limit_resets: oauth.LimitResetsRead | None = None
 
 
 @dataclass(frozen=True)
@@ -846,10 +996,19 @@ class UsageStore:
     on a single slot).
     """
 
-    def __init__(self, cache_dir: Path, clock: Callable[[], float] = time.time):
+    def __init__(
+        self,
+        cache_dir: Path,
+        clock: Callable[[], float] = time.time,
+        roster: Callable[[], Iterable[str] | None] | None = None,
+    ):
         self.path = cache_dir / "usage.json"
         self._lock_path = cache_dir / ".usage.lock"
         self.clock = clock
+        # The limit-resets try stamps, kept apart from usage.json (see
+        # LimitResetsAttempts); they follow this store's clock, and
+        # ``roster`` (the stored account uuids) keeps theirs from the trim.
+        self.attempts = LimitResetsAttempts(cache_dir, lambda: self.clock(), roster)
 
     # -- raw I/O ------------------------------------------------------------
 
@@ -1109,7 +1268,12 @@ class UsageStore:
                 return
             row["lastAttemptAt"] = now
             if rec.error is None:
-                row["lastGood"] = rec.usage
+                # The resets try was stamped when it was reserved, and that
+                # stamp stands whatever the answer: the record only fills
+                # in what it answered.
+                row["lastGood"] = _with_limit_resets(
+                    rec.usage, row.get("lastGood"), rec.limit_resets, now
+                )
                 row["fetchedAt"] = now
                 # Replace the old, possibly due plan in the outcome transaction
                 # so no collector can slip into a record→replan gap.
@@ -1219,6 +1383,100 @@ class UsageStore:
 
         self._mutate(identities, nums, apply)
 
+    def limit_resets_due(
+        self, account_uuids: dict[str, str], max_age_s: float
+    ) -> set[str]:
+        """The slots whose account's limit-resets read looks due.
+
+        ``account_uuids`` maps each candidate slot to its stored account
+        uuid; a slot without one is never due (nothing could attest its
+        answer). Due per ``LimitResetsAttempts.due``. Read without a lock:
+        a cheap first cut, so only these slots get a gate. The read itself
+        is sent only after ``reserve_limit_resets`` wins it.
+        """
+        stamps = self.attempts.read()
+        return {
+            num for num, uuid in account_uuids.items()
+            if uuid and self.attempts.due(uuid, max_age_s, stamps)
+        }
+
+    def reserve_limit_resets(
+        self,
+        num: str,
+        identity: Identity,
+        claim_id: str,
+        max_age_s: float,
+        *,
+        account_uuid: str,
+    ) -> str | None:
+        """Win the right to send one limit-resets read for ``num``, now.
+
+        Asked right before the request is sent. Under this store's lock the
+        row must still be this identity's and still carry the usage lease
+        ``claim_id`` that this fetch holds (a collector whose lease was
+        taken over sends nothing); then, under the attempts file's own lock,
+        ``account_uuid``'s read must be due and is stamped before any byte
+        goes out (``LimitResetsAttempts.reserve``), so its next read is
+        paced from it whatever becomes of this one's record or of the
+        slot's row. Returns the reservation's token (see
+        ``LimitResetsAttempts``). A lock that cannot be had, or a file that
+        cannot be written, refuses: no reservation (None), no read.
+        """
+        if not account_uuid:
+            return None
+        try:
+            with self._lock():
+                row = self._read_rows().get(num)
+                if not self._matches(row, identity) or row.get("claimId") != claim_id:
+                    return None
+                return self.attempts.reserve(account_uuid, max_age_s)
+        except (LockError, OSError):
+            return None
+
+
+class SlotResetsGate:
+    """The ``oauth.LimitResetsGate`` of one slot's fetch in one pass.
+
+    ``reserve()`` wins the slot's read for its stored account
+    (``UsageStore.reserve_limit_resets``: the usage lease still held, the
+    account due, and stamped) and keeps the reservation's token.
+    ``admit(uuid)`` lets the resets request go to the account the profile
+    probe named. When it is the slot's own, only while the stamp is still
+    this reservation's: a probe that outlived the interval while a newer
+    collector reserved the account sends nothing. Any other account must be
+    due too, and is then reserved (``LimitResetsAttempts.reserve``), so an
+    account read through another slot is paced as well.
+    """
+
+    def __init__(
+        self,
+        store: "UsageStore",
+        num: str,
+        identity: Identity,
+        claim_id: str,
+        max_age_s: float,
+        account_uuid: str,
+    ) -> None:
+        self.store = store
+        self.num = num
+        self.identity = identity
+        self.claim_id = claim_id
+        self.max_age_s = max_age_s
+        self.account_uuid = account_uuid
+        self._token: str | None = None
+
+    def reserve(self) -> bool:
+        self._token = self.store.reserve_limit_resets(
+            self.num, self.identity, self.claim_id, self.max_age_s,
+            account_uuid=self.account_uuid,
+        )
+        return self._token is not None
+
+    def admit(self, account_uuid: str) -> bool:
+        if account_uuid == self.account_uuid:
+            return self.store.attempts.holds(account_uuid, self._token)
+        return self.store.attempts.reserve(account_uuid, self.max_age_s) is not None
+
 
 def _num_or_none(value: object) -> float | None:
     return float(value) if isinstance(value, (int, float)) else None
@@ -1293,6 +1551,61 @@ def _row_eligible(
     if repair_overslept:
         return poll_due or (stale and (next_poll_at is None or overslept))
     return poll_due or stale
+
+
+def _limit_resets_due(stamp: float | None, now: float, max_age_s: float) -> bool:
+    """Whether an account's limit-resets read is due.
+
+    Paced from the account's last try (its reservation's stamp) and nothing
+    else: not the entry's ``fetched_at``, which a failing read carries
+    forward and a clock put back can leave in the future, and not the
+    entry's shape. No stamp, or one too far ahead of the clock
+    (``codex_usage.dated_ahead``: a wrong clock's), is due; one a little
+    ahead counts as a try just made.
+    """
+    if stamp is None or dated_ahead(stamp, now):
+        return True
+    return now - stamp >= max_age_s
+
+
+def _with_limit_resets(
+    usage: dict | None,
+    previous: object,
+    read: oauth.LimitResetsRead | None,
+    now: float,
+) -> dict | None:
+    """A success's ``lastGood``: its windows, and the limit-resets entry.
+
+    An answered, attested read (one whose ``account_uuid`` the server
+    named) replaces the entry: the live grants (``oauth.parse_limit_resets``)
+    with ``fetched_at`` = ``now`` (the store's clock) and the attested
+    ``account_uuid``/``org_uuid``, which the menu compares with the slot's
+    current ids before it shows the entry; or no key at all when the account
+    has no live grant. A read without an attested account is kept no more
+    than a failed one. A failed read, or none made, carries the
+    previous ``lastGood``'s entry forward unchanged, so a usage read in
+    between never loses it. A success without window data stays None:
+    ``lastGood`` is never an entry with no windows.
+    """
+    if not isinstance(usage, dict):
+        return usage
+    if read is not None and read.cedar_ember is not None and read.account_uuid:
+        merged = {k: v for k, v in usage.items() if k != "limit_resets"}
+        entry = oauth.parse_limit_resets(read.cedar_ember, now)
+        if entry is not None:
+            merged["limit_resets"] = {
+                **entry,
+                "fetched_at": now,
+                "account_uuid": read.account_uuid,
+                "org_uuid": read.org_uuid or "",
+            }
+        return merged
+    if "limit_resets" in usage or not isinstance(previous, dict):
+        return usage
+    carried = previous.get("limit_resets")
+    if not isinstance(carried, dict):
+        return usage
+    return {**usage, "limit_resets": carried}
 
 
 def with_sentinel(entry: UsageEntry, sentinel: str | None) -> UsageEntry:

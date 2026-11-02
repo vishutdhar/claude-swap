@@ -1101,3 +1101,70 @@ def test_build_codex_panel_paces_against_the_readings_time():
     (row,) = panel.rows
     assert row.pace_fraction == pytest.approx(0.5)  # elapsed at the measurement, not now
     assert "7 day, 80 percent, ahead of pace, resets in " in mp.accessibility_label(panel)
+
+
+# --- limit resets on the Claude accounts (the UR pill) ------------------------------
+
+def _grant(left=1, ends_in=20 * 86400 + 3600, usable=True, paused=False):
+    """A stored limit-resets entry holding one grant."""
+    return {
+        "grants": [{
+            "id": "g", "label": "Free limit reset", "left": left, "total": max(left, 1),
+            "ends_at": _iso(ends_in), "usable_now": usable, "paused": paused,
+        }],
+        "eligible": True, "fetched_at": _NOW - 60,
+    }
+
+
+def _usage_with(**kwargs):
+    return {"five_hour": {"pct": 12.0}, "seven_day": {"pct": 40.0}, "limit_resets": _grant(**kwargs)}
+
+
+def test_account_panel_has_no_pill_without_a_grant():
+    panel = mp.build_account_panel(_entry({"five_hour": {"pct": 12.0}}), _NOW)
+    assert (panel.badge_text, panel.badge_state, panel.badge_spoken) == (None, "ok", None)
+    assert "UR" not in panel.text_label
+
+
+@pytest.mark.parametrize("kwargs, badge", [
+    ({}, ("UR 1", "ok")),
+    ({"left": 3}, ("UR 3", "ok")),
+    ({"left": 0, "usable": False}, ("UR 0", "over")),
+    ({"usable": False}, ("UR 1", "unknown")),
+    ({"paused": True, "usable": False}, ("UR 1", "unknown")),
+])
+def test_account_panel_pill_states(kwargs, badge):
+    panel = mp.build_account_panel(_entry(_usage_with(**kwargs), active=True), _NOW)
+    assert (panel.badge_text, panel.badge_state) == badge
+    assert panel.badge_state in mp.BADGE_STATES
+    assert panel.text_label.endswith(f"· {badge[0]}")
+    assert panel.state_words == ("active",)  # the pill is not a state word
+
+
+def test_account_panel_pill_is_gone_once_the_grant_has_ended():
+    panel = mp.build_account_panel(_entry(_usage_with(ends_in=-1)), _NOW)
+    assert panel.badge_text is None
+
+
+def test_a_sentinel_row_shows_no_pill():
+    panel = mp.build_account_panel(_entry("token expired"), _NOW)
+    assert panel.badge_text is None
+
+
+def test_account_accessibility_label_says_the_resets_and_their_date():
+    panel = mp.build_account_panel(_entry(_usage_with(), fetched_at=_NOW - 60), _NOW)
+    when = _dt.datetime.fromtimestamp(_NOW + 20 * 86400 + 3600, _dt.timezone.utc).astimezone()
+    label = mp.accessibility_label(panel)
+    assert label.endswith(f". 1 limit reset, use by {when:%b} {when.day}.")
+    plain = mp.accessibility_label(mp.build_account_panel(_entry({"five_hour": {"pct": 12.0}}), _NOW))
+    assert "limit reset" not in plain and "usage reset" not in plain
+
+
+def test_codex_panel_speaks_its_usage_resets_as_before():
+    state = cu.CodexState(
+        True, cu.CodexReading((cu.CodexWindow("7d", 56.0, 10080, _NOW + 86400),), "pro", _NOW - 9, "rollout"),
+        2, _NOW - 60, None,
+    )
+    panel = mp.build_codex_panel(state, _NOW)
+    assert panel.badge_spoken is None
+    assert mp.accessibility_label(panel).endswith(". 2 usage resets.")
