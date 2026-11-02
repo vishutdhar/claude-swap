@@ -490,11 +490,11 @@ def _signal_group(pid: int, sig: int) -> None:
 class ChildGroup:
     """The running app-server's process group, so another thread can end it.
 
-    The client calls ``spawned`` right after the launch and ``reaping``
-    right before it reaps the leader. Between the two the leader is not
-    reaped, so its process group id cannot belong to anyone else, and
-    ``kill`` signals it under the same lock that ``reaping`` takes: it can
-    never reach a group id that has been freed.
+    The client calls ``spawned`` right after the launch, and every reap of
+    the leader goes through it (``poll``, ``reaping``), under its lock.
+    While it holds a pid the leader is not reaped, so that process group id
+    cannot belong to anyone else, and ``kill`` signals it under the same
+    lock: it can never reach a group id that has been freed.
     """
 
     def __init__(self):
@@ -510,6 +510,15 @@ class ChildGroup:
     def reaping(self) -> None:
         with self._lock:
             self._pid = None
+
+    def poll(self, proc: subprocess.Popen) -> bool:
+        """Reap ``proc`` if it has exited (``Popen.poll``, a non-blocking waitpid),
+        forgetting its group in the same step; whether it has exited."""
+        with self._lock:
+            if proc.poll() is None:
+                return False
+            self._pid = None
+            return True
 
     def kill(self) -> bool:
         """SIGKILL the live child's whole group; False when there is none."""
@@ -531,19 +540,22 @@ def _kill_now(proc: subprocess.Popen, child: ChildGroup | None = None) -> None:
         pass
 
 
-def _exited_within(pid: int, seconds: float, abort=None) -> bool:
-    """Whether ``pid`` exits within ``seconds``, without reaping it.
+def _exited_within(proc: subprocess.Popen, seconds: float, abort=None, child: ChildGroup | None = None) -> bool:
+    """Whether the child exits within ``seconds``; reaped if it has.
 
-    The leader stays unreaped until the end, so its process group id cannot
-    be reused by another process while the group is being signalled. False
-    at once when ``abort`` is set: nothing waits once Quit has asked.
+    Polled with ``Popen.poll`` (a non-blocking waitpid), which every Python
+    and platform has (a wait that leaves the child unreaped is missing on
+    macOS before Python 3.13). The
+    reap goes through ``child`` when given, so its group is forgotten in the
+    same step. A group whose leader is reaped can still be signalled while
+    any member lives: POSIX does not reuse a process group id until the
+    group is gone. False at once when ``abort`` is set: nothing waits once
+    Quit has asked.
     """
     deadline = time.monotonic() + seconds
     while True:
-        try:
-            if os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT | os.WNOHANG) is not None:
-                return True
-        except ChildProcessError:
+        exited = child.poll(proc) if child is not None else proc.poll() is not None
+        if exited:
             return True
         if (abort is not None and abort.is_set()) or time.monotonic() >= deadline:
             return False
@@ -631,11 +643,13 @@ class _Session:
         except (OSError, ValueError):
             pass
         pid = self.proc.pid
-        if not (graceful and _exited_within(pid, EXIT_GRACE_S, self.abort)):
-            if not (self.abort is not None and self.abort.is_set()):
-                _signal_group(pid, signal.SIGTERM)
-                _exited_within(pid, TERM_GRACE_S, self.abort)
-        _kill_now(self.proc, self.child)
+        try:
+            if not (graceful and _exited_within(self.proc, EXIT_GRACE_S, self.abort, self.child)):
+                if not (self.abort is not None and self.abort.is_set()):
+                    _signal_group(pid, signal.SIGTERM)
+                    _exited_within(self.proc, TERM_GRACE_S, self.abort, self.child)
+        finally:
+            _kill_now(self.proc, self.child)  # whatever the waits did, the group ends here
         try:
             self.selector.close()
             self.proc.stdout.close()

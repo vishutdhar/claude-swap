@@ -1703,3 +1703,22 @@ def test_rollout_tail_refuses_file_changed_between_lstat_and_open(tmp_path, monk
         pytest.fail(f"the reader blocked opening the substituted {swap}")
     assert result == [None]
     assert spy.bytes_read == 0  # refused before a byte was read
+
+
+# --- no os.waitid: macOS before Python 3.13 has none -----------------------------------
+
+@posix_only
+@pytest.mark.parametrize("mode", ["ok", "hang", "spawn-descendant", "answer-then-hang-ignore-term"])
+def test_the_client_works_without_waitid(tmp_path, monkeypatch, mode):
+    monkeypatch.delattr(os, "waitid", raising=False)
+    server, log = _server(tmp_path, mode)
+    started = time.monotonic()
+    reply = cu.read_rate_limits(server, timeout=2, now=NOW)
+    if mode == "hang":
+        assert reply == cu.AppServerReply(None, None, "timeout")
+    else:
+        assert reply.error is None and reply.reset_credits == 2  # the reply survives the cleanup
+    assert time.monotonic() - started < 8
+    assert _gone(_pid(log))  # killed if need be, and reaped
+    descendants = [int(line.split()[1]) for line in _log(log) if line.startswith("DESCENDANT ")]
+    assert all(_wait_for(lambda pid=pid: _gone(pid), 3.0) for pid in descendants)
