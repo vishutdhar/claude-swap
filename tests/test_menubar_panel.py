@@ -647,6 +647,25 @@ def test_header_spans_never_negative():
     assert (name_w, email_w) == (0.0, 0.0)
 
 
+def test_badge_rect_wraps_the_text_in_the_small_pill_padding():
+    # A tag, not a button: three points either side, one above and below.
+    assert (mp.BADGE_PAD_X, mp.BADGE_PAD_Y, mp.BADGE_RADIUS) == (3.0, 1.0, 3.0)
+    assert mp.badge_rect(100.0, text_top=10.0, text_w=20.0, text_h=11.0, pixel=0.5) == (100.0, 9.0, 26.0, 13.0)
+
+
+@pytest.mark.parametrize("pixel", [0.5, 1.0])  # a Retina screen, a standard one
+def test_badge_rect_edges_land_on_the_nearest_whole_device_pixel(pixel):
+    x, text_top, text_w, text_h = 262.37, 10.434, 21.81, 11.0
+    bx, by, bw, bh = mp.badge_rect(x, text_top=text_top, text_w=text_w, text_h=text_h, pixel=pixel)
+    exact = (
+        x, text_top - mp.BADGE_PAD_Y,
+        x + text_w + 2 * mp.BADGE_PAD_X, text_top + text_h + mp.BADGE_PAD_Y,
+    )
+    for edge, want in zip((bx, by, bx + bw, by + bh), exact):
+        assert edge / pixel == pytest.approx(round(edge / pixel))  # a whole pixel
+        assert abs(edge - want) <= pixel / 2 + 1e-9  # the nearest one
+
+
 def test_right_run_lays_segments_out_from_the_right_edge():
     xs, total = mp.right_run(300.0, [40.0, 30.0], gap=8.0)
     assert xs == [222.0, 270.0]  # left to right, the last one ends at the edge

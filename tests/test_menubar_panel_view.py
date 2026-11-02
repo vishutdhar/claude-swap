@@ -1443,7 +1443,7 @@ def test_codex_header_draws_name_plan_badge_and_age_not_its_key(monkeypatch):
         assert text in strings
     assert "codex" not in strings  # the key is never drawn as a slot number
     fonts = pv._fonts()
-    assert [f for s, f, _c in calls if s == "UR 2"][0].isEqual_(fonts["meta"])
+    assert [f for s, f, _c in calls if s == "UR 2"][0].isEqual_(fonts["tag"])  # the ACTIVE tag's font
     assert _is(_colour_of(calls, "UR 2"), "secondaryLabelColor")
     assert _is(_colour_of(calls, "Codex"), "labelColor")
     assert strings.index("UR 2") < strings.index("9s ago")  # the badge, then the age
@@ -1467,9 +1467,9 @@ def test_badge_pill_is_stroked_in_the_badge_colour(monkeypatch):
     strokes = []
     real = pv._stroke_rounded
 
-    def spy(rect, radius, color):
+    def spy(rect, radius, color, *width):
         strokes.append((rect, color))
-        return real(rect, radius, color)
+        return real(rect, radius, color, *width)
 
     monkeypatch.setattr(pv, "_stroke_rounded", spy)
     panel = _codex_panel(credits=0)
@@ -1477,7 +1477,98 @@ def test_badge_pill_is_stroked_in_the_badge_colour(monkeypatch):
     (rect, color) = strokes[-1]
     assert _is(color, "systemRedColor")
     x, y, w, h = rect
-    assert w > pv._width("UR 0", pv._fonts()["meta"]) + mp.BADGE_PAD_X  # the text has room inside
+    assert w > pv._width("UR 0", pv._fonts()["tag"]) + mp.BADGE_PAD_X  # the text has room inside
+
+
+class _Spot:
+    """A string to draw that notes where it was drawn: font, x, y by string."""
+
+    def __init__(self, real, string, font, log):
+        self._real, self._string, self._font, self._log = real, string, font, log
+
+    def size(self):
+        return self._real.size()
+
+    def drawAtPoint_(self, point):
+        self._log[self._string] = (self._font, point[0], point[1])
+        self._real.drawAtPoint_(point)
+
+    def drawInRect_(self, rect):
+        self._log[self._string] = (self._font, rect.origin.x, rect.origin.y)
+        self._real.drawInRect_(rect)
+
+
+def _header_geometry(monkeypatch, panel):
+    """Draw ``panel`` once; returns the view, where each string went, and the pill strokes.
+
+    Each stroke is (rect, radius, line width), the width None when the
+    drawing passed none.
+    """
+    spots, strokes = {}, []
+    view = pv.make_panel_view(panel, pv.PanelLayout([panel]))
+    real_text, real_stroke = pv._text, pv._stroke_rounded
+
+    def text_spy(string, font, color, truncate=None):
+        return _Spot(real_text(string, font, color, truncate), string, font, spots)
+
+    def stroke_spy(rect, radius, color, *width):
+        strokes.append((rect, radius, width[0] if width else None))
+        return real_stroke(rect, radius, color, *width)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(pv, "_text", text_spy)
+        patch.setattr(pv, "_stroke_rounded", stroke_spy)
+        _render(view)
+    return view, spots, strokes
+
+
+def _changed_rows(a, b):
+    """First and last pixel rows where two same-sized renders differ."""
+    stride = a.bytesPerRow()
+    pa, pb = bytes(a.bitmapData()), bytes(b.bitmapData())
+    rows = [r for r in range(a.pixelsHigh()) if pa[r * stride:(r + 1) * stride] != pb[r * stride:(r + 1) * stride]]
+    return rows[0], rows[-1]
+
+
+def test_badge_pill_renders_no_taller_than_the_tag_line_inside_the_header():
+    import dataclasses
+
+    # Measured on the pixels, not the arithmetic: the rows the badge adds
+    # are its pill and its text.
+    codex = _codex_panel()
+    layout = pv.PanelLayout([codex])
+    view = pv.make_panel_view(codex, layout)
+    shown = _render(view)
+    bare = _render(pv.make_panel_view(dataclasses.replace(codex, badge_text=None), layout))
+    scale = shown.pixelsWide() / view.bounds().size.width
+    first, last = _changed_rows(shown, bare)
+    tag_h = pv._line_h(pv._fonts()["tag"])
+    assert (last + 1 - first) / scale <= tag_h + 2.0  # the ACTIVE tag's line and a point each side
+    assert first / scale >= mp.TOP_PAD
+    assert (last + 1) / scale <= mp.TOP_PAD + layout.header_h  # never taller than the header line
+
+
+def test_badge_text_is_in_the_tag_font_on_the_age_text_baseline(monkeypatch):
+    _view, spots, _strokes = _header_geometry(monkeypatch, _codex_panel())
+    badge_font, _bx, badge_y = spots["UR 2"]
+    age_font, _ax, age_y = spots["9s ago"]
+    assert badge_font.isEqual_(pv._fonts()["tag"])  # the ACTIVE tag's cap height
+    assert badge_y + badge_font.ascender() == pytest.approx(age_y + age_font.ascender())
+
+
+def test_badge_pill_is_a_one_pixel_outline_round_its_text_an_age_gap_before_the_age(monkeypatch):
+    view, spots, strokes = _header_geometry(monkeypatch, _codex_panel())
+    pixel = view.convertSizeFromBacking_((1.0, 1.0)).width
+    (((x, y, w, h), radius, width),) = strokes
+    assert (radius, width) == (mp.BADGE_RADIUS, pixel)  # one device pixel: a hairline on Retina
+    font, text_x, text_y = spots["UR 2"]
+    text_w = pv._width("UR 2", font)
+    # The padding and the gap hold to the nearest pixel, where the outline is snapped.
+    assert text_x - x == pytest.approx(mp.BADGE_PAD_X, abs=pixel / 2)
+    assert x + w - (text_x + text_w) == pytest.approx(mp.BADGE_PAD_X, abs=pixel / 2)
+    assert text_y - y == pytest.approx(mp.BADGE_PAD_Y, abs=pixel / 2)
+    _age_font, age_x, _age_y = spots["9s ago"]
+    assert age_x - (x + w) == pytest.approx(mp.AGE_GAP, abs=pixel / 2)
 
 
 def test_codex_panel_does_not_widen_the_gutter():
