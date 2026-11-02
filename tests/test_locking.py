@@ -41,6 +41,14 @@ class TestFileLock:
         with FileLock(lock_path):
             assert lock_path.parent.exists()
 
+    def test_create_parent_false_never_makes_the_folder(self, tmp_path: Path):
+        """Opted out of making the folder: a missing one is an error, left missing."""
+        lock = FileLock(tmp_path / "gone" / ".lock", create_parent=False)
+        with pytest.raises(FileNotFoundError):
+            lock.acquire(timeout=0)
+        assert not (tmp_path / "gone").exists()
+        assert FileLock(tmp_path / ".lock", create_parent=False).acquire(timeout=0) is True
+
     def test_lock_timeout(self, tmp_path: Path):
         """Test that lock times out when already held."""
         lock_path = tmp_path / ".lock"

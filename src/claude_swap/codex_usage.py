@@ -772,7 +772,16 @@ class LaunchBudget:
     goes for the reset count's time. The reset count is written only together
     with its time, and a count or time that does not read back as valid is
     dropped. ``last_failure`` says why the last reservation or record could
-    not be written ("launch log unwritable", "launch log busy").
+    not be written ("launch log unwritable", "launch log busy",
+    "launch log unreadable", "launch log missing").
+
+    A history that cannot be trusted admits nothing and is never written
+    over (fail closed): content that does not read as this log, cut off,
+    or with any entry that is not a launch, is "unreadable"; a log that
+    this process has read or written before and that is gone now is
+    "missing" (a missing log is a fresh start only for a process that has
+    never seen one); and the log's folder is never made again, so a
+    vanished folder is "missing" too.
 
     The log, read under the lock, is the only record: nothing is kept in
     memory beside it. A copy in memory could only bring back what another
@@ -802,29 +811,63 @@ class LaunchBudget:
         self.lock_timeout = lock_timeout
         self.last_failure: str | None = None
         self.last_reservation: str | None = None  # the token of the last reservation written
+        self._seen = False  # this process has read or written the log at this path
 
-    def _read_raw(self) -> dict:
+    def _load(self) -> tuple[str, dict]:
+        """``("ok", log)``, ``("missing", {})`` or ``("unreadable", {})``."""
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return "missing", {}
         except (OSError, ValueError):
-            return {}
-        return raw if isinstance(raw, dict) else {}
+            return "unreadable", {}
+        if not isinstance(raw, dict) or not isinstance(raw.get("launches"), list):
+            return "unreadable", {}
+        return "ok", raw
 
-    def _read(self) -> list[tuple[float, str | None]]:
-        """``(time, token)`` for each launch in the log; a bare number has no token."""
-        launches = self._read_raw().get("launches")
-        if not isinstance(launches, list):
-            return []
+    @staticmethod
+    def _entries(raw: dict) -> list[tuple[float, str | None]] | None:
+        """``(time, token)`` for each launch, or None when any entry is not one.
+
+        An entry is ``{"t": time, "id": token or null}``, or a bare number
+        (no token) as earlier builds wrote it.
+        """
         found = []
-        for entry in launches[-_LOG_KEEP:]:
+        for entry in raw["launches"][-_LOG_KEEP:]:
             if isinstance(entry, dict):
                 t, token = finite_float(entry.get("t")), entry.get("id")
-                token = token if isinstance(token, str) and token else None
+                if token is not None and not (isinstance(token, str) and token):
+                    return None
             else:
                 t, token = finite_float(entry), None
-            if t is not None:
-                found.append((t, token))
+            if t is None:
+                return None
+            found.append((t, token))
         return found
+
+    def _history(self, now: float) -> list[tuple[float, str | None]] | None:
+        """The log's launches inside the rolling day, as ``(time, token)``, oldest
+        first; None, with ``last_failure`` set, when the log cannot be trusted.
+
+        Two launches in the same second are two launches: nothing is
+        deduplicated. Entries more than ``FUTURE_SLACK_S`` ahead of ``now``
+        are left out.
+        """
+        status, raw = self._load()
+        if status == "missing":
+            if self._seen or not self.path.parent.is_dir():
+                self.last_failure = "launch log missing"
+                return None
+            return []  # this process's first run at this path
+        entries = self._entries(raw) if status == "ok" else None
+        if entries is None:
+            self.last_failure = "launch log unreadable"
+            return None
+        self._seen = True
+        return sorted(
+            (e for e in entries if now - e[0] < DAY_S and not dated_ahead(e[0], now)),
+            key=lambda e: e[0],
+        )
 
     def load_credits(self, now: float | None = None) -> tuple[int | None, float | None]:
         """The saved reset count and when it was reported, or ``(None, None)``.
@@ -832,7 +875,7 @@ class LaunchBudget:
         With ``now``, a count dated more than ``FUTURE_SLACK_S`` ahead of it
         is a wrong clock's and is not trusted.
         """
-        raw = self._read_raw()
+        _status, raw = self._load()
         count, at = _reset_count(raw.get("reset_credits")), finite_float(raw.get("credits_at"))
         if count is None or at is None or (now is not None and dated_ahead(at, now)):
             return None, None
@@ -852,41 +895,45 @@ class LaunchBudget:
             return
         try:
             now = _read_clock(at if now is None else now)
-            self._write(now, self._recent(now), credits=(credits, at))
+            history = self._history(now)
+            if history is not None:  # never over a log that cannot be trusted
+                self._write(now, history, credits=(credits, at))
         finally:
             lock.release()
 
     def _acquire(self) -> FileLock | None:
-        """The budget's lock, held; None, with ``last_failure`` set, when it cannot be had."""
-        lock = FileLock(self.lock_path, timeout=self.lock_timeout)
+        """The budget's lock, held; None, with ``last_failure`` set, when it cannot be had.
+
+        The log's folder is never made: a missing one is "launch log missing".
+        """
+        if not self.path.parent.is_dir():
+            self.last_failure = "launch log missing"
+            return None
+        lock = FileLock(self.lock_path, timeout=self.lock_timeout, create_parent=False)
         try:
             if lock.acquire():
                 return lock
             self.last_failure = "launch log busy"
         except OSError:  # the lock file cannot even be created
-            self.last_failure = "launch log unwritable"
+            missing = not self.path.parent.is_dir()
+            self.last_failure = "launch log missing" if missing else "launch log unwritable"
         return None
 
-    def _recent(self, now: float) -> list[tuple[float, str | None]]:
-        """The log's launches inside the rolling day, as ``(time, token)``, oldest first.
-
-        Two launches in the same second are two launches: nothing is
-        deduplicated. Entries more than ``FUTURE_SLACK_S`` ahead of ``now``
-        are left out.
-        """
-        return sorted(
-            (e for e in self._read() if now - e[0] < DAY_S and not dated_ahead(e[0], now)),
-            key=lambda e: e[0],
-        )
-
     def launches_in_last_day(self, now: float) -> int:
-        return len(self._recent(now))
+        """Launches in the rolling day; a log that cannot be trusted counts as full."""
+        history = self._history(now)
+        return self.daily_cap if history is None else len(history)
 
     def may_launch(self, now: float, manual: bool, first_of_process: bool) -> bool:
-        """Whether a launch may go now. In order: the daily cap, the first
-        launch of this process, a manual one 30 minutes after the last, a
-        scheduled one six hours after it."""
-        recent = [t for t, _token in self._recent(now)]
+        """Whether a launch may go now. In order: a log that can be trusted,
+        the daily cap, the first launch of this process, a manual one 30
+        minutes after the last, a scheduled one six hours after it."""
+        return self._allows(self._history(now), now, manual, first_of_process)
+
+    def _allows(self, history, now: float, manual: bool, first_of_process: bool) -> bool:
+        if history is None:
+            return False
+        recent = [t for t, _token in history]
         if len(recent) >= self.daily_cap:
             return False
         if first_of_process or not recent:
@@ -911,11 +958,12 @@ class LaunchBudget:
             return False
         try:
             now = _read_clock(now)
-            if not self.may_launch(now, manual, first_of_process):
+            history = self._history(now)
+            if not self._allows(history, now, manual, first_of_process):
                 return False
             if go is not None and not go():
                 return False
-            token = self._append(now)
+            token = self._append(now, history)
             if token is None:
                 return False
             self.last_reservation = token
@@ -939,7 +987,9 @@ class LaunchBudget:
             return
         try:
             now = _read_clock(time.time if now is None else now)
-            launches = self._recent(now)
+            launches = self._history(now)
+            if launches is None:
+                return  # never over a log that cannot be trusted
             kept = [entry for entry in launches if entry[1] != token]
             if len(kept) != len(launches):
                 self._write(now, kept)
@@ -956,14 +1006,17 @@ class LaunchBudget:
         if lock is None:
             return False
         try:
-            return self._append(_read_clock(now)) is not None
+            now = _read_clock(now)
+            history = self._history(now)
+            return history is not None and self._append(now, history) is not None
         finally:
             lock.release()
 
-    def _append(self, now: float) -> str | None:
-        """Add a launch at ``now`` with a new token to the log (lock held); the token, or None."""
+    def _append(self, now: float, history) -> str | None:
+        """Add a launch at ``now`` with a new token to ``history`` and write it (lock
+        held); the token, or None."""
         token = uuid.uuid4().hex
-        if not self._write(now, sorted(self._recent(now) + [(now, token)], key=lambda e: e[0])):
+        if not self._write(now, sorted(history + [(now, token)], key=lambda e: e[0])):
             self.last_failure = "launch log unwritable"
             return None
         return token
@@ -983,12 +1036,12 @@ class LaunchBudget:
             data["reset_credits"], data["credits_at"] = saved
         tmp = None
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=self.path.name + ".", suffix=".tmp")
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(data, f)
             os.replace(tmp, self.path)
             tmp = None
+            self._seen = True
             return True
         except OSError:
             return False

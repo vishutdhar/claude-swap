@@ -521,27 +521,33 @@ def test_budget_file_keeps_a_day_only(tmp_path):
     assert saved == {"launches": [NOW]}
 
 
-@pytest.mark.parametrize("text", ["{ not json", "[1, 2]", '{"launches": "x"}', '{"launches": [true, "1", null]}'])
-def test_budget_unreadable_file_is_empty(tmp_path, text):
-    (tmp_path / "launches.json").write_text(text)
-    budget = _budget(tmp_path)
-    assert budget.launches_in_last_day(NOW) == 0
-    assert budget.may_launch(NOW, manual=False, first_of_process=False)
-    budget.record(NOW)
-    assert _logged(tmp_path / "launches.json") == {"launches": [NOW]}
-
-
 def test_budget_refuses_a_launch_it_cannot_write_down(tmp_path):
-    # No launch without a written reservation: a log that cannot be written
-    # admits nothing, so no restart can start with a clean slate.
+    # No launch without a written reservation: a log that cannot be read or
+    # written admits nothing, so no restart can start with a clean slate.
     blocked = tmp_path / "launches.json"
-    blocked.mkdir()  # a folder where the file should be: every write fails
+    blocked.mkdir()  # a folder where the file should be: it reads as no log at all
     budget = cu.LaunchBudget(blocked)
     assert budget.reserve(NOW, manual=False, first_of_process=True) is False  # never raises
-    assert budget.last_failure == "launch log unwritable"
+    assert budget.last_failure == "launch log unreadable"
     assert budget.record(NOW) is False
-    assert budget.launches_in_last_day(NOW + 1) == 0
+    assert budget.launches_in_last_day(NOW + 1) == budget.daily_cap  # not trusted: counts as full
     assert sorted(p.name for p in tmp_path.iterdir()) == ["launches.json", "launches.json.lock"]  # no temp file
+
+
+@posix_only
+def test_budget_refuses_a_launch_it_cannot_write_down_in_a_read_only_folder(tmp_path):
+    home = tmp_path / "backup"
+    home.mkdir()
+    path = home / "launches.json"
+    budget = cu.LaunchBudget(path)
+    assert budget.reserve(NOW, manual=False, first_of_process=True)
+    home.chmod(0o500)  # the log stays readable, nothing in the folder can be replaced
+    try:
+        assert budget.reserve(NOW + 7 * HOUR, manual=True, first_of_process=True) is False
+        assert budget.last_failure == "launch log unwritable"
+        assert budget.launches_in_last_day(NOW + 7 * HOUR) == 1
+    finally:
+        home.chmod(0o700)
 
 
 @posix_only
@@ -549,14 +555,14 @@ def test_concurrent_budget_reservations_enforce_limits(tmp_path, monkeypatch):
     import threading
     import time
 
-    real_recent = cu.LaunchBudget._recent
+    real_history = cu.LaunchBudget._history
 
-    def slow_recent(self, now):
-        found = real_recent(self, now)
+    def slow_history(self, now):
+        found = real_history(self, now)
         time.sleep(0.02)  # widen the gap between reading the log and writing it
         return found
 
-    monkeypatch.setattr(cu.LaunchBudget, "_recent", slow_recent)
+    monkeypatch.setattr(cu.LaunchBudget, "_history", slow_history)
 
     def race(attempts):
         barrier, results = threading.Barrier(len(attempts)), []
@@ -608,7 +614,8 @@ def test_unwritable_budget_survives_restart_without_extra_launches(tmp_path, how
             states.append(monitor.tick())
             clock.now += 1
         assert app.calls == []
-        assert {s.error for s in states} == {"launch log unwritable"}
+        expected = {"folder-in-the-way": "launch log unreadable", "read-only-folder": "launch log unwritable"}
+        assert {s.error for s in states} == {expected[how]}
     finally:
         home.chmod(0o700)
 
@@ -964,9 +971,10 @@ def test_oversized_numbers_in_a_reply_and_the_launch_log(tmp_path):
     path = tmp_path / "launches.json"
     path.write_text('{"launches": [%s, %s], "reset_credits": 2, "credits_at": %s}' % (HUGE, NOW, HUGE))
     budget = cu.LaunchBudget(path)
-    assert budget.launches_in_last_day(NOW) == 1
     assert budget.load_credits() == (None, None)
-    assert budget.reserve(NOW + 7 * HOUR, manual=False, first_of_process=False)
+    # An entry that is not a launch: the whole log is not trusted (fail closed).
+    assert budget.reserve(NOW + 7 * HOUR, manual=False, first_of_process=False) is False
+    assert budget.last_failure == "launch log unreadable"
 
 
 @pytest.mark.parametrize("value, expected", [
@@ -1288,3 +1296,65 @@ def test_cleanup_kills_descendants_after_leader_exits(tmp_path):
     (descendant,) = [int(line.split()[1]) for line in _log(log) if line.startswith("DESCENDANT ")]
     assert _gone(_pid(log))  # the server left on its own when its input closed
     assert _wait_for(lambda: _gone(descendant), 3.0)  # and what it started did not outlive it
+
+
+
+# --- a log that cannot be trusted admits nothing ------------------------------------------
+
+CORRUPT_LOGS = [
+    '{"launches": [{"t": 1, "id": "x"}',  # cut off mid-write
+    "{ not json",
+    "[1, 2]",
+    '{"launches": "x"}',
+    '{"launches": [true]}',
+    '{"launches": [{"t": "soon", "id": "x"}]}',
+    "{}",
+]
+
+
+def test_corrupt_or_deleted_launch_history_fails_closed(tmp_path):
+    path = tmp_path / "launches.json"
+    budget = cu.LaunchBudget(path)
+    assert budget.reserve(NOW, manual=False, first_of_process=True)  # first run: no log yet
+    for text in CORRUPT_LOGS:
+        path.write_text(text)
+        assert budget.reserve(NOW + 7 * HOUR, manual=True, first_of_process=True) is False, text
+        assert budget.last_failure == "launch log unreadable"
+        assert budget.record(NOW + 7 * HOUR) is False
+        budget.save_credits(2, NOW + 7 * HOUR)
+        budget.release(budget.last_reservation, now=NOW + 7 * HOUR)
+        assert path.read_text() == text  # never written over with an emptied history
+    path.unlink()  # deleted while this process runs: lost, not a first run
+    assert budget.reserve(NOW + 7 * HOUR, manual=True, first_of_process=True) is False
+    assert budget.last_failure == "launch log missing"
+    assert not path.exists()
+    assert cu.LaunchBudget(path).reserve(NOW + 7 * HOUR, manual=False, first_of_process=True)  # a new process
+
+
+def test_a_corrupt_log_is_reported_once_and_launches_nothing(tmp_path, caplog):
+    (tmp_path / "launches.json").write_text("{ not json")
+    app = _AppServer(cu.AppServerReply(_reading(56.0, NOW, "app-server"), 2, None))
+    monitor, _reads = _monitor(tmp_path, app=app)
+    with caplog.at_level(logging.DEBUG, logger="claude-swap"):
+        states = [monitor.tick(manual=True) for _ in range(3)]
+    assert app.calls == []
+    assert {s.error for s in states} == {"launch log unreadable"}
+    assert sum("launch log unreadable" in r.getMessage() for r in caplog.records) == 1
+
+
+def test_disappearing_log_directory_fails_closed(tmp_path):
+    home = tmp_path / "backup"
+    home.mkdir()
+    path = home / "launches.json"
+    budget = cu.LaunchBudget(path)
+    assert budget.reserve(NOW, manual=False, first_of_process=True)
+    path.unlink()
+    budget.lock_path.unlink()
+    home.rmdir()  # the whole folder goes
+    assert budget.reserve(NOW + 7 * HOUR, manual=True, first_of_process=True) is False
+    assert budget.last_failure == "launch log missing"
+    budget.save_credits(2, NOW + 7 * HOUR)
+    assert budget.record(NOW + 7 * HOUR) is False
+    assert not home.exists()  # never made again by the budget
+    assert cu.LaunchBudget(path).reserve(NOW + 7 * HOUR, manual=False, first_of_process=True) is False
+    assert not home.exists()

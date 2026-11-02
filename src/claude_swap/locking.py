@@ -19,9 +19,13 @@ from claude_swap.exceptions import LockError
 class FileLock:
     """Cross-process file lock using platform-specific APIs."""
 
-    def __init__(self, lock_path: Path, timeout: float = 10.0):
+    def __init__(self, lock_path: Path, timeout: float = 10.0, create_parent: bool = True):
         self.lock_path = lock_path
         self.timeout = timeout
+        # False: a missing parent folder is an error (FileNotFoundError from
+        # acquire), never made again; for callers whose folder vanishing
+        # means their state is gone.
+        self.create_parent = create_parent
         self._lock_file: IO | None = None
         self._locked = False
 
@@ -37,7 +41,8 @@ class FileLock:
         """
         if timeout is None:
             timeout = self.timeout
-        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        if self.create_parent:
+            self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock_file = open(self.lock_path, "w")
 
         start = time.monotonic()
