@@ -13348,3 +13348,86 @@ class TestLimitResetsAttributionUnverified:
         assert "Bearer sk-backup" in sent
         assert "limit_resets" not in row["lastGood"]
         assert isinstance(row.get("limitResetsAttemptAt"), float)  # still paced
+
+
+class TestActivePathResets:
+    """The active account's resets read, made after its usage read and the
+    ownership verdict: never without a good usage read, never once the
+    pass has lost the slot's lease."""
+
+    IDENT1 = {"1": ("test@example.com", "")}
+
+    def _switcher(self, sample_sequence_data):
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        return s
+
+    def _run(self, s, usage_answer, extra=()):
+        sent = []
+
+        def fake_urlopen(req, timeout=0):
+            token = req.get_header("Authorization")
+            if req.full_url == oauth.LIMIT_RESETS_URL:
+                sent.append(token)
+                body = {"cedar_ember": TestLimitResetsAttribution.GRANT}
+            elif token == "Bearer sk-active" and isinstance(usage_answer, Exception):
+                raise usage_answer
+            else:
+                body = usage_answer if token == "Bearer sk-active" else {"seven_day": {"utilization": 21.0}}
+            resp = MagicMock()
+            resp.read.return_value = json.dumps(body).encode()
+            resp.__enter__ = lambda r: r
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        with patch.object(
+            ClaudeAccountSwitcher, "_read_active_credentials",
+            return_value=ActiveCredentials(_oauth_creds("sk-active", 7200), False),
+        ), patch.object(
+            ClaudeAccountSwitcher, "_read_account_credentials", return_value=_oauth_creds("sk-backup", 7200),
+        ), patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake_urlopen):
+            for cm in extra:
+                cm.__enter__()
+            try:
+                s._collect_usage_entries(s._build_accounts_info())
+            finally:
+                for cm in reversed(extra):
+                    cm.__exit__(None, None, None)
+        return sent
+
+    @pytest.mark.no_limit_resets_fake
+    @pytest.mark.parametrize("usage_answer", [
+        urllib.error.HTTPError("u", 429, "Too Many", hdrs=None, fp=None),
+        {},  # an answer with no window data
+    ], ids=["usage-429", "usage-empty"])
+    def test_active_failed_or_empty_usage_never_reserves_resets(
+        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch, usage_answer
+    ):
+        monkeypatch.setattr(oauth, "claude_code_user_agent", lambda: "claude-cli/2.1.316 (external, cli)")
+        s = self._switcher(sample_sequence_data)
+        sent = self._run(s, usage_answer)
+        assert "Bearer sk-active" not in sent
+        assert sent == ["Bearer sk-backup"]  # the other slot is read as usual
+        row = json.loads(s._usage_store.path.read_text())["accounts"]["1"]
+        assert "limitResetsAttemptAt" not in row
+
+    @pytest.mark.no_limit_resets_fake
+    def test_active_lease_taken_over_during_probe_never_sends_resets(
+        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch
+    ):
+        monkeypatch.setattr(oauth, "claude_code_user_agent", lambda: "claude-cli/2.1.316 (external, cli)")
+        s = self._switcher(sample_sequence_data)
+        taken = []
+
+        def probe_while_another_collector_takes_the_slot(*_args, **_kwargs):
+            taken.append(s._usage_store.claim(["1"], self.IDENT1)["1"])
+
+        monkeypatch.setattr(s, "_resync_rotated_backup", probe_while_another_collector_takes_the_slot)
+        sent = self._run(s, {"seven_day": {"utilization": 30.0}})
+        assert taken  # the lease moved while the probe ran
+        assert "Bearer sk-active" not in sent
+        row = json.loads(s._usage_store.path.read_text())["accounts"]["1"]
+        assert "limitResetsAttemptAt" not in row
+        assert row["claimId"] == taken[0]  # the other collector's lease is untouched
