@@ -2424,6 +2424,14 @@ def test_remaining_grant_stays_visible_after_earliest_grant_expires(new_york):
     assert menubar.limit_resets_badge(usage, december) is None  # both ended
 
 
+def test_spent_usable_grant_does_not_make_remaining_resets_usable(new_york):
+    spent = _one_grant(left=0, usable=True, id="a")
+    waiting = _one_grant(left=1, usable=False, id="b", ends_at="2026-11-25T12:00:00+00:00")
+    usage = {**_USAGE, "limit_resets": _resets(spent, waiting)}
+    assert menubar.limit_resets_badge(usage, _UR_NOW) == ("UR 1", "unknown")  # dimmed
+    assert menubar.limit_resets_spoken(usage, _UR_NOW) == "1 limit reset, not usable now, use by Nov 25"
+
+
 def test_badge_while_the_grant_is_still_live():
     usage = _with_resets(ends_at="2026-11-02T12:00:01+00:00")
     assert menubar.limit_resets_badge(usage, _UR_NOW) == ("UR 1", "ok")

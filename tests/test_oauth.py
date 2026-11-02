@@ -2064,3 +2064,20 @@ class TestReadLimitResetsFor:
         monkeypatch.setattr(oauth, "request_limit_resets", lambda token: sent.append(token))
         assert oauth.read_limit_resets_for(creds, lambda: asked.append(1) or True) is None
         assert (asked, sent) == ([], [])
+
+
+class TestLimitResetsUsableNow:
+    def test_spent_usable_grant_does_not_make_remaining_resets_usable(self):
+        spent = _grant(id="a", resets_left=0, usable_now=True)
+        waiting = _grant(id="b", resets_left=1, usable_now=False)
+        summary = _summary(_cedar([spent, waiting]))
+        assert (summary["left"], summary["usable_now"]) == (1, False)
+
+    def test_usable_needs_a_live_unpaused_grant_with_resets_left(self):
+        usable = _grant(id="u", resets_left=1, usable_now=True, ends_at="2026-11-02T12:00:30+00:00")
+        waiting = _grant(id="w", resets_left=1, usable_now=False)
+        entry = oauth.parse_limit_resets(_cedar([usable, waiting]), _NOW)
+        assert oauth.summarize_limit_resets(entry, _NOW)["usable_now"] is True
+        assert oauth.summarize_limit_resets(entry, _NOW + 31)["usable_now"] is False  # the usable one ended
+        paused = _summary(_cedar([_grant(paused=True, usable_now=True)]))
+        assert (paused["paused"], paused["usable_now"]) == (True, False)

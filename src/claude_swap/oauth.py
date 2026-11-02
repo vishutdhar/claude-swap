@@ -598,7 +598,9 @@ def summarize_limit_resets(entry, now: float) -> dict | None:
 
     Summed over the stored grants whose ``ends_at`` is still ahead of
     ``now`` and that are not paused: ``left`` and ``total``, ``usable_now``
-    (any of them), ``label`` (the first one's) and ``ends_at``, the soonest
+    (one of them is usable now and still has resets left: a spent grant
+    never makes another's reset usable, and a paused one never is),
+    ``label`` (the first one's) and ``ends_at``, the soonest
     end among those that still have resets left (among all of them when
     none has: a used reset still shows until it ends). When every live grant
     is paused, those are summed instead and ``paused`` is true: a paused
@@ -634,7 +636,10 @@ def summarize_limit_resets(entry, now: float) -> dict | None:
         "total": sum(total for _grant, _ends, _left, total in counted),
         "ends_at": _utc_iso(min(ends for _grant, ends, _left, _total in dated)),
         "label": label if isinstance(label, str) else None,
-        "usable_now": any(grant.get("usable_now") is True for grant, *_rest in counted),
+        "usable_now": any(
+            grant.get("usable_now") is True and left > 0 and grant.get("paused") is not True
+            for grant, _ends, left, _total in counted
+        ),
         "eligible": entry.get("eligible") is True,
         "paused": paused,
     }
