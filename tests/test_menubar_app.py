@@ -2207,3 +2207,74 @@ def test_quit_during_post_reply_cleanup_kills_before_exit(tmp_path, monkeypatch,
     finally:
         built.refresh_timer.stop()
         built.sync_timer.stop()
+
+
+def test_blocked_codex_monitor_does_not_delay_or_drop_account_refreshes(tmp_path, monkeypatch):
+    # A real monitor whose app-server read hangs (its own 20 s timeout) while
+    # the account rows refresh: every refresh starts at once and none is lost.
+    import os
+    import sys as _sys
+    from pathlib import Path
+
+    fake = Path(__file__).parent / "fixtures" / "fake_codex_app_server.py"
+    log = tmp_path / "server.log"
+    script = tmp_path / "codex-hang"
+    script.write_text(f'#!/bin/sh\nexec "{_sys.executable}" "{fake}" hang "{log}" "$@"\n', encoding="utf-8")
+    script.chmod(0o755)
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    monitor = cu.CodexMonitor(
+        sessions, cu.LaunchBudget(tmp_path / "codex-launches.json"), script, logging.getLogger("claude-swap"),
+        read_rollouts=lambda folder, now: None,
+    )
+    monkeypatch.setattr(rumps.rumps, "application_support", lambda _name: str(tmp_path))
+    monkeypatch.setattr("claude_swap.snapshot_source.SnapshotSource", _NoFetch)
+    monkeypatch.setattr(rumps, "notification", lambda *a, **k: None)
+    monkeypatch.setattr(menubar, "_adapt_snapshot", lambda raw: raw)
+    built = menubar.create_app(_FakeSwitcher(tmp_path), codex_monitor=monitor)  # starts the Codex read
+    pid = None
+    try:
+        deadline = time.monotonic() + 5
+        while (not log.exists() or "METHOD initialize" not in log.read_text()) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        (pid,) = [int(line[4:]) for line in log.read_text().splitlines() if line.startswith("PID ")]
+        assert monitor.busy  # the Codex read is stuck mid-conversation
+        _wait_idle(built)
+        takes = []
+
+        class Source:
+            def take(self, **kw):
+                takes.append(kw)
+                return _BEFORE
+
+        built._snapshot_source = Source()
+
+        def refreshes_at_once(action):
+            before, started = len(takes), time.monotonic()
+            action()
+            while (len(takes) == before or built._refreshing) and time.monotonic() - started < 2.0:
+                time.sleep(0.01)
+            assert len(takes) == before + 1  # this one ran, and only this one
+            assert time.monotonic() - started < 1.0  # at once, not after the Codex read
+
+        for _ in range(3):
+            refreshes_at_once(lambda: built.on_refresh_tick(None))
+        refreshes_at_once(built.on_refresh_pressed)
+        built.on_sync_tick(None)  # the press reports back (the menu is closed)
+        refreshes_at_once(lambda: built._make_switch_to("2")(None))
+        assert built.switcher.switched == ["2"]
+        assert [kw["fresh"] for kw in takes] == [False, False, False, True, False]
+        assert monitor.busy  # still stuck all along
+    finally:
+        started = time.monotonic()
+        assert monitor.close(timeout=2.0) is True
+        assert time.monotonic() - started < 2.5
+        if pid is not None:
+            try:
+                os.kill(pid, 0)
+                alive = True
+            except ProcessLookupError:
+                alive = False
+            assert not alive
+        built.refresh_timer.stop()
+        built.sync_timer.stop()
