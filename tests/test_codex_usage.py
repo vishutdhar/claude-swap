@@ -1405,3 +1405,13 @@ def test_a_lock_on_a_replaced_sidecar_is_retried_then_refused(tmp_path, monkeypa
     assert budget.last_failure == "launch log busy"
     assert len(attempts) == cu.LOCK_ATTEMPTS == 5
     assert not (tmp_path / "launches.json").exists()
+
+
+def test_duplicate_token_release_never_removes_multiple_entries(tmp_path):
+    path = tmp_path / "launches.json"
+    copied = [{"t": NOW - 30, "id": "abc"}] * 3 + [{"t": NOW - 20, "id": "x1"}, {"t": NOW - 10, "id": "x2"}]
+    path.write_text(json.dumps({"launches": copied}))  # a log copied with a token repeated
+    budget = cu.LaunchBudget(path)
+    budget.release("abc", now=NOW)
+    assert _logged(path)["launches"] == [NOW - 30, NOW - 30, NOW - 20, NOW - 10]  # one taken back
+    assert budget.launches_in_last_day(NOW) == 4

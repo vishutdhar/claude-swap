@@ -992,7 +992,7 @@ class LaunchBudget:
     def release(self, token: str | None, now=None) -> None:
         """Take back the reservation ``token`` (its child never started). Never raises.
 
-        Only the entry with that token goes: one already trimmed is not
+        Only one entry with that token goes: one already trimmed is not
         looked for under its time, so another menu bar's launch in the same
         second stays. A launch without a token is never released. ``now`` (a
         number or a clock, read inside the lock; default the time now) dates
@@ -1008,9 +1008,12 @@ class LaunchBudget:
             launches = self._history(now)
             if launches is None:
                 return  # never over a log that cannot be trusted
-            kept = [entry for entry in launches if entry[1] != token]
-            if len(kept) != len(launches):
-                self._write(now, kept)
+            for index, entry in enumerate(launches):
+                if entry[1] == token:
+                    # Exactly one: a log copied with a token repeated must not
+                    # lose several counted launches to one release.
+                    self._write(now, launches[:index] + launches[index + 1:])
+                    break
         finally:
             self._release(lock)
 
