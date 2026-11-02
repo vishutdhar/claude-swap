@@ -49,6 +49,20 @@ class TestFileLock:
         assert not (tmp_path / "gone").exists()
         assert FileLock(tmp_path / ".lock", create_parent=False).acquire(timeout=0) is True
 
+    def test_holds_path_follows_the_file_at_the_path(self, tmp_path: Path):
+        """A lock guards its path only while its file is still the one there."""
+        lock_path = tmp_path / ".lock"
+        lock = FileLock(lock_path)
+        assert lock.holds_path() is False  # not held
+        assert lock.acquire(timeout=0) is True
+        assert lock.holds_path() is True
+        lock_path.unlink()
+        assert lock.holds_path() is False  # deleted while held
+        lock_path.write_text("")
+        assert lock.holds_path() is False  # another file at the path now
+        lock.release()
+        assert lock.holds_path() is False
+
     def test_lock_timeout(self, tmp_path: Path):
         """Test that lock times out when already held."""
         lock_path = tmp_path / ".lock"

@@ -732,6 +732,7 @@ def _converse(
 DAY_S = 24 * 3600.0
 _LOG_KEEP = 64  # entries read from the log at most; it holds a day's launches
 LOCK_WAIT_S = 2.0  # how long a reservation waits for another menu bar's lock
+LOCK_ATTEMPTS = 5  # locks taken on a sidecar no longer at its path before giving up
 # A launch or a reset count dated further ahead of the clock than this was
 # written under a wrong clock: dropped, never waited out (a clock fast by
 # days would otherwise hold the budget full for days after it is put right).
@@ -812,6 +813,7 @@ class LaunchBudget:
         self.last_failure: str | None = None
         self.last_reservation: str | None = None  # the token of the last reservation written
         self._seen = False  # this process has read or written the log at this path
+        self._held: FileLock | None = None  # the lock while this budget holds it
 
     def _load(self) -> tuple[str, dict]:
         """``("ok", log)``, ``("missing", {})`` or ``("unreadable", {})``."""
@@ -899,25 +901,41 @@ class LaunchBudget:
             if history is not None:  # never over a log that cannot be trusted
                 self._write(now, history, credits=(credits, at))
         finally:
-            lock.release()
+            self._release(lock)
 
     def _acquire(self) -> FileLock | None:
         """The budget's lock, held; None, with ``last_failure`` set, when it cannot be had.
 
         The log's folder is never made: a missing one is "launch log missing".
+        A lock is kept only on the file that is at the sidecar's path once
+        locked (``FileLock.holds_path``): if the sidecar was deleted or
+        replaced, another menu bar may hold a lock on its successor, so the
+        lock is dropped and taken again, ``LOCK_ATTEMPTS`` times at most
+        ("launch log busy").
         """
-        if not self.path.parent.is_dir():
-            self.last_failure = "launch log missing"
-            return None
-        lock = FileLock(self.lock_path, timeout=self.lock_timeout, create_parent=False)
-        try:
-            if lock.acquire():
+        for _attempt in range(LOCK_ATTEMPTS):
+            if not self.path.parent.is_dir():
+                self.last_failure = "launch log missing"
+                return None
+            lock = FileLock(self.lock_path, timeout=self.lock_timeout, create_parent=False)
+            try:
+                if not lock.acquire():
+                    self.last_failure = "launch log busy"
+                    return None
+            except OSError:  # the lock file cannot even be created
+                missing = not self.path.parent.is_dir()
+                self.last_failure = "launch log missing" if missing else "launch log unwritable"
+                return None
+            if lock.holds_path():
+                self._held = lock
                 return lock
-            self.last_failure = "launch log busy"
-        except OSError:  # the lock file cannot even be created
-            missing = not self.path.parent.is_dir()
-            self.last_failure = "launch log missing" if missing else "launch log unwritable"
+            lock.release()  # a lock on a file no longer at the path: take it again
+        self.last_failure = "launch log busy"
         return None
+
+    def _release(self, lock: FileLock) -> None:
+        self._held = None
+        lock.release()
 
     def launches_in_last_day(self, now: float) -> int:
         """Launches in the rolling day; a log that cannot be trusted counts as full."""
@@ -969,7 +987,7 @@ class LaunchBudget:
             self.last_reservation = token
             return True
         finally:
-            lock.release()
+            self._release(lock)
 
     def release(self, token: str | None, now=None) -> None:
         """Take back the reservation ``token`` (its child never started). Never raises.
@@ -994,7 +1012,7 @@ class LaunchBudget:
             if len(kept) != len(launches):
                 self._write(now, kept)
         finally:
-            lock.release()
+            self._release(lock)
 
     def record(self, now) -> bool:
         """Write down a launch without asking the rules (locked). True when written. Never raises.
@@ -1010,14 +1028,13 @@ class LaunchBudget:
             history = self._history(now)
             return history is not None and self._append(now, history) is not None
         finally:
-            lock.release()
+            self._release(lock)
 
     def _append(self, now: float, history) -> str | None:
         """Add a launch at ``now`` with a new token to ``history`` and write it (lock
         held); the token, or None."""
         token = uuid.uuid4().hex
         if not self._write(now, sorted(history + [(now, token)], key=lambda e: e[0])):
-            self.last_failure = "launch log unwritable"
             return None
         return token
 
@@ -1025,7 +1042,10 @@ class LaunchBudget:
         """Replace the log (lock held, atomically) with ``launches`` and the reset
         count: ``credits`` (count, time) when given and newer than the log's,
         else the log's own, when it is valid and not dated ahead of ``now``.
-        False when it could not be written."""
+        False, with ``last_failure`` set, when it could not be written, or when
+        the lock held no longer guards the log (its sidecar was deleted or
+        replaced while held: another menu bar may be writing too), checked
+        last, right before the new log takes the old one's place."""
         data: dict = {"launches": [{"t": t, "id": token} for t, token in launches]}
         saved = self.load_credits(now)
         if credits is not None and not dated_ahead(credits[1], now) and (
@@ -1039,11 +1059,15 @@ class LaunchBudget:
             fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=self.path.name + ".", suffix=".tmp")
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(data, f)
+            if self._held is not None and not self._held.holds_path():
+                self.last_failure = "launch log busy"
+                return False
             os.replace(tmp, self.path)
             tmp = None
             self._seen = True
             return True
         except OSError:
+            self.last_failure = "launch log unwritable"
             return False
         finally:
             if tmp is not None:

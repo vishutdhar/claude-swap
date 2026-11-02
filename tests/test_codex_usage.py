@@ -1358,3 +1358,50 @@ def test_disappearing_log_directory_fails_closed(tmp_path):
     assert not home.exists()  # never made again by the budget
     assert cu.LaunchBudget(path).reserve(NOW + 7 * HOUR, manual=False, first_of_process=True) is False
     assert not home.exists()
+
+
+# --- a lock on a sidecar that is no longer at its path guards nothing ---------------------
+
+@posix_only
+def test_unlinked_held_sidecar_cannot_admit_concurrent_reservations(tmp_path):
+    path = tmp_path / "launches.json"
+    seed = cu.LaunchBudget(path)
+    for i in range(7):
+        assert seed.record(NOW - (7 - i) * 60)  # oldest first, as a clock records them
+    assert seed.launches_in_last_day(NOW) == 7
+    a, b = cu.LaunchBudget(path), cu.LaunchBudget(path)
+    real_allows = a._allows
+    taken = []
+
+    def allows_while_the_sidecar_is_replaced(history, now, manual, first_of_process):
+        os.unlink(a.lock_path)  # someone deletes the sidecar a is holding
+        assert b.reserve(NOW, manual=True, first_of_process=True)  # b locks a new file there, takes the eighth
+        taken.append(b.last_reservation)
+        return real_allows(history, now, manual, first_of_process)  # a had read seven
+
+    a._allows = allows_while_the_sidecar_is_replaced
+    assert a.reserve(NOW, manual=True, first_of_process=True) is False  # its lock no longer guards the log
+    assert a.last_failure == "launch log busy"
+    entries = json.loads(path.read_text())["launches"]
+    assert len(entries) == 8 and taken[0] in [e["id"] for e in entries]  # eight launched, eight written
+
+
+@posix_only
+def test_a_lock_on_a_replaced_sidecar_is_retried_then_refused(tmp_path, monkeypatch):
+    from claude_swap.locking import FileLock
+
+    real_acquire = FileLock.acquire
+    attempts = []
+
+    def acquire_then_lose_the_path(self, timeout=None):
+        got = real_acquire(self, timeout)
+        attempts.append(1)
+        os.unlink(self.lock_path)  # deleted between the open and the check
+        return got
+
+    monkeypatch.setattr(FileLock, "acquire", acquire_then_lose_the_path)
+    budget = cu.LaunchBudget(tmp_path / "launches.json")
+    assert budget.reserve(NOW, manual=False, first_of_process=True) is False
+    assert budget.last_failure == "launch log busy"
+    assert len(attempts) == cu.LOCK_ATTEMPTS == 5
+    assert not (tmp_path / "launches.json").exists()

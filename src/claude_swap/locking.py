@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -62,6 +63,24 @@ class FileLock:
                     self._lock_file = None
                     return False
                 time.sleep(0.1)
+
+    def holds_path(self) -> bool:
+        """Whether the lock held is on the file at ``lock_path`` now.
+
+        False when not held, or when the file was deleted or replaced since
+        it was opened: another process can then lock a new file at the same
+        path, and this lock keeps nobody out. Callers that must not share
+        their critical section check it after acquiring and before
+        committing.
+        """
+        if not (self._lock_file and self._locked):
+            return False
+        try:
+            held = os.fstat(self._lock_file.fileno())
+            there = os.stat(self.lock_path)
+        except OSError:
+            return False
+        return (held.st_dev, held.st_ino) == (there.st_dev, there.st_ino)
 
     def release(self) -> None:
         """Release the lock."""
