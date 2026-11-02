@@ -1490,3 +1490,27 @@ def test_later_abort_does_not_restore_consumed_startup_allowance(tmp_path):
     monitor.enabled = True
     monitor.tick()  # an ordinary tick, within six hours of the start launch
     assert len(calls) == 2  # the allowance used at start does not come back
+
+
+def test_a_stale_corrupt_log_self_heals(tmp_path):
+    stale = tmp_path / "launches.json"
+    stale.write_text("{ not json")
+    os.utime(stale, (NOW - 25 * HOUR, NOW - 25 * HOUR))  # last written over a day ago
+    budget = cu.LaunchBudget(stale)
+    assert budget.launches_in_last_day(NOW) == 0  # nothing in it can be inside the day
+    assert budget.reserve(NOW, manual=False, first_of_process=True)  # one launch
+    assert _logged(stale)["launches"] == [NOW]  # written over as a valid log
+    assert not budget.reserve(NOW + 60, manual=False, first_of_process=False)  # then the rules as ever
+
+    young = tmp_path / "young.json"
+    young.write_text("{ not json")
+    os.utime(young, (NOW - HOUR, NOW - HOUR))  # could hold this day's launches
+    other = cu.LaunchBudget(young)
+    assert other.reserve(NOW, manual=False, first_of_process=True) is False
+    assert other.last_failure == "launch log unreadable"
+    assert young.read_text() == "{ not json"  # untouched
+
+    folder = tmp_path / "folder.json"
+    folder.mkdir()  # not a file at all: never written over, however old
+    os.utime(folder, (NOW - 25 * HOUR, NOW - 25 * HOUR))
+    assert cu.LaunchBudget(folder).reserve(NOW, manual=False, first_of_process=True) is False

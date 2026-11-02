@@ -778,7 +778,10 @@ class LaunchBudget:
 
     A history that cannot be trusted admits nothing and is never written
     over (fail closed): content that does not read as this log, cut off,
-    or with any entry that is not a launch, is "unreadable"; a log that
+    or with any entry that is not a launch, is "unreadable", unless the
+    file was last written more than a day ago, when it cannot hold a launch
+    inside the rolling day and is read as empty (and written over by the
+    next reservation); a log that
     this process has read or written before and that is gone now is
     "missing" (a missing log is a fresh start only for a process that has
     never seen one); and the log's folder is never made again, so a
@@ -847,6 +850,19 @@ class LaunchBudget:
             found.append((t, token))
         return found
 
+    def _stale(self, now: float) -> bool:
+        """The log is a regular file last written more than ``DAY_S`` before ``now``.
+
+        Every launch rewrites the log, so such a file cannot hold a launch
+        inside the rolling day, whatever its content. A modification time
+        ahead of the clock is never stale.
+        """
+        try:
+            st = os.lstat(self.path)
+        except OSError:
+            return False
+        return stat.S_ISREG(st.st_mode) and now - st.st_mtime > DAY_S
+
     def _history(self, now: float) -> list[tuple[float, str | None]] | None:
         """The log's launches inside the rolling day, as ``(time, token)``, oldest
         first; None, with ``last_failure`` set, when the log cannot be trusted.
@@ -863,6 +879,8 @@ class LaunchBudget:
             return []  # this process's first run at this path
         entries = self._entries(raw) if status == "ok" else None
         if entries is None:
+            if self._stale(now):
+                return []  # nothing in it can be inside the day: start afresh
             self.last_failure = "launch log unreadable"
             return None
         self._seen = True
