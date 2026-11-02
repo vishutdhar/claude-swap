@@ -12,6 +12,7 @@ import threading
 import sys
 import tempfile
 import time
+from collections.abc import Collection
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -88,6 +89,8 @@ from claude_swap.process_detection import get_running_instances
 from claude_swap import poll_policy
 from claude_swap.settings import load_settings, parse_model_names, settings_path
 from claude_swap.usage_store import (
+    LIMIT_RESETS_EVERY_S,
+    LIMIT_RESETS_MANUAL_EVERY_S,
     FetchRecord,
     UsageEntry,
     UsageStore,
@@ -4065,10 +4068,18 @@ class ClaudeAccountSwitcher:
         return accounts_info
 
     def _fetch_active_usage(
-        self, account_num: str, email: str, creds: str, org_uuid: str = ""
+        self,
+        account_num: str,
+        email: str,
+        creds: str,
+        org_uuid: str = "",
+        limit_resets: bool = False,
     ) -> FetchRecord:
         """Usage fetch for the active/default account, refreshing an expired
         token under Claude Code's own lock protocol.
+
+        ``limit_resets`` asks for the rare limit-resets read with a
+        successful usage read (see ``_fetch_account_usage``).
 
         Claude Code 2.1.218 is built to *adopt* an externally rotated
         credential rather than collide with it: its refresh takes the
@@ -4133,6 +4144,7 @@ class ClaudeAccountSwitcher:
         if not oauth.is_oauth_token_expired(oauth_data.get("expiresAt")):
             outcome = oauth.try_fetch_usage_for_account(
                 account_num, email, creds, is_active=True,
+                limit_resets=limit_resets,
             )
             if outcome.error != "http-401":
                 if outcome.usage is not None:
@@ -4173,6 +4185,7 @@ class ClaudeAccountSwitcher:
                     usage=outcome.usage,
                     error=outcome.error,
                     retry_after_s=outcome.retry_after_s,
+                    limit_resets=outcome.limit_resets,
                 )
             # A locally-valid token the server rejects: revoked out-of-band
             # (measured: a sibling machine rotating a synced lineage kills
@@ -4616,11 +4629,13 @@ class ClaudeAccountSwitcher:
 
         outcome = oauth.try_fetch_usage_for_account(
             account_num, email, working, is_active=True,
+            limit_resets=limit_resets,
         )
         return FetchRecord(
             usage=outcome.usage,
             error=outcome.error,
             retry_after_s=outcome.retry_after_s,
+            limit_resets=outcome.limit_resets,
         )
 
     def _resync_rotated_backup(
@@ -4801,16 +4816,26 @@ class ClaudeAccountSwitcher:
         return None
 
     def _fetch_account_usage(
-        self, account_info: tuple[int, str, str, str, bool, str, str]
+        self,
+        account_info: tuple[int, str, str, str, bool, str, str],
+        limit_resets: bool = False,
     ) -> FetchRecord:
-        """One network fetch for one account. Never raises."""
+        """One network fetch for one account. Never raises.
+
+        ``limit_resets`` asks for the rare limit-resets read as well, made
+        with the same credential right after a successful usage read and
+        carried in ``FetchRecord.limit_resets`` (the collector decides when
+        it is due: ``UsageStore.limit_resets_due``).
+        """
         num, email, _, org_uuid, is_active, creds, _alias = account_info
 
         # The active/default account owns the live credential — route it
         # through the locked-refresh path (refreshes an expired token under
         # Claude Code's own lock protocol, owner or not).
         if is_active:
-            return self._fetch_active_usage(str(num), email, creds, org_uuid)
+            return self._fetch_active_usage(
+                str(num), email, creds, org_uuid, limit_resets=limit_resets
+            )
 
         from claude_swap.session import (
             read_session_credentials,
@@ -4848,11 +4873,13 @@ class ClaudeAccountSwitcher:
                 if not oauth.is_oauth_token_expired(session_oauth.get("expiresAt")):
                     outcome = oauth.try_fetch_usage_for_account(
                         str(num), email, session_creds, is_active=True,
+                        limit_resets=limit_resets,
                     )
                     return FetchRecord(
                         usage=outcome.usage,
                         error=outcome.error,
                         retry_after_s=outcome.retry_after_s,
+                        limit_resets=outcome.limit_resets,
                     )
                 if has_live_session:
                     # The live claude refreshes lazily on its next API call;
@@ -4871,26 +4898,34 @@ class ClaudeAccountSwitcher:
             refresh_via=(
                 None if has_live_session else self.consume_backup_grant
             ),
+            limit_resets=limit_resets,
         )
         return FetchRecord(
             usage=outcome.usage,
             error=outcome.error,
             retry_after_s=outcome.retry_after_s,
             struck_fp=outcome.struck_fp,
+            limit_resets=outcome.limit_resets,
         )
 
     def _run_usage_fetches(
-        self, infos: list[tuple[int, str, str, str, bool, str, str]]
+        self,
+        infos: list[tuple[int, str, str, str, bool, str, str]],
+        limit_resets: Collection[str] = (),
     ) -> dict[str, FetchRecord]:
         """Fetch the given accounts in parallel, staggering request starts so
-        N accounts never hit the endpoint in the same instant."""
+        N accounts never hit the endpoint in the same instant. The slots
+        named in ``limit_resets`` also get the rare limit-resets read."""
         def fetch_one(
             idx_info: tuple[int, tuple[int, str, str, str, bool, str, str]]
         ) -> tuple[str, FetchRecord]:
             idx, info = idx_info
             if idx and _FETCH_STAGGER_S:
                 time.sleep(idx * _FETCH_STAGGER_S)
-            return str(info[0]), self._fetch_account_usage(info)
+            num = str(info[0])
+            return num, self._fetch_account_usage(
+                info, limit_resets=num in limit_resets
+            )
 
         with ThreadPoolExecutor() as executor:
             return dict(
@@ -5007,8 +5042,15 @@ class ClaudeAccountSwitcher:
 
         if claims:
             pre = entries
+            # Decided after reserve, from what the store holds now, so a try
+            # another collector recorded a moment ago is seen.
+            resets_due = store.limit_resets_due(
+                claims,
+                identities,
+                LIMIT_RESETS_MANUAL_EVERY_S if fresh else LIMIT_RESETS_EVERY_S,
+            )
             records = self._run_usage_fetches(
-                [info_by_num[num] for num in claims]
+                [info_by_num[num] for num in claims], limit_resets=resets_due
             )
             plans, floors = self._plans_after_fetch(records, pre, info_by_num)
             accepted = store.record(

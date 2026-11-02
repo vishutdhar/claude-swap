@@ -29,12 +29,14 @@ batch, not one request.
 from __future__ import annotations
 
 import json
+import math
 import time
 import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from claude_swap.codex_usage import dated_ahead
 from claude_swap.locking import FileLock
 from claude_swap import oauth
 from claude_swap.poll_policy import (
@@ -61,6 +63,18 @@ STALE_OK_S = 300.0  # trusted for switch decisions; older → headroom unknown
 # polling interval.
 CLAIM_TTL_S = 90.0  # in-flight claim window: skip just-claimed accounts
 LEGACY_CLAIM_TTL_S = 10.0  # additive-schema overlap with older collectors
+
+# The limit-resets read (oauth.request_limit_resets) speaks with Claude Code's
+# User-Agent, so it spends Claude Code's polling budget on the usage
+# endpoint, not ours. The resets change rarely (a grant is added, used or
+# ends), so a slot is asked at most once an hour, inside its own usage
+# fetch, paced from the last try whether it answered or not (a failing read
+# must not retry on every poll). Refresh now (and ``list --fresh``) may ask
+# again after ten minutes. The try time is fetch state, kept on the row as
+# ``limitResetsAttemptAt``; the entry itself, with its own ``fetched_at``,
+# rides in ``lastGood`` beside the windows.
+LIMIT_RESETS_EVERY_S = 3600.0
+LIMIT_RESETS_MANUAL_EVERY_S = 600.0
 
 
 def _live_claim(
@@ -289,6 +303,9 @@ class FetchRecord:
     # predate the field — those strikes bind unconditionally, the legacy
     # behavior).
     struck_fp: str | None = None
+    # The limit-resets read made with this success, or None when none was
+    # made. See _with_limit_resets for how it lands in lastGood.
+    limit_resets: oauth.LimitResetsRead | None = None
 
 
 @dataclass(frozen=True)
@@ -1109,7 +1126,11 @@ class UsageStore:
                 return
             row["lastAttemptAt"] = now
             if rec.error is None:
-                row["lastGood"] = rec.usage
+                row["lastGood"] = _with_limit_resets(
+                    rec.usage, row.get("lastGood"), rec.limit_resets, now
+                )
+                if rec.limit_resets is not None:
+                    row["limitResetsAttemptAt"] = now
                 row["fetchedAt"] = now
                 # Replace the old, possibly due plan in the outcome transaction
                 # so no collector can slip into a record→replan gap.
@@ -1219,6 +1240,34 @@ class UsageStore:
 
         self._mutate(identities, nums, apply)
 
+    def limit_resets_due(
+        self,
+        nums: Iterable[str],
+        identities: dict[str, Identity],
+        max_age_s: float,
+    ) -> set[str]:
+        """The slots among ``nums`` whose limit-resets read is due.
+
+        Due when the last try (``limitResetsAttemptAt``, else the stored
+        entry's ``fetched_at``) is at least ``max_age_s`` old, unknown, or
+        dated ahead of the clock (written under a clock since put back,
+        ``codex_usage.dated_ahead``). A row of another account is due. Read
+        without the lock (writes are atomic replaces); call it after
+        ``reserve`` so a just-recorded try is seen.
+        """
+        now = self.clock()
+        rows = self._read_rows()
+        due: set[str] = set()
+        for num in nums:
+            row = rows.get(num)
+            if not self._matches(row, identities[num]):
+                due.add(num)
+                continue
+            assert isinstance(row, dict)
+            if _limit_resets_due(row, now, max_age_s):
+                due.add(num)
+        return due
+
 
 def _num_or_none(value: object) -> float | None:
     return float(value) if isinstance(value, (int, float)) else None
@@ -1293,6 +1342,60 @@ def _row_eligible(
     if repair_overslept:
         return poll_due or (stale and (next_poll_at is None or overslept))
     return poll_due or stale
+
+
+def _finite_or_none(value: object) -> float | None:
+    number = _num_or_none(value) if not isinstance(value, bool) else None
+    return number if number is not None and math.isfinite(number) else None
+
+
+def _limit_resets_due(row: dict, now: float, max_age_s: float) -> bool:
+    """Whether a stored row's limit-resets read is due (see ``limit_resets_due``)."""
+    last_good = row.get("lastGood")
+    entry = last_good.get("limit_resets") if isinstance(last_good, dict) else None
+    stamps = [
+        stamp
+        for stamp in (
+            _finite_or_none(row.get("limitResetsAttemptAt")),
+            _finite_or_none(entry.get("fetched_at")) if isinstance(entry, dict) else None,
+        )
+        if stamp is not None
+    ]
+    if not stamps:
+        return True
+    last = max(stamps)
+    return dated_ahead(last, now) or now - last >= max_age_s
+
+
+def _with_limit_resets(
+    usage: dict | None,
+    previous: object,
+    read: oauth.LimitResetsRead | None,
+    now: float,
+) -> dict | None:
+    """A success's ``lastGood``: its windows, and the limit-resets entry.
+
+    An answered read replaces the entry: the parsed grants with
+    ``fetched_at`` = ``now`` (the store's clock), or no key at all when the
+    account has no live grant. A failed read, or none made, carries the
+    previous ``lastGood``'s entry forward unchanged, so a usage read in
+    between never loses it. A success without window data stays None:
+    ``lastGood`` is never an entry with no windows.
+    """
+    if not isinstance(usage, dict):
+        return usage
+    if read is not None and read.cedar_ember is not None:
+        merged = {k: v for k, v in usage.items() if k != "limit_resets"}
+        entry = oauth.parse_limit_resets(read.cedar_ember, now)
+        if entry is not None:
+            merged["limit_resets"] = {**entry, "fetched_at": now}
+        return merged
+    if "limit_resets" in usage or not isinstance(previous, dict):
+        return usage
+    carried = previous.get("limit_resets")
+    if not isinstance(carried, dict):
+        return usage
+    return {**usage, "limit_resets": carried}
 
 
 def with_sentinel(entry: UsageEntry, sentinel: str | None) -> UsageEntry:

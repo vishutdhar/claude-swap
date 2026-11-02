@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import time
+import urllib.error
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
@@ -1963,7 +1964,7 @@ class TestListFresh:
         with live, backup, patch.object(
             s,
             "_fetch_account_usage",
-            side_effect=lambda info: FetchRecord(usage=self.NEW[str(info[0])]),
+            side_effect=lambda info, **_: FetchRecord(usage=self.NEW[str(info[0])]),
         ) as fetch:
             payload = s.list_accounts(json_output=True, **kwargs)
         fetched = sorted(str(c.args[0][0]) for c in fetch.call_args_list)
@@ -2050,7 +2051,7 @@ class TestListFresh:
         live, backup = self._creds()
         with live, backup, patch.object(
             s, "_fetch_account_usage",
-            side_effect=lambda info: outcomes[str(info[0])],
+            side_effect=lambda info, **_: outcomes[str(info[0])],
         ):
             payload = s.list_accounts(json_output=True, fresh=True)
         after = s._usage_store.entries(self.IDENT)
@@ -2158,7 +2159,7 @@ class TestListFresh:
         with live, backup, patch.object(
             s,
             "_fetch_account_usage",
-            side_effect=lambda info: FetchRecord(usage=self.NEW[str(info[0])]),
+            side_effect=lambda info, **_: FetchRecord(usage=self.NEW[str(info[0])]),
         ) as fetch:
             entries = s._collect_usage_entries(s._build_accounts_info(), fresh=True)
         assert [str(c.args[0][0]) for c in fetch.call_args_list] == ["1"]
@@ -2302,7 +2303,7 @@ class TestActiveAccountRefresh:
             locks_held_during_post["config"] = config_lock_dir().is_dir()
             return oauth.RefreshOutcome(self._REFRESHED, None)
 
-        def mock_fetch(account_num, email, credentials, is_active):
+        def mock_fetch(account_num, email, credentials, is_active, **_):
             from claude_swap.claude_locks import config_lock_dir
             assert is_active is True
             assert credentials == self._REFRESHED  # rotated token used for usage
@@ -2372,7 +2373,7 @@ class TestActiveAccountRefresh:
             }
         })
 
-        def mock_fetch(account_num, email, credentials, is_active):
+        def mock_fetch(account_num, email, credentials, is_active, **_):
             assert credentials == cc_rotated
             return oauth.UsageOutcome({"five_hour": {"pct": 7}})
 
@@ -2703,7 +2704,7 @@ class TestActiveAccountRefresh:
         })
         fetch_calls = []
 
-        def mock_fetch(account_num, email, credentials, is_active):
+        def mock_fetch(account_num, email, credentials, is_active, **_):
             fetch_calls.append(credentials)
             if credentials == valid_but_revoked:
                 return oauth.UsageOutcome(None, error="http-401")
@@ -8258,7 +8259,7 @@ class TestActiveRefreshProvenance:
             "expiresAt": 9_999_999_999_000,
         }})
 
-        def mock_fetch(account_num, email, credentials, is_active):
+        def mock_fetch(account_num, email, credentials, is_active, **_):
             assert is_active is True
             assert credentials == refreshed  # rotated under the locks
             return oauth.UsageOutcome({"five_hour": {"pct": 10}})
@@ -12878,3 +12879,189 @@ class TestSessionShellGuardCoversEveryMutator:
         s = self._switcher(sample_sequence_data, monkeypatch)
         with pytest.raises(SwitchError):
             s.unset_alias("2")
+
+
+class TestLimitResetsInTheFetchPass:
+    """The rare limit-resets read rides on the per-account usage fetch:
+    asked for only when a slot's last try is an hour old (ten minutes for
+    Refresh now / ``list --fresh``), and never touching the paced poll."""
+
+    IDENT = {
+        "1": ("test@example.com", ""),
+        "2": ("account2@example.com", ""),
+    }
+    USAGE = {"five_hour": {"pct": 11.0}, "seven_day": {"pct": 21.0}}
+    GRANT = {
+        "eligible": True, "ineligible_reason": None, "at_limit": False, "exhausted": [],
+        "grants": [{
+            "id": "free_reset_oct_2026", "label": "Free limit reset",
+            "resets_total": 1, "resets_left": 1,
+            "starts_at": "2026-10-21T00:45:00+00:00", "ends_at": "2099-12-01T04:59:00+00:00",
+            "paused": False, "usable_now": True, "use_requires_limit": False,
+        }],
+        "next_grant_id": None, "weekly_resets_at": None, "cooldown_until": None,
+    }
+    NO_GRANT = {"eligible": False, "ineligible_reason": "no_grant", "grants": []}
+
+    def _switcher(self, sample_sequence_data):
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        return s
+
+    def _creds(self):
+        live = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        backup = json.dumps({"claudeAiOauth": {"accessToken": "sk-backup"}})
+        return (
+            patch.object(
+                ClaudeAccountSwitcher, "_read_active_credentials",
+                return_value=ActiveCredentials(live, False),
+            ),
+            patch.object(ClaudeAccountSwitcher, "_read_account_credentials", return_value=backup),
+        )
+
+    def _pass(self, s, fake, **kwargs):
+        live, backup = self._creds()
+        with live, backup, patch.object(s, "_fetch_account_usage", side_effect=fake):
+            return s._collect_usage_entries(s._build_accounts_info(), **kwargs)
+
+    def _age(self, s, seconds, *, poll_due=False):
+        """Move every stored time ``seconds`` into the past; with
+        ``poll_due`` also make every row stale and due for a plain pass."""
+        table = json.loads(s._usage_store.path.read_text())
+        for row in table["accounts"].values():
+            for key in ("fetchedAt", "limitResetsAttemptAt", "lastAttemptAt"):
+                if isinstance(row.get(key), (int, float)):
+                    row[key] -= seconds
+            if isinstance(row.get("lastGood"), dict) and "limit_resets" in row["lastGood"]:
+                row["lastGood"]["limit_resets"]["fetched_at"] -= seconds
+            if poll_due:
+                row["nextPollAt"] = None
+        s._usage_store.path.write_text(json.dumps(table))
+
+    def _fake(self, calls, grant_for=("2",)):
+        def fake(info, limit_resets=False):
+            num = str(info[0])
+            calls.append((num, limit_resets))
+            read = None
+            if limit_resets:
+                read = oauth.LimitResetsRead(self.GRANT if num in grant_for else self.NO_GRANT)
+            return FetchRecord(usage=dict(self.USAGE), limit_resets=read)
+        return fake
+
+    def test_first_pass_asks_every_fetched_slot_then_paces_hourly(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        s = self._switcher(sample_sequence_data)
+        calls = []
+        entries = self._pass(s, self._fake(calls))
+        assert sorted(calls) == [("1", True), ("2", True)]
+        assert entries["2"].last_good["limit_resets"]["left"] == 1
+        assert "limit_resets" not in entries["1"].last_good  # no grant, no key
+
+        # A plain pass that fetches usage again half an hour later: no resets read.
+        self._age(s, 1800, poll_due=True)
+        calls.clear()
+        entries = self._pass(s, self._fake(calls))
+        assert sorted(calls) == [("1", False), ("2", False)]
+        assert entries["2"].last_good["limit_resets"]["left"] == 1  # carried with the new windows
+
+        # An hour after the last try, the next usage fetch asks again.
+        self._age(s, 1800, poll_due=True)
+        calls.clear()
+        self._pass(s, self._fake(calls))
+        assert sorted(calls) == [("1", True), ("2", True)]
+
+    def test_refresh_now_asks_again_after_ten_minutes_not_sooner(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        s = self._switcher(sample_sequence_data)
+        calls = []
+        self._pass(s, self._fake(calls))
+        self._age(s, 599)
+        calls.clear()
+        self._pass(s, self._fake(calls), fresh=True)
+        assert sorted(calls) == [("1", False), ("2", False)]  # re-measured, resets not asked
+        self._age(s, 1)
+        calls.clear()
+        self._pass(s, self._fake(calls), fresh=True)
+        assert sorted(calls) == [("1", True), ("2", True)]
+
+    def test_a_slot_not_fetched_this_pass_is_never_asked(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        s = self._switcher(sample_sequence_data)
+        calls = []
+        self._pass(s, self._fake(calls), fetch={"2"})
+        assert calls == [("2", True)]
+
+    @pytest.mark.no_limit_resets_fake
+    def test_the_paced_poll_is_unchanged_and_the_resets_read_is_its_own_request(
+        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch
+    ):
+        monkeypatch.setattr(oauth, "claude_code_user_agent", lambda: "claude-cli/2.1.316 (external, cli)")
+        s = self._switcher(sample_sequence_data)
+        seen = []
+
+        def fake_urlopen(req, timeout=0):
+            token = req.get_header("Authorization")
+            seen.append((req.full_url, req.get_header("User-agent"), token))
+            if req.full_url == oauth.LIMIT_RESETS_URL:
+                cedar = self.GRANT if token == "Bearer sk-backup" else self.NO_GRANT
+                body = {"five_hour": {"utilization": 99.0}, "cedar_ember": cedar}
+            else:
+                body = {"five_hour": {"utilization": 11.0}, "seven_day": {"utilization": 21.0}}
+            resp = MagicMock()
+            resp.read.return_value = json.dumps(body).encode()
+            resp.__enter__ = lambda r: r
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        live, backup = self._creds()
+        with live, backup, patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake_urlopen):
+            entries = s._collect_usage_entries(s._build_accounts_info())
+            polls = [x for x in seen if x[0] != oauth.LIMIT_RESETS_URL]
+            resets = [x for x in seen if x[0] == oauth.LIMIT_RESETS_URL]
+            assert sorted(polls) == [
+                ("https://api.anthropic.com/api/oauth/usage", "claude-swap/1.0", "Bearer sk-active"),
+                ("https://api.anthropic.com/api/oauth/usage", "claude-swap/1.0", "Bearer sk-backup"),
+            ]
+            assert sorted(resets) == [
+                (oauth.LIMIT_RESETS_URL, "claude-cli/2.1.316 (external, cli)", "Bearer sk-active"),
+                (oauth.LIMIT_RESETS_URL, "claude-cli/2.1.316 (external, cli)", "Bearer sk-backup"),
+            ]
+            # The windows come from the paced poll only, never from the resets answer.
+            assert entries["2"].last_good["five_hour"]["pct"] == 11.0
+            assert entries["2"].last_good["limit_resets"]["left"] == 1
+            assert "limit_resets" not in entries["1"].last_good
+
+            # Re-measured at once (list --fresh): two polls, no resets read.
+            seen.clear()
+            s._collect_usage_entries(s._build_accounts_info(), fresh=True)
+            assert [x[0] for x in seen] == ["https://api.anthropic.com/api/oauth/usage"] * 2
+
+    @pytest.mark.no_limit_resets_fake
+    def test_a_failing_resets_read_leaves_the_usage_read_good(
+        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch
+    ):
+        monkeypatch.setattr(oauth, "claude_code_user_agent", lambda: "claude-cli/2.1.316 (external, cli)")
+        s = self._switcher(sample_sequence_data)
+
+        def fake_urlopen(req, timeout=0):
+            if req.full_url == oauth.LIMIT_RESETS_URL:
+                raise urllib.error.HTTPError(req.full_url, 429, "Too Many", hdrs=None, fp=None)
+            resp = MagicMock()
+            resp.read.return_value = json.dumps({"seven_day": {"utilization": 21.0}}).encode()
+            resp.__enter__ = lambda r: r
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        live, backup = self._creds()
+        with live, backup, patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake_urlopen):
+            entries = s._collect_usage_entries(s._build_accounts_info())
+        for num in ("1", "2"):
+            assert entries[num].last_error is None and entries[num].consecutive_failures == 0
+            assert entries[num].last_good == {"seven_day": {"pct": 21.0}}
+        # The failed try still paces the next one.
+        assert s._usage_store.limit_resets_due(["1", "2"], self.IDENT, 3600.0) == set()

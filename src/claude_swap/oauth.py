@@ -580,6 +580,27 @@ def parse_limit_resets(cedar_ember, now: float) -> dict | None:
     }
 
 
+@dataclass(frozen=True)
+class LimitResetsRead:
+    """One limit-resets read made beside a usage read.
+
+    ``cedar_ember`` is what ``request_limit_resets`` answered: the object,
+    or None when the read failed and nothing was learned. The usage store
+    parses it with its own clock and keeps the previous entry on a failure.
+    """
+
+    cedar_ember: dict | None
+
+
+def _read_limit_resets(access_token: str) -> LimitResetsRead:
+    """``request_limit_resets`` that cannot fail the usage read it rides on."""
+    try:
+        return LimitResetsRead(request_limit_resets(access_token))
+    except Exception as e:  # the contract says never; a bug must not cost the usage
+        _logger.debug("Limit resets read raised: %r", e)
+        return LimitResetsRead(None)
+
+
 def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
     """Map a usage-fetch exception to ``(kind, retry_after_s)``.
 
@@ -785,6 +806,9 @@ class UsageOutcome:
     # permanent auth kind — lets the store bind the strike to that
     # generation (see usage_store.FetchRecord.struck_fp).
     struck_fp: str | None = None
+    # The limit-resets read made right after a successful usage read, when
+    # one was asked for; None when none was made.
+    limit_resets: LimitResetsRead | None = None
 
 
 def fetch_usage(access_token: str) -> dict | None:
@@ -816,6 +840,7 @@ def try_fetch_usage_for_account(
     is_active: bool,
     persist_credentials: Callable[[str, str, str], None] | None = None,
     refresh_via: Callable[[str, str, str], RefreshOutcome] | None = None,
+    limit_resets: bool = False,
 ) -> UsageOutcome:
     """Fetch usage for an account, refreshing expired tokens for inactive accounts only.
 
@@ -825,6 +850,11 @@ def try_fetch_usage_for_account(
     freshest copy under the slot lock, persists via fingerprint CAS, and
     never consumes a superseded snapshot. ``persist_credentials`` is then
     unused for the refresh (the gate persists internally).
+
+    ``limit_resets`` asks for the rare limit-resets read as well: made only
+    after a usage read that succeeded with window data, with the token that
+    read used, and carried in ``UsageOutcome.limit_resets``. Its failure
+    never fails the usage read.
     """
     context = f"for account {account_num}"  # no email: paste-safe for public issues
     oauth = extract_oauth_data(credentials)
@@ -875,9 +905,15 @@ def try_fetch_usage_for_account(
         # A transient refresh failure falls through to try the (expired) token;
         # the 401 path below retries the refresh.
 
+    def succeeded(data: dict, token: str) -> UsageOutcome:
+        usage = build_usage_result(data)
+        if not limit_resets or usage is None:
+            return UsageOutcome(usage)
+        return UsageOutcome(usage, limit_resets=_read_limit_resets(token))
+
     try:
         data = request_usage_data(access_token)
-        return UsageOutcome(build_usage_result(data))
+        return succeeded(data, access_token)
     except urllib.error.HTTPError as e:
         kind, retry_after = _classify_usage_error(e)
         if (
@@ -926,7 +962,7 @@ def try_fetch_usage_for_account(
 
         try:
             data = request_usage_data(new_token)
-            return UsageOutcome(build_usage_result(data))
+            return succeeded(data, new_token)
         except Exception as retry_error:
             kind, retry_after = _classify_usage_error(retry_error)
             _log_usage_failure(context + " after refresh", retry_error, kind, retry_after)
