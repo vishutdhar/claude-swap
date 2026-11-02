@@ -1749,3 +1749,29 @@ def test_the_app_server_gets_the_same_codex_home(tmp_path, value):
     # The child resolves the home exactly as codex_home() does for the rollouts:
     # an absolute one is kept, anything else is dropped so both use ~/.codex.
     assert line == ("CODEX_HOME " + str(tmp_path / "alt") if value == "absolute" else "CODEX_HOME -")
+
+
+# --- a reading dated ahead of the clock is not kept ---------------------------------------
+
+def test_a_reading_dated_ahead_gives_way_after_a_clock_rollback(tmp_path):
+    fast = NOW + 2 * 86400  # a clock two days fast
+    clock = _Clock(fast)
+    app = _AppServer(
+        cu.AppServerReply(_reading(90.0, fast, "app-server"), 2, None),
+        cu.AppServerReply(_reading(12.0, NOW + 60, "app-server"), 3, None),
+    )
+    monitor, _reads = _monitor(tmp_path, app=app, clock=clock)
+    assert monitor.tick().reading.windows[0].pct == 90.0
+    clock.now = NOW + 60  # put right
+    state = monitor.tick()
+    assert len(app.calls) == 2
+    assert state.reading.windows[0].pct == 12.0  # the cached 90% gives way to the next reply
+
+    # With no fresh reading at all, one dated ahead is not shown either.
+    (tmp_path / "b").mkdir()
+    other_clock = _Clock(fast)
+    found = {"reading": _reading(90.0, fast)}
+    rollouts_only, _ = _monitor(tmp_path / "b", rollouts=lambda now: found["reading"], binary=None, clock=other_clock)
+    assert rollouts_only.tick().reading.windows[0].pct == 90.0
+    found["reading"], other_clock.now = None, NOW + 60
+    assert rollouts_only.tick().reading is None

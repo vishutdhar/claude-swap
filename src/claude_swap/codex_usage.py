@@ -1183,11 +1183,19 @@ def ur_badge(credits: int | None, known: bool) -> tuple[str, str]:
     return f"UR {credits}", "over" if credits == 0 else "ok"
 
 
-def _newest(*readings: CodexReading | None) -> CodexReading | None:
-    """The reading measured last; on a tie the earlier argument wins."""
+def _newest(now: float, *readings: CodexReading | None) -> CodexReading | None:
+    """The reading measured last; on a tie the earlier argument wins.
+
+    A reading dated ahead of ``now`` (``dated_ahead``: measured under a
+    clock since put right) is left out, as the rollout reader and the
+    launch budget leave such times out: kept, it would win against every
+    fresh reading until the clock caught up with it.
+    """
     best = None
     for reading in readings:
-        if reading is not None and (best is None or reading.fetched_at > best.fetched_at):
+        if reading is None or dated_ahead(reading.fetched_at, now):
+            continue
+        if best is None or reading.fetched_at > best.fetched_at:
             best = reading
     return best
 
@@ -1335,7 +1343,7 @@ class CodexMonitor:
                 credits, credits_at = reply.reset_credits, self._clock()
                 self.budget.save_credits(credits, credits_at, now=self._clock)
         state = CodexState(
-            True, _newest(self._app_reading, rollout, previous.reading), credits, credits_at, error
+            True, _newest(now, self._app_reading, rollout, previous.reading), credits, credits_at, error
         )
         self._state = state
         return state
