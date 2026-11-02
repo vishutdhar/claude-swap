@@ -3,8 +3,10 @@
     .venv/bin/python tests/render_codex_captures.py [OUT_DIR]
 
 Writes the dropdown (four accounts, then the Codex block) and the Codex
-header states, each in light and dark, to OUT_DIR (default
-~/Code/cswap-captures/codex-block). A fixed clock and example accounts, so
+header states, each in light and dark, to OUT_DIR. OUT_DIR is
+~/Code/cswap-captures/codex-block or a folder inside it, and nothing else:
+any other folder, or one that leads out of it through a symlink, is
+refused before anything is drawn. A fixed clock and example accounts, so
 two runs of one drawing give the same pictures.
 """
 
@@ -14,12 +16,10 @@ import datetime as dt
 import sys
 from pathlib import Path
 
-import AppKit
-
 from claude_swap import codex_usage as cu
 from claude_swap import menubar_panel as mp
-from claude_swap import menubar_panel_view as pv
 
+CAPTURES = Path.home() / "Code" / "cswap-captures" / "codex-block"
 NOW = 1_000_000.0
 HOUR, DAY = 3600.0, 86400.0
 WEEK_MIN = 7 * 24 * 60
@@ -75,15 +75,49 @@ SCENES = {
 }
 
 
+APPEARANCES = (("darkAqua", "dark"), ("aqua", "light"))
+
+
+def _inside(path: Path, folder: Path) -> bool:
+    return path == folder or folder in path.parents
+
+
+def output_dir(arg: str | None, root: Path) -> Path:
+    """The folder to write into, every symlink followed: ``root`` or one inside it.
+
+    Anything else ends the run (SystemExit) before a file is touched.
+    ``root`` must already exist, so nothing above it is ever created.
+    """
+    if not root.is_dir():
+        raise SystemExit(f"refusing to write: {root} does not exist")
+    home = root.resolve()
+    out = (Path(arg).expanduser() if arg else root).resolve()
+    if not _inside(out, home):
+        raise SystemExit(f"refusing to write outside {root}: {out}")
+    return out
+
+
 def main(argv: list[str]) -> int:
-    out = Path(argv[1]) if len(argv) > 1 else Path.home() / "Code" / "cswap-captures" / "codex-block"
-    out.mkdir(parents=True, exist_ok=True)
+    out = output_dir(argv[1] if len(argv) > 1 else None, CAPTURES)
+    home = CAPTURES.resolve()
+    jobs = [
+        (out / f"{name}-{suffix}.png", panels, highlighted, appearance)
+        for name, (panels, highlighted) in SCENES.items()
+        for appearance, suffix in APPEARANCES
+    ]
+    for path, *_rest in jobs:  # a capture file that is a symlink out of the folder
+        if not _inside(path.resolve(), home):
+            raise SystemExit(f"refusing to write outside {CAPTURES}: {path} leads to {path.resolve()}")
+    out.mkdir(parents=True, exist_ok=True)  # resolved inside the folder: only folders below it
+
+    import AppKit
+
+    from claude_swap import menubar_panel_view as pv
+
     AppKit.NSApplication.sharedApplication()
-    for name, (panels, highlighted) in SCENES.items():
-        for appearance, suffix in (("darkAqua", "dark"), ("aqua", "light")):
-            path = out / f"{name}-{suffix}.png"
-            pv.render_png(panels(), str(path), appearance, highlighted=highlighted)
-            print(path)
+    for path, panels, highlighted, appearance in jobs:
+        pv.render_png(panels(), str(path), appearance, highlighted=highlighted)
+        print(path)
     return 0
 
 
