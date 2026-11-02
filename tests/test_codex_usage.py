@@ -1415,3 +1415,29 @@ def test_duplicate_token_release_never_removes_multiple_entries(tmp_path):
     budget.release("abc", now=NOW)
     assert _logged(path)["launches"] == [NOW - 30, NOW - 30, NOW - 20, NOW - 10]  # one taken back
     assert budget.launches_in_last_day(NOW) == 4
+
+
+def test_save_credits_orders_ties_and_future_counts(tmp_path):
+    def log(name):
+        path = tmp_path / name
+        budget = cu.LaunchBudget(path)
+        assert budget.record(NOW - 60)
+        return path, budget
+
+    path, budget = log("newer.json")  # a newer count in the log survives an older reply
+    budget.save_credits(5, NOW + 100, now=NOW + 100)
+    budget.save_credits(3, NOW, now=NOW + 100)
+    assert cu.LaunchBudget(path).load_credits(NOW + 100) == (5, NOW + 100)
+
+    path, budget = log("tie.json")  # the same time: the reply wins
+    budget.save_credits(5, NOW, now=NOW)
+    budget.save_credits(3, NOW, now=NOW)
+    assert cu.LaunchBudget(path).load_credits(NOW) == (3, NOW)
+
+    path, budget = log("ahead.json")  # dated 300 s ahead: kept
+    budget.save_credits(2, NOW + 300, now=NOW)
+    assert cu.LaunchBudget(path).load_credits(NOW) == (2, NOW + 300)
+
+    path, budget = log("too-far.json")  # 301 s ahead: a wrong clock's, not written
+    budget.save_credits(2, NOW + 301, now=NOW)
+    assert "reset_credits" not in json.loads(path.read_text())
