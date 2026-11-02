@@ -5076,9 +5076,7 @@ class ClaudeAccountSwitcher:
                     num, identities[num], claims[num], resets_every,
                     account_uuid=uuids[num],
                 )
-                for num in store.limit_resets_due(
-                    claims, identities, resets_every, account_uuids=uuids
-                )
+                for num in store.limit_resets_due(uuids, resets_every)
             }
             records = self._run_usage_fetches(
                 [info_by_num[num] for num in claims], limit_resets=resets_gates

@@ -12883,7 +12883,15 @@ class TestSessionShellGuardCoversEveryMutator:
 
 def _resets_stamps(s) -> dict:
     """The per-account limit-resets try stamps in a switcher's usage cache."""
-    return json.loads(s._usage_store.path.read_text()).get("limitResetsAttempts", {})
+    return s._usage_store.attempts.read()
+
+
+def _age_resets_stamps(s, seconds) -> None:
+    """Move every account's resets try stamp ``seconds`` into the past."""
+    attempts = s._usage_store.attempts
+    stamps = attempts.read()
+    if stamps:
+        attempts.path.write_text(json.dumps({"attempts": {u: t - seconds for u, t in stamps.items()}}))
 
 
 class TestLimitResetsInTheFetchPass:
@@ -12935,10 +12943,8 @@ class TestLimitResetsInTheFetchPass:
     def _age(self, s, seconds, *, poll_due=False):
         """Move every stored time ``seconds`` into the past; with
         ``poll_due`` also make every row stale and due for a plain pass."""
+        _age_resets_stamps(s, seconds)
         table = json.loads(s._usage_store.path.read_text())
-        stamps = table.get("limitResetsAttempts") or {}
-        for uuid in stamps:
-            stamps[uuid] -= seconds
         for row in table["accounts"].values():
             for key in ("fetchedAt", "lastAttemptAt"):
                 if isinstance(row.get(key), (int, float)):
@@ -13096,9 +13102,7 @@ class TestLimitResetsInTheFetchPass:
             assert entries[num].last_error is None and entries[num].consecutive_failures == 0
             assert entries[num].last_good == {"seven_day": {"pct": 21.0}}
         # The failed try still paces the next one.
-        assert s._usage_store.limit_resets_due(
-            ["1", "2"], self.IDENT, 3600.0, account_uuids={"1": "uuid-1", "2": "uuid-2"}
-        ) == set()
+        assert s._usage_store.limit_resets_due({"1": "uuid-1", "2": "uuid-2"}, 3600.0) == set()
 
 
 class TestLimitResetsPacingSurvivesADiscardedRead:
@@ -13403,10 +13407,8 @@ class _ResetsNetHelpers:
         return entry["grants"][0]["left"] if entry else None
 
     def _age(self, s, seconds):
+        _age_resets_stamps(s, seconds)
         table = json.loads(s._usage_store.path.read_text())
-        stamps = table.get("limitResetsAttempts") or {}
-        for uuid in stamps:
-            stamps[uuid] -= seconds
         for row in table["accounts"].values():
             for key in ("fetchedAt", "lastAttemptAt"):
                 if isinstance(row.get(key), (int, float)):
