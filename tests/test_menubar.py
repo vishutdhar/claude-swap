@@ -2521,7 +2521,7 @@ def _attested_resets(account_uuid="uuid-1", org_uuid=""):
 
 def _acct_with_ids(entry, account_uuid="uuid-1", org_uuid="", active=True, number="1"):
     acct = _FakeAcct(number, "a@x.com", active, entry)
-    acct.account_uuid, acct.org_uuid = account_uuid, org_uuid
+    acct.account_uuid, acct.account_org_uuid = account_uuid, org_uuid
     return acct
 
 

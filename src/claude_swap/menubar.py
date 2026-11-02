@@ -997,14 +997,15 @@ def _adapt_snapshot(snap, marker_path: Path | None = None) -> dict:
     active_usage = None
     active_alias = None
     for acc in snap.accounts:
-        org_uuid = getattr(acc, "org_uuid", "") or ""
-        orgs[acc.number] = org_uuid
+        orgs[acc.number] = getattr(acc, "org_uuid", "") or ""
         # A limit-resets entry reaches the menu only while it is this slot's
         # current account's (the pill, text row, VoiceOver, title and log
-        # all read these two).
+        # all read these two): the slot's stored uuid and organization, read
+        # together after the collection.
         account_uuid = getattr(acc, "account_uuid", "") or ""
-        display = _attested_for_slot(_account_display_usage(acc.usage), account_uuid, org_uuid)
-        last_good = _attested_for_slot(acc.usage.last_good, account_uuid, org_uuid)
+        account_org = getattr(acc, "account_org_uuid", "") or ""
+        display = _attested_for_slot(_account_display_usage(acc.usage), account_uuid, account_org)
+        last_good = _attested_for_slot(acc.usage.last_good, account_uuid, account_org)
         accounts.append(
             (
                 acc.number, acc.email, acc.is_active, display, last_good,

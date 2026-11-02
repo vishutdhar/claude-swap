@@ -1841,6 +1841,8 @@ class ClaudeAccountSwitcher:
             n = str(num)
             if is_active:
                 active_number = n
+            # The slot's stored ids, both from this one read of the roster.
+            stored = (seq_data.get("accounts") or {}).get(n) or {}
             accounts.append(
                 AccountSnapshot(
                     number=n,
@@ -1853,9 +1855,8 @@ class ClaudeAccountSwitcher:
                     usage=entries[n],
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, n),
-                    account_uuid=(
-                        ((seq_data.get("accounts") or {}).get(n) or {}).get("uuid") or ""
-                    ).strip(),
+                    account_uuid=(stored.get("uuid") or "").strip(),
+                    account_org_uuid=(stored.get("organizationUuid") or "").strip(),
                 )
             )
         return AccountsSnapshot(

@@ -13688,3 +13688,47 @@ class TestLimitResetsPacedPerAccount:
         for token in ("sk-a", "sk-b", "sk-active"):
             assert log.count(("resets", token)) == 1, (token, log)
             assert log.count(("profile", token)) == (0 if resets_fail else 1), (token, log)
+
+
+class TestSnapshotIdsReadTogether:
+    def test_org_change_during_collection_hides_previous_org_resets(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        from claude_swap import menubar
+
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        sample_sequence_data["accounts"]["2"].update({"uuid": "uuid-2", "organizationUuid": "org-A"})
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        ident = {"2": ("account2@example.com", "org-A")}
+        # Account A's grant in org A, attested and stored.
+        claim = s._usage_store.claim(["2"], ident)["2"]
+        assert s._usage_store.reserve_limit_resets("2", ident["2"], claim, 3600.0, account_uuid="uuid-2")
+        s._usage_store.record(
+            {"2": FetchRecord(usage={"seven_day": {"pct": 5.0}},
+                              limit_resets=oauth.LimitResetsRead(TestLimitResetsInTheFetchPass.GRANT, "uuid-2", "org-A"))},
+            ident, claims={"2": claim},
+            plans={"2": (time.time() + 600.0, 600.0)},  # as a collector records it: no floor pending
+        )
+        fetched = []
+
+        def fetch(info, limit_resets=None):
+            fetched.append(str(info[0]))
+            if str(info[0]) == "2":
+                # While the pass runs, slot 2 moves to the same account in org B.
+                sample_sequence_data["accounts"]["2"]["organizationUuid"] = "org-B"
+                s._write_json(s.sequence_file, sample_sequence_data)
+            return FetchRecord(usage={"seven_day": {"pct": 6.0}})
+
+        live = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        with patch.object(ClaudeAccountSwitcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(live, False)), \
+             patch.object(ClaudeAccountSwitcher, "_read_account_credentials", return_value=live), \
+             patch.object(s, "_fetch_account_usage", side_effect=fetch):
+            snap = s.accounts_snapshot(fresh=True)
+        assert "2" in fetched  # the slot moved while this pass fetched it
+        acc = {a.number: a for a in snap.accounts}["2"]
+        assert acc.usage.last_good["limit_resets"]  # the org A entry is still stored
+        row = {r[0]: r for r in menubar._adapt_snapshot(snap)["accounts"]}["2"]
+        assert "limit_resets" not in row[3] and "limit_resets" not in row[4]
