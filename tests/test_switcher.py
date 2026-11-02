@@ -12960,7 +12960,7 @@ class TestLimitResetsInTheFetchPass:
         calls = []
         entries = self._pass(s, self._fake(calls))
         assert sorted(calls) == [("1", True), ("2", True)]
-        assert entries["2"].last_good["limit_resets"]["left"] == 1
+        assert entries["2"].last_good["limit_resets"]["grants"][0]["left"] == 1
         assert "limit_resets" not in entries["1"].last_good  # no grant, no key
 
         # A plain pass that fetches usage again half an hour later: no resets read.
@@ -12968,7 +12968,7 @@ class TestLimitResetsInTheFetchPass:
         calls.clear()
         entries = self._pass(s, self._fake(calls))
         assert sorted(calls) == [("1", False), ("2", False)]
-        assert entries["2"].last_good["limit_resets"]["left"] == 1  # carried with the new windows
+        assert entries["2"].last_good["limit_resets"]["grants"][0]["left"] == 1  # carried with the new windows
 
         # An hour after the last try, the next usage fetch asks again.
         self._age(s, 1800, poll_due=True)
@@ -13036,7 +13036,7 @@ class TestLimitResetsInTheFetchPass:
             ]
             # The windows come from the paced poll only, never from the resets answer.
             assert entries["2"].last_good["five_hour"]["pct"] == 11.0
-            assert entries["2"].last_good["limit_resets"]["left"] == 1
+            assert entries["2"].last_good["limit_resets"]["grants"][0]["left"] == 1
             assert "limit_resets" not in entries["1"].last_good
 
             # Re-measured at once (list --fresh): two polls, no resets read.

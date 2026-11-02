@@ -2349,12 +2349,17 @@ import time as _time  # noqa: E402
 _UR_NOW = _dt.datetime(2026, 11, 2, 12, 0, tzinfo=_dt.timezone.utc).timestamp()
 
 
-def _resets(left=1, ends_at="2026-11-20T12:00:00+00:00", usable=True, paused=False):
+def _one_grant(left=1, ends_at="2026-11-20T12:00:00+00:00", usable=True, paused=False, id="g"):
     return {
-        "left": left, "total": left if type(left) is int and left > 1 else 1, "ends_at": ends_at,
-        "label": "Free limit reset",
-        "usable_now": usable, "eligible": True, "paused": paused, "fetched_at": _UR_NOW - 60,
+        "id": id, "label": "Free limit reset", "left": left,
+        "total": left if type(left) is int and left > 1 else 1, "ends_at": ends_at,
+        "usable_now": usable, "paused": paused,
     }
+
+
+def _resets(*grants, **kwargs):
+    """The stored entry: each live grant, as the usage store keeps it."""
+    return {"grants": list(grants) or [_one_grant(**kwargs)], "eligible": True, "fetched_at": _UR_NOW - 60}
 
 
 def _with_resets(usage=None, **kwargs):
@@ -2402,6 +2407,21 @@ def test_no_badge_for_an_unreadable_count(left):
 @pytest.mark.parametrize("ends_at", [None, "", "soon", 5, "2026-11-02T11:59:59+00:00", "2026-11-02T12:00:00+00:00"])
 def test_no_badge_once_the_grant_has_ended_or_cannot_be_dated(ends_at):
     assert menubar.limit_resets_badge(_with_resets(ends_at=ends_at), _UR_NOW) is None
+
+
+def test_remaining_grant_stays_visible_after_earliest_grant_expires(new_york):
+    # A spent grant that ends in 30 seconds and a live one until December:
+    # once the first has ended the pill, the text and VoiceOver still show
+    # the second, without waiting for the next read.
+    spent = _one_grant(left=0, usable=False, ends_at="2026-11-02T12:00:30+00:00", id="spent")
+    live = _one_grant(left=1, ends_at="2026-12-01T04:59:00+00:00", id="live")
+    usage = {**_USAGE, "limit_resets": _resets(spent, live)}
+    for at in (_UR_NOW, _UR_NOW + 31):
+        assert menubar.limit_resets_badge(usage, at) == ("UR 1", "ok")
+        assert menubar.limit_resets_spoken(usage, at) == "1 limit reset, use by Nov 30"
+    assert menubar.format_account_label(2, "a@x.com", usage, _UR_NOW + 31).endswith("$ 30% · UR 1")
+    december = _dt.datetime(2026, 12, 1, 4, 59, tzinfo=_dt.timezone.utc).timestamp()
+    assert menubar.limit_resets_badge(usage, december) is None  # both ended
 
 
 def test_badge_while_the_grant_is_still_live():

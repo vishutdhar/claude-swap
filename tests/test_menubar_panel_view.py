@@ -1837,9 +1837,11 @@ def _account_with_resets(left=2, active=True, usable=True, disabled=False):
     usage = {
         "five_hour": {"pct": 12.0}, "seven_day": {"pct": 40.0},
         "limit_resets": {
-            "left": left, "total": max(left, 1), "ends_at": "2099-01-01T00:00:00+00:00",
-            "label": "Free limit reset", "usable_now": usable, "eligible": True, "paused": False,
-            "fetched_at": _NOW - 60,
+            "grants": [{
+                "id": "g", "label": "Free limit reset", "left": left, "total": max(left, 1),
+                "ends_at": "2099-01-01T00:00:00+00:00", "usable_now": usable, "paused": False,
+            }],
+            "eligible": True, "fetched_at": _NOW - 60,
         },
     }
     return mp.build_account_panel(("1", "me@example.com", active, usage, usage, "proton", disabled, _NOW - 9), _NOW)

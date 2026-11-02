@@ -47,12 +47,14 @@ def accounts():
 
 
 def _grant(left: int, usable: bool = True, paused: bool = False) -> dict:
-    """An account's limit-resets entry, as the usage store keeps it."""
+    """An account's limit-resets entry holding one grant, as the usage store keeps it."""
     return {
-        "left": left, "total": max(left, 1),
-        "ends_at": dt.datetime.fromtimestamp(NOW + 28 * DAY, dt.timezone.utc).isoformat(),
-        "label": "Free limit reset", "usable_now": usable, "eligible": True, "paused": paused,
-        "fetched_at": NOW - 600,
+        "grants": [{
+            "id": "g", "label": "Free limit reset", "left": left, "total": max(left, 1),
+            "ends_at": dt.datetime.fromtimestamp(NOW + 28 * DAY, dt.timezone.utc).isoformat(),
+            "usable_now": usable, "paused": paused,
+        }],
+        "eligible": True, "fetched_at": NOW - 600,
     }
 
 

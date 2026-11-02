@@ -2302,14 +2302,19 @@ def test_blocked_codex_monitor_does_not_delay_or_drop_account_refreshes(tmp_path
 
 # --- limit resets on the Claude accounts (the UR tag) --------------------------------
 
-_GRANT = {
-    "left": 1, "total": 1, "ends_at": "2099-01-01T00:00:00+00:00", "label": "Free limit reset",
-    "usable_now": True, "eligible": True, "paused": False, "fetched_at": 1.0,
-}
+def _stored_resets(left):
+    """A stored limit-resets entry holding one grant until 2099."""
+    return {
+        "grants": [{
+            "id": "g", "label": "Free limit reset", "left": left, "total": 1,
+            "ends_at": "2099-01-01T00:00:00+00:00", "usable_now": True, "paused": False,
+        }],
+        "eligible": True, "fetched_at": 1.0,
+    }
 
 
 def _entry_resets(num, email, active=False, left=1, pct=10.0):
-    usage = {"five_hour": {"pct": pct}, "limit_resets": {**_GRANT, "left": left}}
+    usage = {"five_hour": {"pct": pct}, "limit_resets": _stored_resets(left)}
     return (num, email, active, usage, usage, None, False, None)
 
 

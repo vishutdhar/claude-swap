@@ -531,28 +531,31 @@ def iso_epoch(value) -> float | None:
     return when.timestamp()
 
 
+def _utc_iso(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, timezone.utc).isoformat()
+
+
 def parse_limit_resets(cedar_ember, now: float) -> dict | None:
     """The ``limit_resets`` entry kept beside an account's usage windows.
 
-    Counted are the grants whose ``ends_at`` is ahead of ``now`` and that
-    are not paused: ``left`` and ``total`` sum their ``resets_left`` and
-    ``resets_total``, ``ends_at`` is the soonest end among them (ISO, UTC),
-    ``label`` the first one's label, ``usable_now`` whether any is usable
-    now, ``eligible`` the answer's own flag. When every live grant is
-    paused, those are counted instead and ``paused`` is true: a paused
-    reset is not a used one. None when the answer is not an object or has
-    no live grant (``no_grant``, ``surface``, every grant ended). A grant
-    without a readable ``ends_at`` or ``resets_left`` is left out: a reset
-    that cannot be dated is not promised. Flags count only when they are
+    ``{"grants": [...], "eligible": bool}``: every grant whose ``ends_at``
+    is ahead of ``now``, as ``{"id", "label", "left", "total", "ends_at"
+    (ISO, UTC), "usable_now", "paused"}``, kept one by one so the menu can
+    sum them up when it draws (``summarize_limit_resets``) and a grant that
+    ends between reads drops out on its own. None when the answer is not an
+    object or has no live grant (``no_grant``, ``surface``, every grant
+    ended). A grant without a readable ``ends_at`` or ``resets_left`` is
+    left out: a reset that cannot be dated is not promised. A missing
+    ``resets_total`` counts what is left. Flags count only when they are
     ``true`` itself.
     """
     if not isinstance(cedar_ember, dict):
         return None
-    grants = cedar_ember.get("grants")
-    if not isinstance(grants, list):
+    raw = cedar_ember.get("grants")
+    if not isinstance(raw, list):
         return None
-    live = []  # (grant, ends epoch, left, total)
-    for grant in grants:
+    grants = []
+    for grant in raw:
         if not isinstance(grant, dict):
             continue
         ends = iso_epoch(grant.get("ends_at"))
@@ -560,6 +563,48 @@ def parse_limit_resets(cedar_ember, now: float) -> dict | None:
         if ends is None or ends <= now or left is None:
             continue
         total = _grant_count(grant.get("resets_total"))
+        grant_id, label = grant.get("id"), grant.get("label")
+        grants.append({
+            "id": grant_id if isinstance(grant_id, str) else None,
+            "label": label if isinstance(label, str) else None,
+            "left": left,
+            "total": left if total is None else total,
+            "ends_at": _utc_iso(ends),
+            "usable_now": grant.get("usable_now") is True,
+            "paused": grant.get("paused") is True,
+        })
+    if not grants:
+        return None
+    return {"grants": grants, "eligible": cedar_ember.get("eligible") is True}
+
+
+def summarize_limit_resets(entry, now: float) -> dict | None:
+    """What the menu shows for a stored ``limit_resets`` entry at ``now``.
+
+    Summed over the stored grants whose ``ends_at`` is still ahead of
+    ``now`` and that are not paused: ``left`` and ``total``, ``usable_now``
+    (any of them), ``label`` (the first one's) and ``ends_at``, the soonest
+    end among those that still have resets left (among all of them when
+    none has: a used reset still shows until it ends). When every live grant
+    is paused, those are summed instead and ``paused`` is true: a paused
+    reset is not a used one. ``eligible`` is the answer's own flag. None
+    when no stored grant is live and readable, and for an entry in any
+    other shape (the summed one written before grants were kept).
+    """
+    if not isinstance(entry, dict):
+        return None
+    grants = entry.get("grants")
+    if not isinstance(grants, list):
+        return None
+    live = []  # (grant, ends epoch, left, total)
+    for grant in grants:
+        if not isinstance(grant, dict):
+            continue
+        ends = iso_epoch(grant.get("ends_at"))
+        left = _grant_count(grant.get("left"))
+        if ends is None or ends <= now or left is None:
+            continue
+        total = _grant_count(grant.get("total"))
         live.append((grant, ends, left, left if total is None else total))
     if not live:
         return None
@@ -567,15 +612,15 @@ def parse_limit_resets(cedar_ember, now: float) -> dict | None:
     paused = not counted
     if paused:
         counted = live
+    dated = [item for item in counted if item[2] > 0] or counted
     label = counted[0][0].get("label")
-    soonest = min(ends for _grant, ends, _left, _total in counted)
     return {
         "left": sum(left for _grant, _ends, left, _total in counted),
         "total": sum(total for _grant, _ends, _left, total in counted),
-        "ends_at": datetime.fromtimestamp(soonest, timezone.utc).isoformat(),
+        "ends_at": _utc_iso(min(ends for _grant, ends, _left, _total in dated)),
         "label": label if isinstance(label, str) else None,
         "usable_now": any(grant.get("usable_now") is True for grant, *_rest in counted),
-        "eligible": cedar_ember.get("eligible") is True,
+        "eligible": entry.get("eligible") is True,
         "paused": paused,
     }
 

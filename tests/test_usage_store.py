@@ -2062,7 +2062,7 @@ class TestLimitResetsRecord:
         _resets_pass(store, "1", oauth.LimitResetsRead(_cedar_with()))
         row = self._row(store)
         entry = row["lastGood"]["limit_resets"]
-        assert entry["left"] == 1 and entry["fetched_at"] == clock.now
+        assert entry["grants"][0]["left"] == 1 and entry["fetched_at"] == clock.now
         assert {k: v for k, v in row["lastGood"].items() if k != "limit_resets"} == USAGE
         assert row["limitResetsAttemptAt"] == clock.now
         assert store.entries(IDENT)["1"].last_good["limit_resets"] == entry
@@ -2133,7 +2133,7 @@ class TestLimitResetsRecord:
         # second earlier is not.
         live = _cedar_with(ends_at="1970-01-12T13:46:41+00:00")  # 1_000_001 s
         _resets_pass(store, "1", oauth.LimitResetsRead(live))
-        assert self._row(store)["lastGood"]["limit_resets"]["left"] == 1
+        assert self._row(store)["lastGood"]["limit_resets"]["grants"][0]["left"] == 1
         ended = _cedar_with(ends_at="1970-01-12T13:46:39+00:00")  # 999_999 s
         _resets_pass(store, "2", oauth.LimitResetsRead(ended))
         assert "limit_resets" not in self._row(store, "2")["lastGood"]
@@ -2196,6 +2196,18 @@ class TestLimitResetsDue:
         table = json.loads(store.path.read_text(encoding="utf-8"))
         table["accounts"]["1"]["limitResetsAttemptAt"] = stamp
         store.path.write_text(json.dumps(table), encoding="utf-8")
+        assert store.limit_resets_due(["1"], IDENT, usage_store.LIMIT_RESETS_EVERY_S) == {"1"}
+
+    def test_an_entry_in_the_older_shape_is_due(self, store, clock):
+        # An entry written before it kept each grant (the summed shape) is
+        # read again at the next fetch instead of waiting out the hour.
+        self._seed(store, oauth.LimitResetsRead(_cedar_with()))
+        table = json.loads(store.path.read_text(encoding="utf-8"))
+        table["accounts"]["1"]["lastGood"]["limit_resets"] = {
+            "left": 1, "total": 1, "ends_at": "2099-01-01T00:00:00+00:00", "fetched_at": clock.now,
+        }
+        store.path.write_text(json.dumps(table), encoding="utf-8")
+        clock.advance(60)
         assert store.limit_resets_due(["1"], IDENT, usage_store.LIMIT_RESETS_EVERY_S) == {"1"}
 
     def test_a_row_of_another_account_is_due(self, store, clock):

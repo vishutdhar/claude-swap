@@ -1106,9 +1106,13 @@ def test_build_codex_panel_paces_against_the_readings_time():
 # --- limit resets on the Claude accounts (the UR pill) ------------------------------
 
 def _grant(left=1, ends_in=20 * 86400 + 3600, usable=True, paused=False):
+    """A stored limit-resets entry holding one grant."""
     return {
-        "left": left, "total": max(left, 1), "ends_at": _iso(ends_in), "label": "Free limit reset",
-        "usable_now": usable, "eligible": True, "paused": paused, "fetched_at": _NOW - 60,
+        "grants": [{
+            "id": "g", "label": "Free limit reset", "left": left, "total": max(left, 1),
+            "ends_at": _iso(ends_in), "usable_now": usable, "paused": paused,
+        }],
+        "eligible": True, "fetched_at": _NOW - 60,
     }
 
 

@@ -1693,11 +1693,17 @@ class TestRequestLimitResets:
         assert req.get_header("User-agent") == "claude-swap/1.0"
 
 
+def _summary(cedar, at=None):
+    """What the menu reads: the answer parsed at ``_NOW``, summed up at ``at``."""
+    return oauth.summarize_limit_resets(oauth.parse_limit_resets(cedar, _NOW), _NOW if at is None else at)
+
+
 class TestParseLimitResets:
-    """``parse_limit_resets``: the entry kept beside the usage windows."""
+    """``parse_limit_resets`` keeps the live grants; ``summarize_limit_resets``
+    sums them up for the menu. These pin what the menu ends up reading."""
 
     def test_one_live_grant(self):
-        entry = oauth.parse_limit_resets(_cedar([_grant()]), _NOW)
+        entry = _summary(_cedar([_grant()]))
         assert entry == {
             "left": 1,
             "total": 1,
@@ -1709,31 +1715,31 @@ class TestParseLimitResets:
         }
 
     def test_no_grant_and_surface_answers_are_none(self):
-        assert oauth.parse_limit_resets(_cedar(), _NOW) is None
-        assert oauth.parse_limit_resets(_cedar(eligible=False, ineligible_reason="surface"), _NOW) is None
+        assert _summary(_cedar()) is None
+        assert _summary(_cedar(eligible=False, ineligible_reason="surface")) is None
 
     @pytest.mark.parametrize("value", [None, [], "grants", 3, {"grants": "x"}, {"grants": [None, 4]}])
     def test_non_dict_or_malformed_input_is_none(self, value):
-        assert oauth.parse_limit_resets(value, _NOW) is None
+        assert _summary(value) is None
 
     def test_a_grant_whose_ends_at_has_passed_is_left_out(self):
         passed = _grant(ends_at="2026-11-02T11:59:59+00:00")
-        assert oauth.parse_limit_resets(_cedar([passed]), _NOW) is None
-        both = oauth.parse_limit_resets(_cedar([passed, _grant(resets_left=2, resets_total=2)]), _NOW)
+        assert _summary(_cedar([passed])) is None
+        both = _summary(_cedar([passed, _grant(resets_left=2, resets_total=2)]))
         assert (both["left"], both["total"]) == (2, 2)
 
     @pytest.mark.parametrize("ends_at", [None, "", "soon", 12345, "2026-13-45T00:00:00+00:00"])
     def test_a_grant_without_a_readable_ends_at_is_left_out(self, ends_at):
-        assert oauth.parse_limit_resets(_cedar([_grant(ends_at=ends_at)]), _NOW) is None
+        assert _summary(_cedar([_grant(ends_at=ends_at)])) is None
 
     def test_a_naive_ends_at_reads_as_utc(self):
-        entry = oauth.parse_limit_resets(_cedar([_grant(ends_at="2026-12-01T04:59:00")]), _NOW)
+        entry = _summary(_cedar([_grant(ends_at="2026-12-01T04:59:00")]))
         assert entry["ends_at"] == "2026-12-01T04:59:00+00:00"
 
     def test_a_paused_grant_is_left_out_of_the_count(self):
         paused = _grant(id="b", label="Paused one", resets_left=2, resets_total=2, paused=True,
                         usable_now=False, ends_at="2026-11-10T00:00:00+00:00")
-        entry = oauth.parse_limit_resets(_cedar([paused, _grant()]), _NOW)
+        entry = _summary(_cedar([paused, _grant()]))
         assert (entry["left"], entry["total"], entry["paused"]) == (1, 1, False)
         assert entry["ends_at"] == "2026-12-01T04:59:00+00:00"  # the paused grant's date is not used
         assert entry["label"] == "Free limit reset"
@@ -1742,7 +1748,7 @@ class TestParseLimitResets:
         # Nothing usable to count, but a paused reset is not a used one: the
         # entry describes the paused grants and says so, for a dimmed pill.
         paused = _grant(paused=True, usable_now=False)
-        entry = oauth.parse_limit_resets(_cedar([paused]), _NOW)
+        entry = _summary(_cedar([paused]))
         assert (entry["left"], entry["total"], entry["paused"], entry["usable_now"]) == (1, 1, True, False)
 
     def test_two_grants_are_summed_with_the_soonest_end(self):
@@ -1750,34 +1756,82 @@ class TestParseLimitResets:
                        ends_at="2026-12-01T04:59:00+00:00", usable_now=False)
         sooner = _grant(id="b", label="Second listed", resets_left=2, resets_total=3,
                         ends_at="2026-11-20T00:00:00Z", usable_now=True)
-        entry = oauth.parse_limit_resets(_cedar([later, sooner]), _NOW)
+        entry = _summary(_cedar([later, sooner]))
         assert (entry["left"], entry["total"]) == (3, 4)
         assert entry["ends_at"] == "2026-11-20T00:00:00+00:00"
         assert entry["label"] == "First listed"
         assert entry["usable_now"] is True  # any grant usable now
 
     def test_a_used_grant_counts_zero_left(self):
-        entry = oauth.parse_limit_resets(_cedar([_grant(resets_left=0, usable_now=False)]), _NOW)
+        entry = _summary(_cedar([_grant(resets_left=0, usable_now=False)]))
         assert (entry["left"], entry["total"], entry["usable_now"]) == (0, 1, False)
 
     @pytest.mark.parametrize("left", [-1, 1.5, "1", True, float("nan"), 10**400, None])
     def test_an_unreadable_count_leaves_the_grant_out(self, left):
-        assert oauth.parse_limit_resets(_cedar([_grant(resets_left=left)]), _NOW) is None
+        assert _summary(_cedar([_grant(resets_left=left)])) is None
 
     def test_a_missing_total_counts_what_is_left(self):
         grant = _grant()
         del grant["resets_total"]
-        assert oauth.parse_limit_resets(_cedar([grant]), _NOW)["total"] == 1
+        assert _summary(_cedar([grant]))["total"] == 1
 
     def test_flags_are_strict_booleans(self):
-        entry = oauth.parse_limit_resets(
-            _cedar([_grant(usable_now="yes", paused="no")], eligible="true"), _NOW
-        )
+        entry = _summary(_cedar([_grant(usable_now="yes", paused="no")], eligible="true"))
         # Only a real true counts: "no" is not a pause, "yes" not usable.
         assert (entry["usable_now"], entry["paused"], entry["eligible"]) == (False, False, False)
 
     def test_a_label_that_is_not_text_is_none(self):
-        assert oauth.parse_limit_resets(_cedar([_grant(label=7)]), _NOW)["label"] is None
+        assert _summary(_cedar([_grant(label=7)]))["label"] is None
+
+
+class TestLimitResetsGrants:
+    """The entry keeps each live grant, so the menu sums them up at the time
+    it draws: a grant that ends between reads drops out on its own."""
+
+    def test_parse_keeps_each_live_grant(self):
+        passed = _grant(id="old", ends_at="2026-11-01T00:00:00+00:00")
+        entry = oauth.parse_limit_resets(_cedar([_grant(), passed, _grant(id="b", paused=True, resets_left=2,
+                                                                         resets_total=3, usable_now=False)]), _NOW)
+        assert entry == {
+            "grants": [
+                {"id": "free_reset_oct_2026", "label": "Free limit reset", "left": 1, "total": 1,
+                 "ends_at": "2026-12-01T04:59:00+00:00", "usable_now": True, "paused": False},
+                {"id": "b", "label": "Free limit reset", "left": 2, "total": 3,
+                 "ends_at": "2026-12-01T04:59:00+00:00", "usable_now": False, "paused": True},
+            ],
+            "eligible": True,
+        }
+
+    def test_remaining_grant_stays_visible_after_earliest_grant_expires(self):
+        spent = _grant(id="spent", resets_left=0, usable_now=False, ends_at="2026-11-02T12:00:30+00:00")
+        live = _grant(id="live", resets_left=1, ends_at="2026-12-01T04:59:00+00:00")
+        entry = oauth.parse_limit_resets(_cedar([spent, live]), _NOW)
+        later = oauth.summarize_limit_resets(entry, _NOW + 31)  # the spent grant has ended
+        assert (later["left"], later["usable_now"], later["paused"]) == (1, True, False)
+        assert later["ends_at"] == "2026-12-01T04:59:00+00:00"
+        assert oauth.summarize_limit_resets(entry, _iso_ts("2026-12-01T04:59:00+00:00")) is None  # both ended
+
+    def test_use_by_is_the_soonest_grant_that_still_has_resets(self):
+        spent = _grant(id="spent", resets_left=0, usable_now=False, ends_at="2026-11-02T12:00:30+00:00")
+        live = _grant(id="live", resets_left=1, ends_at="2026-12-01T04:59:00+00:00")
+        now = oauth.summarize_limit_resets(oauth.parse_limit_resets(_cedar([spent, live]), _NOW), _NOW)
+        assert (now["left"], now["total"]) == (1, 2)
+        assert now["ends_at"] == "2026-12-01T04:59:00+00:00"  # not the spent grant's date
+        only_spent = _summary(_cedar([spent]))
+        assert (only_spent["left"], only_spent["ends_at"]) == (0, "2026-11-02T12:00:30+00:00")
+
+    @pytest.mark.parametrize("entry", [
+        None, "x", {}, {"grants": "x"}, {"grants": [None, 3]},
+        {"left": 1, "ends_at": "2026-12-01T04:59:00+00:00", "usable_now": True},  # the older, summed shape
+        {"grants": [{"left": True, "total": 1, "ends_at": "2026-12-01T04:59:00+00:00"}]},
+        {"grants": [{"left": 1, "total": 1, "ends_at": "soon"}]},
+    ])
+    def test_a_stored_entry_that_cannot_be_read_sums_to_nothing(self, entry):
+        assert oauth.summarize_limit_resets(entry, _NOW) is None
+
+
+def _iso_ts(text):
+    return datetime.fromisoformat(text).timestamp()
 
 
 class TestLimitResetsSafetyNet:

@@ -1390,9 +1390,15 @@ def _finite_or_none(value: object) -> float | None:
 
 
 def _limit_resets_due(row: dict, now: float, max_age_s: float) -> bool:
-    """Whether a stored row's limit-resets read is due (see ``limit_resets_due``)."""
+    """Whether a stored row's limit-resets read is due (see ``limit_resets_due``).
+
+    An entry in an older shape (without its ``grants`` list) is due at
+    once: the menu cannot read it, so it is replaced at the next fetch.
+    """
     last_good = row.get("lastGood")
     entry = last_good.get("limit_resets") if isinstance(last_good, dict) else None
+    if isinstance(entry, dict) and not isinstance(entry.get("grants"), list):
+        return True
     stamps = [
         stamp
         for stamp in (
@@ -1415,9 +1421,9 @@ def _with_limit_resets(
 ) -> dict | None:
     """A success's ``lastGood``: its windows, and the limit-resets entry.
 
-    An answered read replaces the entry: the parsed grants with
-    ``fetched_at`` = ``now`` (the store's clock), or no key at all when the
-    account has no live grant. A failed read, or none made, carries the
+    An answered read replaces the entry: the live grants
+    (``oauth.parse_limit_resets``) with ``fetched_at`` = ``now`` (the
+    store's clock), or no key at all when the account has no live grant. A failed read, or none made, carries the
     previous ``lastGood``'s entry forward unchanged, so a usage read in
     between never loses it. A success without window data stays None:
     ``lastGood`` is never an entry with no windows.

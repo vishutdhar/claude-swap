@@ -32,7 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from claude_swap import oauth, pace
-from claude_swap.codex_usage import MAX_RESET_CREDITS, CodexState, ur_badge
+from claude_swap.codex_usage import CodexState, ur_badge
 from claude_swap.exceptions import (
     AccountNotFoundError,
     ClaudeSwitchError,
@@ -460,23 +460,16 @@ def _local_part(email: str, limit: int = 12) -> str:
 # without a grant show nothing, so the menu does not fill with red zeros.
 
 def limit_resets_entry(usage: dict | str | None, now: float) -> dict | None:
-    """An account's live limit-resets entry, or None.
+    """An account's limit resets as they stand at ``now``, or None.
 
-    None for a sentinel or no usage, an entry with no readable count (a
-    whole number) or end time, and a grant that has ended by ``now``.
+    The stored grants summed up when the menu draws
+    (``oauth.summarize_limit_resets``): a grant that has ended since the
+    last read drops out, and the others still show. None for a sentinel or
+    no usage, and when no stored grant is live and readable.
     """
     if not isinstance(usage, dict):
         return None
-    entry = usage.get("limit_resets")
-    if not isinstance(entry, dict):
-        return None
-    left = entry.get("left")
-    if isinstance(left, bool) or not isinstance(left, int) or not 0 <= left <= MAX_RESET_CREDITS:
-        return None
-    ends = oauth.iso_epoch(entry.get("ends_at"))
-    if ends is None or ends <= now:
-        return None
-    return entry
+    return oauth.summarize_limit_resets(usage.get("limit_resets"), now)
 
 
 def limit_resets_badge(usage: dict | str | None, now: float) -> tuple[str, str] | None:
