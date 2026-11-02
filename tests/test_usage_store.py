@@ -2537,3 +2537,26 @@ class TestLimitResetsTrimRoster:
         assert s._usage_store.attempts._roster_now() == {"uuid-1"}
         s.sequence_file.write_text("{torn")
         assert s._usage_store.attempts._roster_now() is None
+
+
+class TestLimitResetsAttemptsConcurrency:
+    def test_concurrent_attempts_writers_preserve_all_accounts(self, tmp_path):
+        import threading
+
+        store = UsageStore(tmp_path / "cache")  # the real clock and the real file
+        accounts = [f"acct-{i}" for i in range(12)]
+        start = threading.Barrier(len(accounts))
+        tokens = {}
+
+        def reserve(account):
+            start.wait()
+            tokens[account] = store.attempts.reserve(account, 3600.0)
+
+        threads = [threading.Thread(target=reserve, args=(a,)) for a in accounts]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        assert all(tokens[a] for a in accounts)  # every writer got its turn
+        assert set(store.attempts.read()) == set(accounts)  # and no write lost another's
+        assert all(store.attempts.holds(a, tokens[a]) for a in accounts)

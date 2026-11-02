@@ -13986,3 +13986,86 @@ class TestLimitResetsTrimKeepsTheRoster(_ResetsNetHelpers):
         self._pass(s, log, fetch={"2"}, fresh=True)
         assert [t for kind, t, _u in log if kind == "resets" and t == "sk-a2"] == ["sk-a2"]
         assert "uuid-2" in _resets_stamps(s)  # a roster account's stamp is never trimmed
+
+
+class TestLimitResetsContention(_ResetsNetHelpers):
+    """Real contention on the attempts file, and two slots racing for one account."""
+
+    @pytest.mark.no_limit_resets_fake
+    @pytest.mark.no_oauth_profile_fake
+    def test_busy_attempts_lock_times_out_without_requests_or_usage_failure(
+        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch
+    ):
+        from claude_swap import usage_store
+        from claude_swap.locking import FileLock
+
+        monkeypatch.setattr(oauth, "claude_code_user_agent", lambda: "claude-cli/2.1.316 (external, cli)")
+        # The wait is shortened so the test is quick; the holder keeps the lock
+        # for the whole pass, longer than any wait.
+        monkeypatch.setattr(usage_store, "LIMIT_RESETS_LOCK_WAIT_S", 0.3)
+        s = self._switcher(sample_sequence_data)
+        holder = FileLock(s._usage_store.attempts._lock_path, timeout=1.0)
+        assert holder.acquire()
+        log = []
+        try:
+            started = time.monotonic()
+            entries = self._pass(s, log)
+            took = time.monotonic() - started
+        finally:
+            holder.release()
+        assert [k for k, _t, _u in log if k in ("resets", "profile")] == []  # nothing sent
+        assert _resets_stamps(s) == {}
+        assert took < 5.0  # each slot waited its short while, and gave up
+        for num in ("1", "2"):
+            entry = entries[num]
+            assert entry.last_good == {"seven_day": {"pct": 21.0}}  # the usage read is recorded
+            assert (entry.last_error, entry.consecutive_failures, entry.backoff_until) == (None, 0, None)
+
+    @pytest.mark.no_limit_resets_fake
+    @pytest.mark.no_oauth_profile_fake
+    def test_two_stale_slots_same_actual_account_send_once(
+        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch
+    ):
+        # Slots 2 and 3 still name accounts that have since left them; both
+        # tokens now belong to one real account, X.
+        monkeypatch.setattr(oauth, "claude_code_user_agent", lambda: "claude-cli/2.1.316 (external, cli)")
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        sample_sequence_data["sequence"] = [1, 2, 3]
+        sample_sequence_data["accounts"]["2"] = {"email": "two@example.com", "uuid": "uuid-old-2"}
+        sample_sequence_data["accounts"]["3"] = {"email": "three@example.com", "uuid": "uuid-old-3"}
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        live = _oauth_creds("sk-active", 7200)
+        backups = {"1": live, "2": _oauth_creds("sk-x2", 7200), "3": _oauth_creds("sk-x3", 7200)}
+        owners = {"sk-active": "uuid-1", "sk-x2": "uuid-X", "sk-x3": "uuid-X"}
+        log = []
+
+        def fake_urlopen(req, timeout=0):
+            token = (req.get_header("Authorization") or "").removeprefix("Bearer ")
+            if req.full_url == oauth.LIMIT_RESETS_URL:
+                log.append(("resets", token))
+                body = {"cedar_ember": TestLimitResetsInTheFetchPass.GRANT}
+            elif req.full_url == "https://api.anthropic.com/api/oauth/profile":
+                log.append(("profile", token))
+                body = {"account": {"uuid": owners[token], "email": "x@example.com"}}
+            else:
+                body = {"seven_day": {"utilization": 21.0}}
+            resp = MagicMock()
+            resp.read.return_value = json.dumps(body).encode()
+            resp.__enter__ = lambda r: r
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        with patch.object(ClaudeAccountSwitcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(live, False)), \
+             patch.object(ClaudeAccountSwitcher, "_read_account_credentials",
+                          side_effect=lambda num, email: backups[str(num)]), \
+             patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake_urlopen):
+            entries = s._collect_usage_entries(s._build_accounts_info(), fetch={"2", "3"})
+            again = s._collect_usage_entries(s._build_accounts_info(), fetch={"2", "3"}, fresh=True)
+        assert sorted(t for k, t in log if k == "profile") == ["sk-x2", "sk-x3"]  # one probe each
+        assert len([t for k, t in log if k == "resets" and t in ("sk-x2", "sk-x3")]) == 1  # X asked once
+        for result in (entries, again):
+            assert all("limit_resets" not in result[n].last_good for n in ("2", "3"))  # X is neither slot's
+        assert {"uuid-old-2", "uuid-old-3", "uuid-X"} <= set(_resets_stamps(s))
