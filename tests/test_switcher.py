@@ -13387,7 +13387,7 @@ class _ResetsNetHelpers:
         return fake_urlopen
 
     def _pass(self, s, log, backup_for_2="sk-a2", session=None, fresh=False, profile_fails=False,
-              profile_error=None, on_profile=None):
+              profile_error=None, on_profile=None, fetch=None):
         """One collect pass. Slot 1 is active (its backup holds the same
         lineage, so no ownership probe runs); slot 2 reads ``backup_for_2``,
         or ``session()`` from its session profile when given."""
@@ -13414,7 +13414,7 @@ class _ResetsNetHelpers:
         for p in patches:
             p.start()
         try:
-            return s._collect_usage_entries(s._build_accounts_info(), fresh=fresh)
+            return s._collect_usage_entries(s._build_accounts_info(), fetch=fetch, fresh=fresh)
         finally:
             for p in reversed(patches):
                 p.stop()
@@ -13964,3 +13964,25 @@ class TestLimitResetsReservationOwnsItsStamp(_ResetsNetHelpers):
         assert newer and newer[0]  # the newer collector won the account's read
         assert ("profile", "sk-a2", "claude-swap/1.0") in log
         assert [t for kind, t, _u in log if kind == "resets" and t == "sk-a2"] == []  # the old one sends nothing
+
+
+
+class TestLimitResetsTrimKeepsTheRoster(_ResetsNetHelpers):
+    @pytest.mark.no_limit_resets_fake
+    @pytest.mark.no_oauth_profile_fake
+    def test_forward_clock_jump_trim_preserves_recent_attempt_after_correction(
+        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch
+    ):
+        monkeypatch.setattr(oauth, "claude_code_user_agent", lambda: "claude-cli/2.1.316 (external, cli)")
+        s = self._switcher(sample_sequence_data)
+        start = time.time()
+        now = [start]
+        s._usage_store.clock = lambda: now[0]
+        log = []
+        self._pass(s, log, fetch={"2"})  # account 2 is read at T
+        now[0] = start + 8 * 86400  # the clock jumps a week and a day ahead ...
+        self._pass(s, log, fetch={"1"})  # ... while another account's read writes the file
+        now[0] = start + 1  # ... and is put right
+        self._pass(s, log, fetch={"2"}, fresh=True)
+        assert [t for kind, t, _u in log if kind == "resets" and t == "sk-a2"] == ["sk-a2"]
+        assert "uuid-2" in _resets_stamps(s)  # a roster account's stamp is never trimmed

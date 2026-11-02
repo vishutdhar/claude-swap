@@ -334,7 +334,9 @@ class ClaudeAccountSwitcher:
         self.credentials_dir = self.backup_dir / "credentials"
         self.lock_file = self.backup_dir / ".lock"
         self._logger = setup_logging(self.backup_dir, debug=debug)
-        self._usage_store = UsageStore(self.backup_dir / "cache")
+        self._usage_store = UsageStore(
+            self.backup_dir / "cache", roster=self._roster_account_uuids
+        )
         # (settings mtime, (threshold, models)) — see _poll_policy_inputs.
         self._poll_inputs_cache: tuple[float | None, tuple[float, tuple[str, ...]]] | None = None
         self._poll_inputs_override: tuple[float, tuple[str, ...]] | None = None
@@ -5105,6 +5107,20 @@ class ClaudeAccountSwitcher:
         return {
             num: with_sentinel(entries[num], sentinels.get(num))
             for num in info_by_num
+        }
+
+    def _roster_account_uuids(self) -> set[str] | None:
+        """Every stored account uuid in the roster now; None when the roster
+        cannot be read. Keeps those accounts' limit-resets stamps from the
+        attempts file's trim (``LimitResetsAttempts``)."""
+        try:
+            accounts = (self._get_sequence_data() or {}).get("accounts") or {}
+        except Exception:
+            return None
+        return {
+            (account.get("uuid") or "").strip()
+            for account in accounts.values()
+            if isinstance(account, dict) and (account.get("uuid") or "").strip()
         }
 
     def _slot_account_ids(self) -> dict[str, tuple[str, str]]:

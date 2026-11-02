@@ -2497,3 +2497,43 @@ class TestLimitResetsReservationTokens:
         other = usage_store.SlotResetsGate(store, "2", IDENT["2"], store.claim(["2"], IDENT)["2"], self.EVERY, "acct-2")
         assert other.reserve()
         assert not other.admit("acct-x")  # already read this interval
+
+
+class TestLimitResetsTrimRoster:
+    """The trim spares every account in the roster."""
+
+    EVERY = 3600.0
+    WEEK = usage_store.LIMIT_RESETS_ATTEMPTS_KEEP_S
+
+    def _store(self, tmp_path, clock, roster):
+        return UsageStore(tmp_path / "rostered", clock=clock, roster=roster)
+
+    def test_only_departed_accounts_older_than_a_week_are_dropped(self, tmp_path, clock):
+        store = self._store(tmp_path, clock, lambda: {"acct-1"})
+        assert store.attempts.reserve("acct-1", self.EVERY)  # in the roster
+        assert store.attempts.reserve("acct-old", self.EVERY)  # left, and will age out
+        clock.advance(self.WEEK - 60)
+        assert store.attempts.reserve("acct-new", self.EVERY)  # left recently
+        clock.advance(120)
+        assert store.attempts.reserve("acct-2", self.EVERY)  # a write, a week and a minute on
+        assert set(store.attempts.read()) == {"acct-1", "acct-new", "acct-2"}
+
+    @pytest.mark.parametrize("roster", [lambda: None, lambda: (_ for _ in ()).throw(OSError("torn"))],
+                             ids=["unreadable", "raises"])
+    def test_an_unreadable_roster_drops_nothing(self, tmp_path, clock, roster):
+        store = self._store(tmp_path, clock, roster)
+        assert store.attempts.reserve("acct-1", self.EVERY)
+        clock.advance(self.WEEK * 3)
+        assert store.attempts.reserve("acct-2", self.EVERY)
+        assert set(store.attempts.read()) == {"acct-1", "acct-2"}
+
+    def test_the_switcher_hands_its_roster_to_the_trim(self, temp_home, sample_sequence_data):
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        sample_sequence_data["accounts"]["2"]["uuid"] = ""  # a token-only slot has no uuid to keep
+        s._write_json(s.sequence_file, sample_sequence_data)
+        assert s._usage_store.attempts._roster_now() == {"uuid-1"}
+        s.sequence_file.write_text("{torn")
+        assert s._usage_store.attempts._roster_now() is None

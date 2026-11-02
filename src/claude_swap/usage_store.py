@@ -86,7 +86,7 @@ LEGACY_CLAIM_TTL_S = 10.0  # additive-schema overlap with older collectors
 LIMIT_RESETS_EVERY_S = 3600.0
 LIMIT_RESETS_MANUAL_EVERY_S = 600.0
 LIMIT_RESETS_ATTEMPTS_FILE = "limit_resets_attempts.json"
-LIMIT_RESETS_ATTEMPTS_KEEP_S = 7 * 86400.0  # stamps older than this are dropped on write
+LIMIT_RESETS_ATTEMPTS_KEEP_S = 7 * 86400.0  # a departed account's stamp older than this is dropped
 LIMIT_RESETS_LOCK_WAIT_S = 2.0  # a fetch worker waits no longer for the attempts lock
 
 
@@ -106,14 +106,28 @@ class LimitResetsAttempts:
     too large for a float, or anything not a number, is dropped and never
     raises. An unreadable file reads as empty: the file only paces a
     display read, so the worst a lost file costs is one read per account
-    earlier than its interval. Stamps older than
-    LIMIT_RESETS_ATTEMPTS_KEEP_S are dropped on write.
+    earlier than its interval.
+
+    On write, a stamp is dropped only when its account is no longer in the
+    roster (``roster()``: the stored account uuids, read at that moment) and
+    it is older than LIMIT_RESETS_ATTEMPTS_KEEP_S. A roster account's stamp
+    is never dropped, so a clock that jumps ahead for a while cannot erase a
+    fresh stamp; the file holds the roster plus the accounts that left in
+    the last week. With no roster given, every stamp is judged by age
+    alone; with one that cannot be read (``roster()`` is None, or raises),
+    nothing is dropped.
     """
 
-    def __init__(self, cache_dir: Path, clock: Callable[[], float]):
+    def __init__(
+        self,
+        cache_dir: Path,
+        clock: Callable[[], float],
+        roster: Callable[[], Iterable[str] | None] | None = None,
+    ):
         self.path = cache_dir / LIMIT_RESETS_ATTEMPTS_FILE
         self._lock_path = cache_dir / (LIMIT_RESETS_ATTEMPTS_FILE + ".lock")
         self.clock = clock
+        self._roster = roster
 
     def _entries(self) -> dict[str, tuple[float, str | None]]:
         """``{uuid: (stamp, reservation token or None)}``; an unreadable file
@@ -174,11 +188,23 @@ class LimitResetsAttempts:
         except (LockError, OSError):
             return None
 
+    def _roster_now(self) -> set[str] | None:
+        """The roster's account uuids, empty without a roster, None when it
+        cannot be read."""
+        if self._roster is None:
+            return set()
+        try:
+            uuids = self._roster()
+        except Exception:
+            return None
+        return None if uuids is None else set(uuids)
+
     def _write(self, entries: dict[str, tuple[float, str | None]], now: float) -> None:
+        roster = self._roster_now()
         kept = {
             account: {"t": stamp, "id": token}
             for account, (stamp, token) in entries.items()
-            if now - stamp <= LIMIT_RESETS_ATTEMPTS_KEEP_S
+            if roster is None or account in roster or now - stamp <= LIMIT_RESETS_ATTEMPTS_KEEP_S
         }
         atomic_write_json(self.path, {"attempts": kept})
 
@@ -970,13 +996,19 @@ class UsageStore:
     on a single slot).
     """
 
-    def __init__(self, cache_dir: Path, clock: Callable[[], float] = time.time):
+    def __init__(
+        self,
+        cache_dir: Path,
+        clock: Callable[[], float] = time.time,
+        roster: Callable[[], Iterable[str] | None] | None = None,
+    ):
         self.path = cache_dir / "usage.json"
         self._lock_path = cache_dir / ".usage.lock"
         self.clock = clock
         # The limit-resets try stamps, kept apart from usage.json (see
-        # LimitResetsAttempts); they follow this store's clock.
-        self.attempts = LimitResetsAttempts(cache_dir, lambda: self.clock())
+        # LimitResetsAttempts); they follow this store's clock, and
+        # ``roster`` (the stored account uuids) keeps theirs from the trim.
+        self.attempts = LimitResetsAttempts(cache_dir, lambda: self.clock(), roster)
 
     # -- raw I/O ------------------------------------------------------------
 
