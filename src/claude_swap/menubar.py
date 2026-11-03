@@ -1647,12 +1647,15 @@ def create_app(switcher, codex_monitor=None):
             self._rebuild_pending = False  # a rebuild waiting for the menu to close
             self._bars_broken = False  # a panel failed to draw: text rows this session
             self._account_target = None
-            # Renames run off the main thread, one at a time in the order asked
-            # (a FIFO drained by a single worker); outcomes queue for the tick.
+            # Store changes that take the account lock (renames, pause and
+            # resume) run off the main thread, one at a time in the order asked
+            # (a FIFO of ("rename" | "toggle", args) drained by a single
+            # worker); outcomes queue for the tick.
             self._rename_queue: list = []
             self._rename_worker_running = False
             self._rename_outcomes: list = []
             self._renames_in_flight = 0
+            self._toggles_in_flight = 0  # pause or resume jobs not yet answered
             # Set by Quit: a rename still waiting for the account lock gives up.
             self._renames_abandoned = False
             # Guards "compare generation, then publish" in the refresh worker
@@ -2536,11 +2539,26 @@ def create_app(switcher, codex_monitor=None):
             # `disabled` is this row's current state; selecting it flips it.
             target = not disabled
             def cb(_sender):
-                if self._guard(
-                    lambda: self.switcher.set_account_disabled(str(num), target)
-                ):
-                    self.refresh_async()
+                self._set_disabled(num, target)
             return cb
+
+        def _set_disabled(self, num, disabled):
+            """Queue a pause (``disabled=True``) or resume of slot ``num``.
+
+            The store call holds the account lock, which a switch, a rename
+            or the rotate daemon may hold for seconds, so it runs on the
+            rename worker, in order with any rename, and the menu stays free.
+            The tick reports the outcome (``_drain_rename_outcomes``): a
+            refresh on success, the store's message in an alert on failure.
+            """
+            with self._event_lock:
+                self._rename_queue.append(("toggle", (str(num), disabled)))
+                self._toggles_in_flight += 1
+                start = not self._rename_worker_running
+                if start:
+                    self._rename_worker_running = True
+            if start:
+                threading.Thread(target=self._rename_loop, daemon=True).start()
 
         def on_add_login(self, _sender):
             if self._guard(self.switcher.add_account):
@@ -2612,8 +2630,9 @@ def create_app(switcher, codex_monitor=None):
 
         def on_quit(self, _sender):
             # A rename still saving would be lost silently with the process.
+            # So would a pause or resume.
             deadline = time.monotonic() + 3.0
-            while self._renames_in_flight and time.monotonic() < deadline:
+            while (self._renames_in_flight or self._toggles_in_flight) and time.monotonic() < deadline:
                 time.sleep(0.05)
             if self._renames_in_flight:
                 # One still waiting for the account lock gives up now; one
@@ -2621,8 +2640,10 @@ def create_app(switcher, codex_monitor=None):
                 # wait is bounded). Either way the worker answers, so the
                 # alert below says what happened, never what might.
                 self._renames_abandoned = True
-                while self._renames_in_flight:
-                    time.sleep(0.05)
+            # A pause or resume finishes on the store's terms too: its lock
+            # wait is bounded, and a refusal is shown below.
+            while self._renames_in_flight or self._toggles_in_flight:
+                time.sleep(0.05)
             # Outcomes the sync tick has not shown yet (a rejected name) are
             # shown now; after quit nothing would.
             self._drain_rename_outcomes(quitting=True)
@@ -2677,7 +2698,7 @@ def create_app(switcher, codex_monitor=None):
             """
             job = (num, email, clean_alias_text(text), org)
             with self._event_lock:
-                self._rename_queue.append(job)
+                self._rename_queue.append(("rename", job))
                 self._renames_in_flight += 1
                 start = not self._rename_worker_running
                 if start:
@@ -2692,20 +2713,40 @@ def create_app(switcher, codex_monitor=None):
                     if not self._rename_queue:
                         self._rename_worker_running = False
                         return
-                    job = self._rename_queue.pop(0)
+                    kind, job = self._rename_queue.pop(0)
                 # Every way out of a job (the lock wait, the store, anything
                 # unexpected) publishes exactly one outcome and ends the job,
                 # or the menu stays "saving" and Quit waits for it forever.
-                outcome = ("failed", "the rename stopped unexpectedly")
+                failed = "toggle_failed" if kind == "toggle" else "failed"
+                outcome = (failed, f"the {'change' if kind == 'toggle' else 'rename'} stopped unexpectedly")
                 try:
-                    outcome = self._run_rename(*job)
+                    outcome = self._run_toggle(*job) if kind == "toggle" else self._run_rename(*job)
                 except BaseException as e:
-                    self.switcher._logger.warning("rename failed", exc_info=True)
-                    outcome = ("failed", str(e) or type(e).__name__)
+                    self.switcher._logger.warning("%s failed", kind, exc_info=True)
+                    outcome = (failed, str(e) or type(e).__name__)
                 finally:
                     with self._event_lock:
                         self._rename_outcomes.append(outcome)
-                        self._renames_in_flight -= 1
+                        if kind == "toggle":
+                            self._toggles_in_flight -= 1
+                        else:
+                            self._renames_in_flight -= 1
+
+        def _run_toggle(self, num, disabled):
+            """Pause or resume one slot; ``("toggled",)`` or ``("toggle_failed", message)``.
+
+            The store waits on the account lock itself, bounded by the lock's
+            own timeout; a refusal keeps its message (a held lock reads
+            "Failed to acquire lock - another instance may be running").
+            """
+            try:
+                self.switcher.set_account_disabled(num, disabled)
+                return ("toggled",)
+            except ClaudeSwitchError as e:
+                return ("toggle_failed", str(e))
+            except Exception as e:  # never lose the outcome
+                self.switcher._logger.warning("pause or resume failed", exc_info=True)
+                return ("toggle_failed", str(e) or type(e).__name__)
 
         def _wait_for_the_account_lock(self):
             """``"free"``, ``"abandoned"`` (Quit gave up on it) or ``"busy"``.
@@ -2763,12 +2804,18 @@ def create_app(switcher, codex_monitor=None):
             with self._event_lock:
                 outcomes, self._rename_outcomes = self._rename_outcomes, []
                 idle = not self._renames_in_flight
-            if outcomes and idle:
+            renamed = [o for o in outcomes if o[0] not in ("toggled", "toggle_failed")]
+            if renamed and idle:
                 self._dirty = True  # re-enable the Rename submenu
             not_saved = False
+            toggled = False
             for outcome in outcomes:
                 kind = outcome[0]
-                if kind == "ok":
+                if kind == "toggled":
+                    toggled = True
+                elif kind == "toggle_failed":
+                    rumps.alert(title="claude-swap", message=outcome[1])
+                elif kind == "ok":
                     self._apply_rename(*outcome[1:])
                 elif kind == "gone":
                     rumps.alert(title="claude-swap", message="Account changed, rename cancelled")
@@ -2788,6 +2835,8 @@ def create_app(switcher, codex_monitor=None):
                 rumps.notification(
                     "claude-swap", "Could not rename", "Another cswap process is busy, try again"
                 )
+            if toggled and not quitting:
+                self.refresh_async()  # one read back of the store, as before
 
         def _apply_rename(self, slot, email, org, alias):
             # Show it now, on the row showing the renamed account: the next

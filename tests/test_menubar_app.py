@@ -450,7 +450,83 @@ def test_the_pause_item_still_flips_the_disabled_flag(app):
     app.rebuild_menu()
     for item in _submenu(app, "Pause / resume account").itemArray():
         item.target().callback_(item)
+    _settle(app)  # the store calls run on the worker, in the order clicked
     assert calls == [("1", True), ("2", False)]
+
+
+def _click_pause_on_the_first_row(app):
+    app.snapshot = _held_snap()
+    app.rebuild_menu()
+    item = _submenu(app, "Pause / resume account").itemArray()[0]
+    started = time.monotonic()
+    item.target().callback_(item)
+    return time.monotonic() - started
+
+
+def test_pause_waits_for_the_store_off_the_main_thread(app, monkeypatch):
+    # The setter holds the account lock, which a switch, a rename or the
+    # rotate daemon may hold for seconds: the menu must not wait with it.
+    gate, entered = threading.Event(), threading.Event()
+    on_main, refreshes = [], []
+
+    def blocked_setter(num, disabled):
+        on_main.append(threading.current_thread() is threading.main_thread())
+        entered.set()
+        assert gate.wait(5)
+
+    app.switcher.set_account_disabled = blocked_setter
+    monkeypatch.setattr(
+        app, "refresh_async",
+        lambda *a, **k: refreshes.append(threading.current_thread() is threading.main_thread()),
+    )
+    assert _click_pause_on_the_first_row(app) < 0.5  # the callback returned at once
+    assert entered.wait(5) and on_main == [False]  # the store call runs on a worker
+    app.on_sync_tick(None)
+    assert refreshes == []  # nothing lands while the store is still busy
+    gate.set()
+    _settle(app)
+    assert refreshes == [True]  # then the refresh, once, from the UI thread
+
+
+@pytest.mark.parametrize("error", ["lock", "unexpected"])
+def test_a_pause_the_store_refuses_alerts_on_the_ui_thread(app, monkeypatch, error):
+    from claude_swap.exceptions import LockError
+
+    alerts, refreshes = [], []
+    monkeypatch.setattr(
+        rumps, "alert",
+        lambda **kw: alerts.append((kw, threading.current_thread() is threading.main_thread())) or 1,
+    )
+    monkeypatch.setattr(app, "refresh_async", lambda *a, **k: refreshes.append(1))
+    raised = (
+        LockError("Failed to acquire lock - another instance may be running")
+        if error == "lock" else RuntimeError("store exploded")
+    )
+
+    def refusing_setter(num, disabled):
+        time.sleep(0.3)  # the lock wait, cut short
+        raise raised
+
+    app.switcher.set_account_disabled = refusing_setter
+    assert _click_pause_on_the_first_row(app) < 0.2
+    assert alerts == []
+    _settle(app)
+    assert alerts == [({"title": "claude-swap", "message": str(raised)}, True)]
+    assert refreshes == []  # as before: a refused change refreshes nothing
+
+
+def test_quit_waits_for_a_pending_pause(app, monkeypatch):
+    calls = []
+
+    def slow_setter(num, disabled):
+        time.sleep(1.0)
+        calls.append((num, disabled))
+
+    app.switcher.set_account_disabled = slow_setter
+    _click_pause_on_the_first_row(app)
+    quits, alerts, took = _quit(app, monkeypatch)
+    assert calls == [("1", True)] and quits == [1] and alerts == []
+    assert 0.5 < took < 3.5
 
 
 def test_text_rows_say_held_with_the_countdown(app):
@@ -530,11 +606,11 @@ def _settle(app, timeout=5.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         app.on_sync_tick(None)
-        if not app._renames_in_flight:
+        if not app._renames_in_flight and not getattr(app, "_toggles_in_flight", 0):
             app.on_sync_tick(None)
             return
         time.sleep(0.02)
-    raise AssertionError("rename never reported back")
+    raise AssertionError("a store job never reported back")
 
 
 def test_rename_prompt_is_prefilled_and_ok_stores_the_alias(app, window):
