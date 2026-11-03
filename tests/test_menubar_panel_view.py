@@ -1470,10 +1470,29 @@ def test_codex_with_nothing_left_draws_no_pill(monkeypatch):
 
 
 def test_no_badge_is_ever_red(monkeypatch):
-    # The red pill for a zero count is withdrawn (the owner, Nov 3): a pill
-    # that does draw is the secondary colour, fainter while unknown.
-    for credits in (2, 1, None):
-        (colour,) = [c for s, _f, c in _drawn(monkeypatch, _codex_panel(credits=credits)) if s.startswith("UR ")]
+    # The red pill for a zero count is withdrawn (the owner, Nov 3): nothing
+    # left draws nothing at all, neither text nor outline, plain or
+    # highlighted; a pill that does draw is the secondary colour, fainter
+    # while unknown.
+    for spent in (
+        _codex_panel(credits=0),
+        _account_with_resets(left=0),
+        _account_with_resets(left=0, usable=False),
+    ):
+        _view, spots, strokes = _header_geometry(monkeypatch, spent)
+        assert strokes == []
+        assert not any(text.startswith("UR") for text in spots)
+        for highlighted in (False, True):
+            drawn = _drawn(monkeypatch, spent, highlighted=highlighted)
+            assert not any(s.startswith("UR") for s, _f, _c in drawn)
+    for shown in (
+        _codex_panel(credits=2),
+        _codex_panel(credits=1),
+        _codex_panel(credits=None),
+        _account_with_resets(left=2),
+        _account_with_resets(left=2, usable=False),
+    ):
+        (colour,) = [c for s, _f, c in _drawn(monkeypatch, shown) if s.startswith("UR ")]
         assert not _is(colour, "systemRedColor")
     assert "over" not in mp.BADGE_STATES
 

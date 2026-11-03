@@ -1934,7 +1934,9 @@ def test_codex_spent_count_is_logged_while_the_dropdown_hides_it(capp, codex, ca
     with caplog.at_level(logging.INFO, logger="claude-swap"):
         codex.finish(_codex_state(credits=1))
         codex.finish(_codex_state(credits=0))  # the reset was used: a line of its own
+        codex.finish(_codex_state(credits=0))  # the same zero, a newer reading: not again
     lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("usage codex:")]
+    assert len(lines) == 2
     assert [line.rsplit(" · ", 1)[-1] for line in lines] == ["UR 1", "UR 0"]
     capp.on_sync_tick(None)
     assert _account_items(capp)[-1].view().panel.badge_text is None
