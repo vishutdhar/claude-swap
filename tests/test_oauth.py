@@ -847,7 +847,8 @@ class TestFetchUsageForAccount:
     def test_persist_failure_logs_warning_with_recovery_hint(self, caplog, capsys):
         """If the persist callback raises, _persist logs at WARNING level with
         a recovery hint (re-run `cswap --add-account`), not debug, AND prints
-        a user-visible warning to stdout.
+        a user-visible warning to stderr, so a ``--json`` payload on stdout
+        stays one parseable object.
         """
         import logging
 
@@ -868,10 +869,11 @@ class TestFetchUsageForAccount:
         assert "1" in msg
         assert "test@example.com" in msg
 
-        # Also verify the user-visible printed warning
-        output = capsys.readouterr().out
-        assert "failed to save refreshed token" in output
-        assert "cswap --add-account" in output
+        # Also verify the user-visible printed warning, and that stdout stays clean
+        captured = capsys.readouterr()
+        assert "failed to save refreshed token" in captured.err
+        assert "cswap --add-account" in captured.err
+        assert captured.out == ""
 
 
 class TestClassifyUsageError:
@@ -2156,3 +2158,23 @@ class TestLimitResetsProbeFirst:
         monkeypatch.setattr(oauth, "request_limit_resets", lambda token: calls.append(token))
         assert oauth._read_limit_resets("tok-1", _Gate()) == oauth.LimitResetsRead(None, "acct-9", None)
         assert calls == ["tok-1"]
+
+
+class TestLoginExpiresAtIso:
+    def test_refresh_token_expiry_is_reported_as_iso_utc(self):
+        creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-x", "refreshTokenExpiresAt": 1791421596865,
+        }})
+        assert oauth.login_expires_at_iso(creds) == "2026-10-08T01:06:36Z"
+
+    @pytest.mark.parametrize("creds", [
+        "",
+        "not json",
+        json.dumps({"claudeAiOauth": {"accessToken": "sk-x"}}),
+        json.dumps({"claudeAiOauth": {"refreshTokenExpiresAt": "soon"}}),
+        json.dumps({"claudeAiOauth": {"refreshTokenExpiresAt": True}}),
+        json.dumps({"claudeAiOauth": {"refreshTokenExpiresAt": 0}}),
+        json.dumps({"other": {}}),
+    ])
+    def test_anything_but_a_positive_epoch_is_unknown(self, creds):
+        assert oauth.login_expires_at_iso(creds) is None
