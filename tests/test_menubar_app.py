@@ -694,6 +694,25 @@ def test_a_read_back_that_cannot_start_stays_owed(app, monkeypatch):
     assert not app._refresh_again and not app._fresh_again
 
 
+def test_an_owed_read_the_tick_cannot_start_stays_owed_across_ticks(app, monkeypatch):
+    # The tick itself starts the owed read and finds no thread, tick after
+    # tick: it never raises, nothing is in flight, the owed re-measure stays
+    # owed, and once a thread can start exactly one fresh read runs.
+    monkeypatch.setattr(menubar, "_adapt_snapshot", lambda raw: raw)
+    source = _CountingSource(_snap(_entry("1", "a@x.com", active=True)))
+    app._snapshot_source = source
+    _refuse_thread_starts(monkeypatch, "_worker", times=3)
+    app._refresh_again, app._fresh_again = True, True
+    for _ in range(3):
+        app.on_sync_tick(None)  # raises nothing
+        assert not app._refreshing
+        assert app._refresh_again and app._fresh_again
+    assert source.reads == []
+    _tick_until_idle(app)  # the fourth start succeeds
+    assert [r.get("fresh") for r in source.reads] == [True]
+    assert not app._refresh_again and not app._fresh_again
+
+
 def test_quit_waits_for_a_pending_pause(app, monkeypatch):
     calls = []
 
