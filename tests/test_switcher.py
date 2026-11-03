@@ -658,6 +658,120 @@ class TestAliasWritesUnderTheSwitchLock:
         assert after == before
 
 
+class TestPolicyWritesUnderTheAccountLock:
+    """A threshold, priority or disable change is a read-modify-write of
+    sequence.json, like a rename or a switch.
+
+    All of them hold the account lock for the whole of it, or a rename or a
+    switch landing in between is written back over: a lost alias, a lost
+    policy, or an undone switch.
+    """
+
+    KINDS = ["threshold", "priority", "disable"]
+
+    def _setup(self, data):
+        data["accounts"]["1"]["alias"] = "old"
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, data)
+        return switcher
+
+    @staticmethod
+    def _policy(switcher, kind):
+        if kind == "threshold":
+            switcher.set_account_threshold("1", 85)
+        elif kind == "priority":
+            switcher.set_account_priority("1", 5)
+        else:
+            switcher.set_account_disabled("1", True)
+
+    @staticmethod
+    def _policy_landed(record, kind) -> bool:
+        if kind == "threshold":
+            return record.get("threshold") == 85
+        if kind == "priority":
+            return record.get("priority") == 5
+        return record.get("disabled") is True
+
+    @staticmethod
+    def _switch_to_2(switcher):
+        """What a concurrent switch does to the roster, under the same lock."""
+        from claude_swap.locking import FileLock
+
+        with FileLock(switcher.lock_file):
+            data = json.loads(switcher.sequence_file.read_text())
+            data["activeAccountNumber"] = 2
+            switcher._write_json(switcher.sequence_file, data)
+
+    @staticmethod
+    def _race_at_the_write(switcher, racer):
+        """Start ``racer`` between ``switcher``'s read and its write; with the
+        lock held it must still be waiting half a second later."""
+        real_write = switcher._write_json
+
+        def write_with_a_racer(path, data):
+            if path == switcher.sequence_file and racer.ident is None:
+                racer.start()
+                racer.join(timeout=0.5)
+            real_write(path, data)
+
+        switcher._write_json = write_with_a_racer
+
+    @staticmethod
+    def _thread(fn):
+        import threading
+
+        errors: list[BaseException] = []
+
+        def run():
+            try:
+                fn()
+            except BaseException as e:  # surfaced by the test, not lost in the thread
+                errors.append(e)
+
+        return threading.Thread(target=run), errors
+
+    @pytest.mark.parametrize("racing", ["rename", "switch"])
+    @pytest.mark.parametrize("kind", KINDS)
+    def test_a_rename_or_switch_racing_a_policy_write_survives(
+        self, temp_home: Path, sample_sequence_data: dict, kind, racing
+    ):
+        switcher = self._setup(sample_sequence_data)
+        other = ClaudeAccountSwitcher()  # another process's view of the same store
+        if racing == "rename":
+            racer, errors = self._thread(lambda: other.set_alias("1", "home"))
+        else:
+            racer, errors = self._thread(lambda: self._switch_to_2(other))
+        self._race_at_the_write(switcher, racer)
+        self._policy(switcher, kind)
+        racer.join(timeout=10)
+        assert not racer.is_alive() and errors == []
+        data = json.loads(switcher.sequence_file.read_text())
+        record = data["accounts"]["1"]
+        assert self._policy_landed(record, kind)  # the policy write landed
+        if racing == "rename":
+            assert record.get("alias") == "home"  # and the rename survived it
+        else:
+            assert data["activeAccountNumber"] == 2  # and the switch was not undone
+
+    @pytest.mark.parametrize("kind", KINDS)
+    def test_a_policy_write_racing_a_rename_survives(
+        self, temp_home: Path, sample_sequence_data: dict, kind
+    ):
+        # The reverse order: the rename holds the lock across its read and
+        # write, so a policy write that honours the lock waits for it.
+        switcher = self._setup(sample_sequence_data)
+        other = ClaudeAccountSwitcher()
+        racer, errors = self._thread(lambda: self._policy(other, kind))
+        self._race_at_the_write(switcher, racer)
+        switcher.set_alias("1", "home")
+        racer.join(timeout=10)
+        assert not racer.is_alive() and errors == []
+        record = json.loads(switcher.sequence_file.read_text())["accounts"]["1"]
+        assert record.get("alias") == "home"
+        assert self._policy_landed(record, kind)
+
+
 class TestAliasExpectedEmail:
     """The menu bar names the account by slot and the email it showed.
 
@@ -1232,6 +1346,43 @@ class TestFetchAccountUsageSessionProfile:
         assert args[2] == backup
         assert kwargs.get("is_active") is True
         assert "refresh_via" not in kwargs
+
+    def test_live_session_backup_read_carries_the_resets_gate(self, temp_home: Path):
+        """The backup copy serving a live session is a usage read like any
+        other: a due resets gate rides on it, the request goes out with the
+        backup's token, and the answer lands in the record."""
+
+        class Gate:  # an oauth.LimitResetsGate that is due and notes each step
+            def __init__(self):
+                self.asked = []
+
+            def reserve(self):
+                self.asked.append("reserve")
+                return True
+
+            def admit(self, account_uuid):
+                self.asked.append(("admit", account_uuid))
+                return True
+
+        switcher = ClaudeAccountSwitcher()
+        backup = _oauth_creds("sk-backup", 7200)
+        gate, sent = Gate(), []
+        cedar = {"eligible": True, "ineligible_reason": None, "grants": []}
+
+        with patch.object(switcher, "_live_session_pids", return_value=[123]), \
+             patch("claude_swap.session.read_session_credentials", return_value=None), \
+             patch("claude_swap.oauth.request_usage_data",
+                   return_value={"five_hour": {"utilization": 7.0}}), \
+             patch("claude_swap.oauth.fetch_oauth_profile",
+                   return_value={"uuid": "acct-2", "organizationUuid": None}), \
+             patch("claude_swap.oauth.request_limit_resets",
+                   side_effect=lambda token: sent.append(token) or cedar):
+            record = switcher._fetch_account_usage(self._info(backup), limit_resets=gate)
+
+        assert record.usage["five_hour"]["pct"] == 7.0
+        assert gate.asked == ["reserve", ("admit", "acct-2")]
+        assert sent == ["sk-backup"]  # the resets request, with the backup's token
+        assert record.limit_resets == oauth.LimitResetsRead(cedar, "acct-2", None)
 
     def test_live_session_without_profile_credentials_and_expired_backup_is_sentinel(
         self, temp_home: Path

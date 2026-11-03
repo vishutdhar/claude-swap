@@ -2038,10 +2038,25 @@ class ClaudeAccountSwitcher:
             if self._disabled_from_data(data, str(num))
         ]
 
+    def _policy_write_lock(self) -> FileLock:
+        """The account lock a policy change holds across its read-modify-write
+        of ``sequence.json``: the same lock ``set_alias`` and a switch hold,
+        or a rename or switch landing between the read and the write is
+        written back over. Checked for a store first, so a command on an
+        empty install creates nothing.
+
+        Raises:
+            ConfigError: No accounts are managed yet.
+        """
+        if not self.sequence_file.exists():
+            raise ConfigError("No accounts are managed yet")
+        return FileLock(self.lock_file)
+
     def _resolve_for_policy_write(self, identifier: str) -> tuple[str, str, dict, dict]:
         """Resolve an identifier and fetch its record, ready for a policy write.
 
-        Called by :meth:`set_account_threshold`. Every
+        Called by :meth:`set_account_threshold` and
+        :meth:`set_account_priority`, inside :meth:`_policy_write_lock`. Every
         raising path here happens **before** any write, so a rejected call
         leaves ``sequence.json`` byte-identical.
 
@@ -2094,27 +2109,28 @@ class ClaudeAccountSwitcher:
         # order matters only in that both checks precede the single write.
         normalized = None if threshold is None else normalize_account_threshold(threshold)
 
-        account_num, email, data, record = self._resolve_for_policy_write(identifier)
+        with self._policy_write_lock():
+            account_num, email, data, record = self._resolve_for_policy_write(identifier)
 
-        current = record.get("threshold")
-        if normalized is None and "threshold" not in record:
-            print(dimmed(
-                f"Account-{account_num} ({email}) has no threshold override "
-                f"— already using the global default."
-            ))
-            return
-        if normalized is not None and current == normalized:
-            print(dimmed(
-                f"Account-{account_num} ({email}) is already at {normalized:g}%."
-            ))
-            return
+            current = record.get("threshold")
+            if normalized is None and "threshold" not in record:
+                print(dimmed(
+                    f"Account-{account_num} ({email}) has no threshold override "
+                    f"— already using the global default."
+                ))
+                return
+            if normalized is not None and current == normalized:
+                print(dimmed(
+                    f"Account-{account_num} ({email}) is already at {normalized:g}%."
+                ))
+                return
 
-        if normalized is None:
-            record.pop("threshold", None)
-        else:
-            record["threshold"] = normalized
-        data["lastUpdated"] = get_timestamp()
-        self._write_json(self.sequence_file, data)
+            if normalized is None:
+                record.pop("threshold", None)
+            else:
+                record["threshold"] = normalized
+            data["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, data)
 
         if normalized is None:
             self._logger.info(f"Cleared threshold for account {account_num}: {email}")
@@ -2130,16 +2146,17 @@ class ClaudeAccountSwitcher:
     def set_account_priority(self, identifier: str, priority: object | None) -> None:
         """Set a priority tier, or remove it with None/0. Validate before writing."""
         normalized = 0 if priority is None else normalize_account_priority(priority)
-        account_num, email, data, record = self._resolve_for_policy_write(identifier)
-        if normalized:
-            changed = record.get("priority") != normalized
-            record["priority"] = normalized
-        else:
-            changed = "priority" in record
-            record.pop("priority", None)
-        if changed:
-            data["lastUpdated"] = get_timestamp()
-            self._write_json(self.sequence_file, data)
+        with self._policy_write_lock():
+            account_num, email, data, record = self._resolve_for_policy_write(identifier)
+            if normalized:
+                changed = record.get("priority") != normalized
+                record["priority"] = normalized
+            else:
+                changed = "priority" in record
+                record.pop("priority", None)
+            if changed:
+                data["lastUpdated"] = get_timestamp()
+                self._write_json(self.sequence_file, data)
         print(f"Account-{account_num} ({email}) priority: {normalized} "
               "(used by priority-consume-first).")
 
@@ -2157,28 +2174,26 @@ class ClaudeAccountSwitcher:
             ConfigError: no accounts are managed yet, or the email is ambiguous.
             AccountNotFoundError: identifier doesn't match any account.
         """
-        if not self.sequence_file.exists():
-            raise ConfigError("No accounts are managed yet")
+        with self._policy_write_lock():
+            # resolve_account migrates org fields and hard-errors on ambiguity.
+            account_num, email, _ = self.resolve_account(identifier)
 
-        # resolve_account migrates org fields and hard-errors on ambiguity.
-        account_num, email, _ = self.resolve_account(identifier)
+            data = self._get_sequence_data() or {}
+            record = data.get("accounts", {}).get(account_num)
+            if not record:
+                raise AccountNotFoundError(f"Account-{account_num} does not exist")
 
-        data = self._get_sequence_data() or {}
-        record = data.get("accounts", {}).get(account_num)
-        if not record:
-            raise AccountNotFoundError(f"Account-{account_num} does not exist")
+            verb = "disabled" if disabled else "enabled"
+            if bool(record.get("disabled")) == disabled:
+                print(dimmed(f"Account-{account_num} ({email}) is already {verb}."))
+                return
 
-        verb = "disabled" if disabled else "enabled"
-        if bool(record.get("disabled")) == disabled:
-            print(dimmed(f"Account-{account_num} ({email}) is already {verb}."))
-            return
-
-        if disabled:
-            record["disabled"] = True
-        else:
-            record.pop("disabled", None)
-        data["lastUpdated"] = get_timestamp()
-        self._write_json(self.sequence_file, data)
+            if disabled:
+                record["disabled"] = True
+            else:
+                record.pop("disabled", None)
+            data["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, data)
         self._logger.info(f"{verb.capitalize()} account {account_num}: {email}")
 
         print(f"{accent(verb.capitalize())} Account-{account_num} ({email}).")
