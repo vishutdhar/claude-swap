@@ -1661,8 +1661,9 @@ def create_app(switcher, codex_monitor=None):
             # Guards "compare generation, then publish" in the refresh worker
             # against "apply rename, bump generation" on the main thread.
             self._snapshot_lock = threading.Lock()
-            # Bumped by a local change to the snapshot (a rename); a refresh
-            # started under an older generation must not overwrite it.
+            # Bumped by a local change to the store (a rename, a pause or
+            # resume); a refresh started under an older generation must not
+            # overwrite it.
             self._snapshot_gen = 0
             self._refresh_again = False  # a refresh asked for while one ran
             self._fresh_again = False  # ... and it must re-measure (Refresh now)
@@ -1739,8 +1740,9 @@ def create_app(switcher, codex_monitor=None):
                 self._log_usage(snap)
                 with self._snapshot_lock:  # one step: nothing lands between check and publish
                     if generation != self._snapshot_gen:
-                        # Read before a local change (a rename) landed: showing
-                        # it would undo that change. Drop it and read again.
+                        # Read before a local change (a rename, a pause or
+                        # resume) landed: showing it would undo that change.
+                        # Drop it and read again.
                         self._refresh_again = True
                         return
                     self.snapshot = snap
@@ -2836,7 +2838,12 @@ def create_app(switcher, codex_monitor=None):
                     "claude-swap", "Could not rename", "Another cswap process is busy, try again"
                 )
             if toggled and not quitting:
-                self.refresh_async()  # one read back of the store, as before
+                # As after a rename: a refresh already in flight read the
+                # roster before this change, so the generation bump drops its
+                # reading, and exactly one refresh reads the store back after.
+                with self._snapshot_lock:
+                    self._snapshot_gen += 1
+                self._request_refresh()
 
         def _apply_rename(self, slot, email, org, alias):
             # Show it now, on the row showing the renamed account: the next

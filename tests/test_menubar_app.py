@@ -515,6 +515,48 @@ def test_a_pause_the_store_refuses_alerts_on_the_ui_thread(app, monkeypatch, err
     assert refreshes == []  # as before: a refused change refreshes nothing
 
 
+def test_a_refresh_started_before_a_pause_cannot_undo_it(app, monkeypatch):
+    # Real refresh worker: a reading taken before the pause must not be what
+    # the menu ends on, and exactly one refresh reads the store back after it.
+    monkeypatch.setattr(menubar, "_adapt_snapshot", lambda raw: raw)
+    gate, calls = threading.Event(), []
+    before = _snap(_entry("1", "a@x.com", active=True), _entry("2", "b@x.com"))
+    after = _snap(_entry("1", "a@x.com", active=True), _disabled_entry("2", "b@x.com"))
+
+    class Source:
+        def take(self, **_kw):
+            calls.append(1)
+            if len(calls) == 1:
+                gate.wait(5)  # an in-flight refresh, still reading the old roster
+                return before
+            return after
+
+    app._snapshot_source = Source()
+    app.snapshot = dict(before)  # an equal copy: `before` itself is the stale reading
+    app.rebuild_menu()
+    app.switcher.set_account_disabled = lambda num, disabled: None  # the store commits at once
+    app.refresh_async()  # 1. a refresh starts
+    app._set_disabled("2", True)  # 2. the pause commits and its outcome drains
+    _settle(app)
+    gate.set()  # 3. the old refresh completes, with the old state
+    deadline = time.monotonic() + 5
+    while app._refreshing and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert app.snapshot is not before  # its reading was dropped, never shown
+    for _ in range(150):  # the follow-up refresh runs, from the tick
+        app.on_sync_tick(None)
+        if len(calls) >= 2 and not app._refreshing:
+            break
+        time.sleep(0.02)
+    for _ in range(5):
+        app.on_sync_tick(None)
+        time.sleep(0.02)
+    assert len(calls) == 2  # exactly one read back after the pause
+    assert app.snapshot["accounts"][1][6] is True  # the menu holds what the store says
+    states = [i.state() for i in _submenu(app, "Pause / resume account").itemArray()]
+    assert states == [0, 1]
+
+
 def test_quit_waits_for_a_pending_pause(app, monkeypatch):
     calls = []
 
