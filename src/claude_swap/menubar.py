@@ -1707,11 +1707,21 @@ def create_app(switcher, codex_monitor=None):
             ).start()
 
         def _request_refresh(self):
-            """Refresh now, or right after the refresh already running."""
+            """Refresh now, or right after the refresh already running.
+
+            One read pays for a read already owed: with nothing running, the
+            read started here takes the owed one's place and keeps its
+            re-measure (a Refresh now pressed while another read ran), so a
+            change never adds a second read and never downgrades a fresh one.
+            """
             if self._refreshing:
-                self._refresh_again = True
-            else:
-                self.refresh_async()
+                self._refresh_again = True  # an owed re-measure stays owed
+                return
+            fresh = False
+            if self._refresh_again:
+                self._refresh_again = False
+                fresh, self._fresh_again = self._fresh_again, False
+            self.refresh_async(full=fresh, fresh=fresh)
 
         def _worker(self, full, generation=0, fresh=False):
             # Lock-free handoff: worker only rebinds plain attributes (atomic in
@@ -2810,7 +2820,7 @@ def create_app(switcher, codex_monitor=None):
             if renamed and idle:
                 self._dirty = True  # re-enable the Rename submenu
             not_saved = False
-            toggled = False
+            toggled = renamed_ok = False
             for outcome in outcomes:
                 kind = outcome[0]
                 if kind == "toggled":
@@ -2819,6 +2829,7 @@ def create_app(switcher, codex_monitor=None):
                     rumps.alert(title="claude-swap", message=outcome[1])
                 elif kind == "ok":
                     self._apply_rename(*outcome[1:])
+                    renamed_ok = True
                 elif kind == "gone":
                     rumps.alert(title="claude-swap", message="Account changed, rename cancelled")
                 elif kind in ("busy", "abandoned"):
@@ -2837,19 +2848,21 @@ def create_app(switcher, codex_monitor=None):
                 rumps.notification(
                     "claude-swap", "Could not rename", "Another cswap process is busy, try again"
                 )
-            if toggled and not quitting:
-                # As after a rename: a refresh already in flight read the
-                # roster before this change, so the generation bump drops its
-                # reading, and exactly one refresh reads the store back after.
+            if toggled:
+                # A refresh already in flight read the roster before this
+                # change: the bump drops its reading. (A rename bumps as it
+                # is applied, in one step with the change it shows.)
                 with self._snapshot_lock:
                     self._snapshot_gen += 1
+            if (toggled or renamed_ok) and not quitting:
+                # One read for the whole batch, after every change in it.
                 self._request_refresh()
 
         def _apply_rename(self, slot, email, org, alias):
             # Show it now, on the row showing the renamed account: the next
             # tick rebuilds from this snapshot. The generation bump makes any
-            # refresh already in flight discard its older reading, and a
-            # fresh refresh reads the store back.
+            # refresh already in flight discard its older reading; the drain
+            # then asks for one refresh that reads the store back.
             with self._snapshot_lock:  # one step with the refresh's compare-and-publish
                 snap = dict(self.snapshot)
                 orgs = snap.get("orgs") or {}
@@ -2873,7 +2886,6 @@ def create_app(switcher, codex_monitor=None):
                 self._snapshot_gen += 1
                 self.snapshot = snap
             self._dirty = True
-            self._request_refresh()
 
         def on_toggle_names_only(self, _sender):
             self.settings.show_names_only = not self.settings.show_names_only

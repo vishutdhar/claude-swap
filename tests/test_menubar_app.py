@@ -557,6 +557,72 @@ def test_a_refresh_started_before_a_pause_cannot_undo_it(app, monkeypatch):
     assert states == [0, 1]
 
 
+class _CountingSource:
+    """A snapshot source that notes each read's arguments and answers ``snap``."""
+
+    def __init__(self, snap):
+        self.snap, self.reads = snap, []
+
+    def take(self, **kw):
+        self.reads.append(kw)
+        return self.snap
+
+
+def _tick_until_idle(app):
+    for _ in range(100):
+        app.on_sync_tick(None)
+        if not app._refreshing and not app._refresh_again:
+            break
+        time.sleep(0.02)
+    for _ in range(5):  # a few more ticks: nothing else may start
+        app.on_sync_tick(None)
+        time.sleep(0.02)
+
+
+def _wait_for_store_jobs(app):
+    deadline = time.monotonic() + 5
+    while (app._renames_in_flight or app._toggles_in_flight) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert not app._renames_in_flight and not app._toggles_in_flight
+
+
+def test_a_rename_and_a_pause_draining_together_read_the_store_once(app, monkeypatch):
+    # Both are committed before the tick: one read covers the batch.
+    monkeypatch.setattr(menubar, "_adapt_snapshot", lambda raw: raw)
+    stored = _snap(_entry_alias("1", "a@x.com", "home", active=True), _disabled_entry("2", "b@x.com"))
+    source = _CountingSource(stored)
+    app._snapshot_source = source
+    app.snapshot = _snap(_entry_alias("1", "a@x.com", None, active=True), _entry("2", "b@x.com"))
+    app.rebuild_menu()
+    app.switcher.set_account_disabled = lambda num, disabled: None
+    app._rename_account("1", "a@x.com", "home")
+    app._set_disabled("2", True)
+    _wait_for_store_jobs(app)  # both outcomes wait for the tick
+    _tick_until_idle(app)
+    assert len(source.reads) == 1
+    assert app.snapshot is stored  # and that one read is what the menu shows
+
+
+@pytest.mark.parametrize("owed", ["ordinary", "refresh-now"])
+def test_a_pause_draining_with_a_read_owed_reads_once(app, monkeypatch, owed):
+    # A read is owed (a dropped reading, or a Refresh now pressed while one
+    # ran) and nothing runs when the pause drains: one read pays both, and
+    # an owed re-measure stays a re-measure.
+    monkeypatch.setattr(menubar, "_adapt_snapshot", lambda raw: raw)
+    source = _CountingSource(_snap(_entry("1", "a@x.com", active=True), _disabled_entry("2", "b@x.com")))
+    app._snapshot_source = source
+    app.snapshot = _snap(_entry("1", "a@x.com", active=True), _entry("2", "b@x.com"))
+    app.switcher.set_account_disabled = lambda num, disabled: None
+    app._set_disabled("2", True)
+    _wait_for_store_jobs(app)
+    app._refresh_again = True
+    app._fresh_again = owed == "refresh-now"
+    _tick_until_idle(app)
+    assert len(source.reads) == 1
+    assert source.reads[0].get("fresh") is (owed == "refresh-now")
+    assert not app._refresh_again and not app._fresh_again
+
+
 def test_quit_waits_for_a_pending_pause(app, monkeypatch):
     calls = []
 
