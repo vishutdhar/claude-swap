@@ -979,7 +979,7 @@ def test_codex_row_countdown_before_reset():
 @pytest.mark.parametrize("credits, known, badge", [
     (2, True, ("UR 2", "ok")),
     (1, True, ("UR 1", "ok")),
-    (0, True, ("UR 0", "over")),
+    (0, True, None),  # nothing left: no pill
     (2, False, ("UR ?", "unknown")),
     (None, True, ("UR ?", "unknown")),
 ])
@@ -1015,11 +1015,15 @@ def test_build_codex_panel_no_reading():
     assert panel.text_label == "Codex · no reading · UR ?"
 
 
-def test_build_codex_panel_old_count_is_unknown_and_zero_is_over():
+def test_build_codex_panel_old_count_is_unknown_and_zero_shows_no_pill():
     stale = mp.build_codex_panel(_codex_state(_codex_window(), credits=3, credits_age=25 * 3600), _NOW)
     assert (stale.badge_text, stale.badge_state) == ("UR ?", "unknown")
+    old_zero = mp.build_codex_panel(_codex_state(_codex_window(), credits=0, credits_age=25 * 3600), _NOW)
+    assert (old_zero.badge_text, old_zero.badge_state) == ("UR ?", "unknown")  # unknown is not none
     spent = mp.build_codex_panel(_codex_state(_codex_window(), credits=0), _NOW)
-    assert (spent.badge_text, spent.badge_state) == ("UR 0", "over")
+    assert (spent.badge_text, spent.badge_state) == (None, "ok")  # the no-grant shape: no pill
+    assert spent.text_label == "Codex · 7d 56% · 9s ago"
+    assert "UR" not in spent.text_label
 
 
 def test_build_codex_panel_names_only_hides_plan():
@@ -1047,8 +1051,9 @@ def test_codex_accessibility_label():
     none = mp.build_codex_panel(_codex_state(credits=None), _NOW)
     assert mp.accessibility_label(none) == "Codex. no reading. usage resets unknown."
     spent = mp.build_codex_panel(_codex_state(_codex_window(), credits=0, plan=None), _NOW)
-    assert mp.accessibility_label(spent).endswith(". no usage resets.")
-    assert mp.accessibility_label(spent).startswith("Codex, 9 seconds ago. ")
+    # No pill, nothing spoken for it: the label ends with the last window.
+    assert mp.accessibility_label(spent) == "Codex, 9 seconds ago. 7 day, 56 percent, resets in 2 days 3 hours."
+    assert "usage reset" not in mp.accessibility_label(spent)
 
 
 def test_account_panel_defaults_unchanged():
@@ -1129,7 +1134,6 @@ def test_account_panel_has_no_pill_without_a_grant():
 @pytest.mark.parametrize("kwargs, badge", [
     ({}, ("UR 1", "ok")),
     ({"left": 3}, ("UR 3", "ok")),
-    ({"left": 0, "usable": False}, ("UR 0", "over")),
     ({"usable": False}, ("UR 1", "unknown")),
     ({"paused": True, "usable": False}, ("UR 1", "unknown")),
 ])
@@ -1139,6 +1143,22 @@ def test_account_panel_pill_states(kwargs, badge):
     assert panel.badge_state in mp.BADGE_STATES
     assert panel.text_label.endswith(f"· {badge[0]}")
     assert panel.state_words == ("active",)  # the pill is not a state word
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"left": 0, "usable": False},
+    {"left": 0},
+    {"left": 0, "paused": True},
+    {"left": 0, "paused": True, "usable": False},
+])
+def test_account_panel_has_no_pill_when_nothing_is_left(kwargs):
+    # A spent grant is drawn, written and spoken exactly as no grant at all.
+    panel = mp.build_account_panel(_entry(_usage_with(**kwargs), active=True), _NOW)
+    assert (panel.badge_text, panel.badge_state, panel.badge_spoken) == (None, "ok", None)
+    assert "UR" not in panel.text_label
+    assert panel.state_words == ("active",)
+    label = mp.accessibility_label(panel)
+    assert "limit reset" not in label and "usage reset" not in label
 
 
 def test_account_panel_pill_is_gone_once_the_grant_has_ended():

@@ -868,6 +868,27 @@ def test_monitor_stale_seed_shows_unknown(tmp_path):
     assert cu.ur_badge(state.reset_credits, state.credits_known(NOW)) == ("UR ?", "unknown")
 
 
+@pytest.mark.parametrize("credits, known, badge", [
+    (2, True, ("UR 2", "ok")),
+    (0, True, None),  # nothing left: no pill (the owner, Nov 3)
+    (0, False, ("UR ?", "unknown")),  # an old zero is unknown, and unknown is not none
+    (None, True, ("UR ?", "unknown")),
+])
+def test_ur_badge_hides_a_known_zero_only(credits, known, badge):
+    assert cu.ur_badge(credits, known) == badge
+
+
+@pytest.mark.parametrize("credits, known, text", [
+    (2, True, "UR 2"),
+    (0, True, "UR 0"),  # the log keeps a spent count
+    (0, False, "UR ?"),
+    (None, True, "UR ?"),
+    (2, False, "UR ?"),
+])
+def test_ur_text_keeps_every_count_for_the_log(credits, known, text):
+    assert cu.ur_text(credits, known) == text
+
+
 def test_monitor_reply_updates_the_file(tmp_path):
     path = tmp_path / "launches.json"
     cu.LaunchBudget(path).save_credits(2, NOW - 3 * HOUR)

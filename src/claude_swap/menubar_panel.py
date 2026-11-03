@@ -75,7 +75,10 @@ STATE_SEP = " · "  # joins the state words ("active · held · 28m")
 CODEX_KEY = "codex"
 NO_READING = "no reading"
 RESET_DONE = "reset"  # a Codex window whose reset time has passed
-BADGE_STATES = ("ok", "over", "unknown")
+# The usage-resets pill: a count ("ok"), or dimmed ("unknown": not known,
+# paused or not usable now). Nothing left is no pill (``badge_text`` None),
+# never a red zero.
+BADGE_STATES = ("ok", "unknown")
 
 # A dead login (``json_output.DEAD_LOGIN_SENTINELS``): only the user can fix
 # it, so its row is urgent. The panel is handed the sentinel's display text,
@@ -142,7 +145,8 @@ class AccountPanel:
     kind: str = "account"
     # The usage-resets pill, drawn first on the right: the Codex block's
     # banked resets ("UR 2"), or an account's limit resets ("UR 1"), before
-    # ACTIVE and the other state words. None draws no pill.
+    # ACTIVE and the other state words. None draws no pill: no grant, or
+    # nothing left (a zero is absence, not an alarm).
     badge_text: str | None = None
     badge_state: str = "ok"  # one of BADGE_STATES
     # What VoiceOver says for an account's pill ("1 limit reset, use by
@@ -354,7 +358,7 @@ def codex_window_row(window: CodexWindow, now: float, fetched_at: float | None =
 
 
 def codex_text_label(name: str, rows, badge_text: str | None, age: str | None) -> str:
-    """The Codex text row: "Codex · 7d 56% · UR 2 · 9s ago"."""
+    """The Codex text row: "Codex · 7d 56% · UR 2 · 9s ago", no count without a pill."""
     parts = [name]
     windows = [row for row in rows if row.state != "unknown"]
     if windows:
@@ -374,7 +378,7 @@ def build_codex_panel(
     goes, and Show names only hides it behind an alias the same way. One
     row per window the reading carries, or one "no reading" row. The badge
     is the banked reset count, unknown when the app-server has not reported
-    it within a day.
+    it within a day, and absent when none are left (``ur_badge``).
     """
     reading = state.reading
     alias = alias or None
@@ -385,7 +389,8 @@ def build_codex_panel(
         if reading is not None else []
     )
     rows = rows or [_unknown(NO_READING)]
-    badge_text, badge_state = ur_badge(state.reset_credits, state.credits_known(now))
+    badge = ur_badge(state.reset_credits, state.credits_known(now))
+    badge_text = badge[0] if badge else None
     age = age_text(reading.fetched_at, now) if reading is not None else None
     return AccountPanel(
         num=CODEX_KEY,
@@ -403,7 +408,7 @@ def build_codex_panel(
         show_email=bool(plan) and not (names_only and alias),
         kind="codex",
         badge_text=badge_text,
-        badge_state=badge_state,
+        badge_state=badge[1] if badge else "ok",
     )
 
 
@@ -608,13 +613,13 @@ def _spoken_meta(panel: AccountPanel) -> str:
     return ", ".join(out)
 
 
-def _spoken_badge(panel: AccountPanel) -> str:
-    """"2 usage resets", "1 usage reset", "no usage resets" or "usage resets unknown"."""
-    if panel.badge_state == "unknown" or not panel.badge_text:
+def _spoken_badge(panel: AccountPanel) -> str | None:
+    """"2 usage resets", "1 usage reset" or "usage resets unknown"; None without a pill."""
+    if not panel.badge_text:
+        return None  # nothing left: no pill, nothing to say
+    if panel.badge_state == "unknown":
         return "usage resets unknown"
     count = panel.badge_text.rsplit(" ", 1)[-1]
-    if count == "0":
-        return "no usage resets"
     return f"{count} usage reset{'' if count == '1' else 's'}"
 
 
@@ -624,6 +629,7 @@ def accessibility_label(panel: AccountPanel) -> str:
     The Codex block says its name (with "Codex" after an alias), its plan,
     the age, each window, and then the banked usage resets. An account
     holding a limit reset ends with it: "1 limit reset, use by Nov 30".
+    Either says nothing for a pill it does not draw (nothing left).
     """
     # Always the full identity, whatever the display setting: a listener
     # has no other way to tell which email an alias belongs to.
@@ -651,8 +657,7 @@ def accessibility_label(panel: AccountPanel) -> str:
         elif row.reset_text:
             parts.append(f"resets in {spoken_duration(row.reset_text)}")
         sentences.append(", ".join(parts))
-    if panel.kind == "codex":
-        sentences.append(_spoken_badge(panel))
-    elif panel.badge_spoken:
-        sentences.append(panel.badge_spoken)
+    spoken = _spoken_badge(panel) if panel.kind == "codex" else panel.badge_spoken
+    if spoken:
+        sentences.append(spoken)
     return ". ".join(sentences) + "."

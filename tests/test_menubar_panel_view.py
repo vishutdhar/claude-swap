@@ -1433,11 +1433,15 @@ def test_codex_panel_renders_badge_and_no_slot_number():
 
 
 def test_badge_states_render_differently():
+    # A count, nothing left (no pill at all) and unknown: three pictures.
     panels = [_codex_panel(credits=2), _codex_panel(credits=0), _codex_panel(credits=None)]
-    assert [p.badge_state for p in panels] == ["ok", "over", "unknown"]
+    assert [(p.badge_text, p.badge_state) for p in panels] == [("UR 2", "ok"), (None, "ok"), ("UR ?", "unknown")]
     layout = pv.PanelLayout(panels)
     images = [_png(pv.make_panel_view(p, layout)) for p in panels]
     assert len(set(images)) == 3
+    # Nothing left draws exactly what a panel with no badge draws.
+    bare = dataclasses.replace(panels[0], badge_text=None)
+    assert images[1] == _png(pv.make_panel_view(bare, layout))
 
 
 def test_codex_header_draws_name_plan_badge_and_age_not_its_key(monkeypatch):
@@ -1453,9 +1457,25 @@ def test_codex_header_draws_name_plan_badge_and_age_not_its_key(monkeypatch):
     assert strings.index("UR 2") < strings.index("9s ago")  # the badge, then the age
 
 
-def test_badge_colour_by_state(monkeypatch):
+def test_codex_with_nothing_left_draws_no_pill(monkeypatch):
     calls = _drawn(monkeypatch, _codex_panel(credits=0))
-    assert _is(_colour_of(calls, "UR 0"), "systemRedColor")
+    strings = [s for s, _f, _c in calls]
+    assert not any(s.startswith("UR") for s in strings)
+    assert "9s ago" in strings  # the rest of the header as before
+    for highlighted in (False, True):
+        drawn = _drawn(monkeypatch, _codex_panel(credits=0), highlighted=highlighted)
+        assert not any(s.startswith("UR") for s, _f, _c in drawn)
+    _view, _spots, strokes = _header_geometry(monkeypatch, _codex_panel(credits=0))
+    assert strokes == []  # no outline either
+
+
+def test_no_badge_is_ever_red(monkeypatch):
+    # The red pill for a zero count is withdrawn (the owner, Nov 3): a pill
+    # that does draw is the secondary colour, fainter while unknown.
+    for credits in (2, 1, None):
+        (colour,) = [c for s, _f, c in _drawn(monkeypatch, _codex_panel(credits=credits)) if s.startswith("UR ")]
+        assert not _is(colour, "systemRedColor")
+    assert "over" not in mp.BADGE_STATES
 
 
 def test_unknown_badge_is_the_secondary_colour_a_little_fainter(monkeypatch):
@@ -1472,7 +1492,7 @@ def test_unknown_badge_is_the_secondary_colour_a_little_fainter(monkeypatch):
 
 
 def test_highlighted_badge_uses_the_selection_colour(monkeypatch):
-    for credits in (2, 0, None):
+    for credits in (2, None):
         calls = _drawn(monkeypatch, _codex_panel(credits=credits), highlighted=True)
         (badge,) = [c for s, _f, c in calls if s.startswith("UR ")]
         assert _is(badge, "selectedMenuItemTextColor")
@@ -1487,12 +1507,14 @@ def test_badge_pill_is_stroked_in_the_badge_colour(monkeypatch):
         return real(rect, radius, color, *width)
 
     monkeypatch.setattr(pv, "_stroke_rounded", spy)
-    panel = _codex_panel(credits=0)
-    _render(pv.make_panel_view(panel, pv.PanelLayout([panel])))
-    (rect, color) = strokes[-1]
-    assert _is(color, "systemRedColor")
-    x, y, w, h = rect
-    assert w > pv._width("UR 0", pv._fonts()["tag"]) + mp.BADGE_PAD_X  # the text has room inside
+    for credits, text in ((2, "UR 2"), (None, "UR ?")):
+        panel = _codex_panel(credits=credits)
+        strokes.clear()
+        calls = _drawn(monkeypatch, panel)  # one render: the stroke and the text it outlines
+        (rect, color) = strokes[-1]
+        assert color.isEqual_(_colour_of(calls, text))  # the outline is the text's colour
+        x, y, w, h = rect
+        assert w > pv._width(text, pv._fonts()["tag"]) + mp.BADGE_PAD_X  # the text has room inside
 
 
 class _Drawn(NamedTuple):
@@ -1600,7 +1622,7 @@ def test_badge_pill_is_a_one_pixel_outline_round_its_text_an_age_gap_before_the_
 
 
 @pytest.mark.parametrize("scale", [1, 1.5, 2, 3])
-@pytest.mark.parametrize("credits, text", [(0, "UR 0"), (None, "UR ?"), (12, "UR 12"), (999, "UR 999")])
+@pytest.mark.parametrize("credits, text", [(1, "UR 1"), (None, "UR ?"), (12, "UR 12"), (999, "UR 999")])
 def test_badge_geometry_by_state_and_scale(monkeypatch, credits, text, scale):
     pixel = 1.0 / scale
     monkeypatch.setattr(pv, "_device_pixel", lambda _view: pixel)
@@ -1746,7 +1768,7 @@ def test_unknown_badge_contrast(monkeypatch, appearance):
 
 
 @pytest.mark.parametrize("appearance", ["darkAqua", "aqua"])
-@pytest.mark.parametrize("credits", [2, 0])
+@pytest.mark.parametrize("credits", [2, 12])  # a zero draws no pill to measure
 def test_known_badges_meet_the_same_contrast(monkeypatch, credits, appearance):
     assert _badge_contrast(monkeypatch, credits, appearance) >= BADGE_MIN_CONTRAST
 
@@ -1897,11 +1919,21 @@ def test_account_pill_before_a_held_or_paused_word(monkeypatch):
 
 
 def test_account_pill_colours(monkeypatch):
-    assert _is(_colour_of(_drawn(monkeypatch, _account_with_resets(left=0, usable=False)), "UR 0"), "systemRedColor")
     assert _is(_colour_of(_drawn(monkeypatch, _account_with_resets(left=2)), "UR 2"), "secondaryLabelColor")
     dim = _colour_of(_drawn(monkeypatch, _account_with_resets(usable=False)), "UR 2")
     secondary = AppKit.NSColor.secondaryLabelColor().colorUsingColorSpace_(AppKit.NSColorSpace.sRGBColorSpace())
     resolved = dim.colorUsingColorSpace_(AppKit.NSColorSpace.sRGBColorSpace())
     assert resolved.alphaComponent() == pytest.approx(secondary.alphaComponent() * pv.UNKNOWN_BADGE_ALPHA)
-    highlighted = _drawn(monkeypatch, _account_with_resets(left=0, usable=False), highlighted=True)
-    assert _is(_colour_of(highlighted, "UR 0"), "selectedMenuItemTextColor")
+    highlighted = _drawn(monkeypatch, _account_with_resets(left=2), highlighted=True)
+    assert _is(_colour_of(highlighted, "UR 2"), "selectedMenuItemTextColor")
+
+
+@pytest.mark.parametrize("usable", [True, False])
+def test_account_with_nothing_left_draws_no_pill(monkeypatch, usable):
+    spent = _account_with_resets(left=0, usable=usable)
+    _view, spots, strokes = _header_geometry(monkeypatch, spent)
+    assert strokes == []
+    assert not any(text.startswith("UR") for text in spots)
+    assert "ACTIVE" in spots  # the state words as before
+    highlighted = _drawn(monkeypatch, spent, highlighted=True)
+    assert not any(s.startswith("UR") for s, _f, _c in highlighted)

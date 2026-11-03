@@ -1912,7 +1912,7 @@ def test_codex_done_marks_dirty_and_rebuilds(capp, codex):
     assert capp._dirty is True
     capp.on_sync_tick(None)
     panel = _account_items(capp)[-1].view().panel
-    assert (panel.badge_text, panel.badge_state) == ("UR 0", "over")
+    assert (panel.badge_text, panel.badge_state) == (None, "ok")  # nothing left: no pill
     assert capp.title.endswith(" · Codex 56%")  # the count is in the dropdown only
     assert "UR" not in capp.title
 
@@ -1926,6 +1926,18 @@ def test_codex_done_logs_usage_once_per_change(capp, codex, caplog):
     assert len(lines) == 2
     assert lines[0].startswith("usage codex: 7d 56% (resets ") and lines[0].endswith(" · UR 2")
     assert lines[1].startswith("usage codex: 7d 57% ")
+
+
+def test_codex_spent_count_is_logged_while_the_dropdown_hides_it(capp, codex, caplog):
+    capp.snapshot = _snap(_entry("1", "a@x.com", active=True))
+    capp.rebuild_menu()
+    with caplog.at_level(logging.INFO, logger="claude-swap"):
+        codex.finish(_codex_state(credits=1))
+        codex.finish(_codex_state(credits=0))  # the reset was used: a line of its own
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("usage codex:")]
+    assert [line.rsplit(" · ", 1)[-1] for line in lines] == ["UR 1", "UR 0"]
+    capp.on_sync_tick(None)
+    assert _account_items(capp)[-1].view().panel.badge_text is None
 
 
 def test_rename_menu_has_codex_entry_and_sets_alias(capp, window, tmp_path):
@@ -2054,7 +2066,8 @@ def test_in_place_text_rows_include_codex(capp, codex, cshown, on_screen):
     codex.state = _codex_state(credits=0)
     assert _row(capp).accessibilityPerformPress()
     assert _pump(lambda: not _row(capp).busy)
-    assert _account_items(capp)[-1].title().startswith("Codex · 7d 56% · UR 0")
+    row = _account_items(capp)[-1].title()
+    assert row.startswith("Codex · 7d 56% · ") and "UR" not in row  # nothing left: no "UR 0"
 
 
 def test_quit_closes_the_codex_monitor_first(capp, codex, monkeypatch):
@@ -2336,15 +2349,20 @@ def test_account_panels_carry_the_resets_pill_only_with_a_grant(app):
     )
     app.rebuild_menu()
     got = [(i.view().panel.badge_text, i.view().panel.badge_state) for i in _account_items(app)]
-    assert got == [("UR 0", "over"), (None, "ok"), ("UR 1", "ok")]
+    # A spent grant and no grant look alike: no pill. One left shows.
+    assert got == [(None, "ok"), (None, "ok"), ("UR 1", "ok")]
+    assert "UR" not in app.title  # the active account's spent grant stays out of the title too
 
 
 def test_text_rows_carry_the_resets_too(app):
     app.settings.show_usage_bars = False
-    app.snapshot = _snap(_entry_resets("1", "a@x.com", active=True), _entry("2", "b@x.com"))
+    app.snapshot = _snap(
+        _entry_resets("1", "a@x.com", active=True), _entry("2", "b@x.com"), _entry_resets("3", "c@x.com", left=0)
+    )
     app.rebuild_menu()
     titles = [i.title() for i in _account_items(app)]
     assert titles[0].endswith("5h 10% · UR 1") and "UR" not in titles[1]
+    assert titles[2].endswith("5h 10%") and "UR" not in titles[2]  # nothing left: no "UR 0"
 
 
 def test_usage_log_gains_the_resets_and_logs_again_when_only_they_change(app, caplog):
@@ -2352,8 +2370,13 @@ def test_usage_log_gains_the_resets_and_logs_again_when_only_they_change(app, ca
         app._log_usage(_snap(_entry_resets("1", "a@x.com", active=True, left=1)))
         app._log_usage(_snap(_entry_resets("1", "a@x.com", active=True, left=1)))  # same: not again
         app._log_usage(_snap(_entry_resets("1", "a@x.com", active=True, left=0)))  # the reset was used
+        app._log_usage(_snap(_entry_resets("1", "a@x.com", active=True, left=0)))  # same: not again
     lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("usage a@x.com")]
+    # The log keeps the spent count the dropdown hides: a trace of the reset.
     assert lines == ["usage a@x.com: 5h 10% · UR 1", "usage a@x.com: 5h 10% · UR 0"]
+    app.snapshot = _snap(_entry_resets("1", "a@x.com", active=True, left=0))
+    app.rebuild_menu()
+    assert _account_items(app)[0].view().panel.badge_text is None
 
 
 def test_resets_pill_appears_and_disappears_in_place_without_height_change(app, shown, on_screen):
@@ -2397,10 +2420,10 @@ def test_title_stays_ur_free_after_in_place_refresh(capp, codex, cshown, on_scre
     assert list(capp.menu._menu.itemArray()) == items  # redrawn in place
     # The dropdown carries every count; the title carries none.
     if bars:
-        assert [i.view().panel.badge_text for i in _account_items(capp)] == ["UR 1", "UR 0", "UR 3"]
+        assert [i.view().panel.badge_text for i in _account_items(capp)] == ["UR 1", None, "UR 3"]
     else:
         titles = [i.title() for i in _account_items(capp)]
-        assert titles[0].endswith("· UR 1") and titles[1].endswith("· UR 0")
+        assert titles[0].endswith("· UR 1") and "UR" not in titles[1]  # account 2 has none left
         assert titles[2].startswith("Codex · 7d 56% · UR 3")
     assert capp.title == "⇄ a · 55% · Codex 56%"
     _close(capp)  # and after the full rebuild the close owes

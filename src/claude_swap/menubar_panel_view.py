@@ -470,11 +470,13 @@ def _draw_panel(view, dirty) -> None:
 
 
 def _badge_color(state: str, ink):
-    """The usage-resets badge's text and outline colour."""
+    """The usage-resets badge's text and outline colour.
+
+    Never red: nothing left is no pill at all (``badge_text`` None), so a
+    pill that draws always holds a count or a question mark.
+    """
     if ink.highlighted:
         return ink.secondary  # the selection's text colour, like everything else
-    if state == "over":
-        return _fill_color("over")
     if state == "unknown":
         # A little fainter than a known count. Not the tertiary colour: on
         # the menu that falls below the 3:1 a control's outline needs.

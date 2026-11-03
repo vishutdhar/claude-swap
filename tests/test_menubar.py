@@ -2289,6 +2289,26 @@ def test_format_title_never_shows_the_codex_usage_resets(credits, credits_age):
     assert menubar.format_title("a@x.com", None, s, now=_CODEX_NOW, codex=state) == "⇄ Codex 56%"
 
 
+@pytest.mark.parametrize("credits, credits_age, text", [
+    (2, 60.0, "UR 2"),
+    (0, 60.0, "UR 0"),  # the dropdown hides a spent count; the log keeps it
+    (None, 60.0, "UR ?"),
+    (0, 25 * 3600, "UR ?"),
+])
+def test_codex_usage_log_keeps_every_count(credits, credits_age, text):
+    state = _codex(credits=credits, credits_age=credits_age)
+    line = menubar.format_codex_usage_log(state, _CODEX_NOW)
+    assert line.startswith("usage codex: 7d 56% (resets ") and line.endswith(f" · {text}")
+    assert menubar.codex_usage_log_key(state, _CODEX_NOW) == ((("7d", 56.0),), text)
+
+
+def test_codex_usage_log_key_tells_a_spent_count_from_an_unknown_one():
+    spent = menubar.codex_usage_log_key(_codex(credits=0), _CODEX_NOW)
+    unknown = menubar.codex_usage_log_key(_codex(credits=None), _CODEX_NOW)
+    one = menubar.codex_usage_log_key(_codex(credits=1), _CODEX_NOW)
+    assert len({spent, unknown, one}) == 3  # each change logs a line
+
+
 def test_format_title_codex_off():
     title_off = menubar.MenuBarSettings(show_account_name=True, title_pct="off", title_codex=False)
     assert menubar.format_title("loc@x.com", None, title_off, now=_CODEX_NOW, codex=_codex()) == "⇄ loc"
@@ -2379,13 +2399,28 @@ def new_york(monkeypatch):
 @pytest.mark.parametrize("kwargs, badge", [
     ({}, ("UR 1", "ok")),
     ({"left": 2}, ("UR 2", "ok")),
-    ({"left": 0, "usable": False}, ("UR 0", "over")),  # used: red, like the Codex zero
     ({"usable": False}, ("UR 1", "unknown")),  # held but not usable right now: dimmed
     ({"paused": True, "usable": False}, ("UR 1", "unknown")),
-    ({"left": 0, "paused": True}, ("UR 0", "unknown")),  # a paused reset is not a used one
+    # Nothing left is no pill at all (the owner, Nov 3), whatever the grant
+    # says of itself: a spent grant is spent.
+    ({"left": 0, "usable": False}, None),
+    ({"left": 0}, None),
+    ({"left": 0, "paused": True}, None),
+    ({"left": 0, "paused": True, "usable": False}, None),
 ])
 def test_limit_resets_badge_states(kwargs, badge):
     assert menubar.limit_resets_badge(_with_resets(**kwargs), _UR_NOW) == badge
+
+
+@pytest.mark.parametrize("kwargs, text", [
+    ({}, "UR 1"),
+    ({"left": 2}, "UR 2"),
+    ({"usable": False}, "UR 1"),
+    ({"left": 0, "usable": False}, "UR 0"),  # the log keeps a spent reset
+    ({"left": 0, "paused": True}, "UR 0"),
+])
+def test_limit_resets_text_keeps_every_count_for_the_log(kwargs, text):
+    assert menubar.limit_resets_text(_with_resets(**kwargs), _UR_NOW) == text
 
 
 @pytest.mark.parametrize("usage", [
@@ -2397,6 +2432,7 @@ def test_limit_resets_badge_states(kwargs, badge):
 def test_no_badge_without_a_grant(usage):
     assert menubar.limit_resets_badge(usage, _UR_NOW) is None
     assert menubar.limit_resets_spoken(usage, _UR_NOW) is None
+    assert menubar.limit_resets_text(usage, _UR_NOW) is None
 
 
 @pytest.mark.parametrize("left", [True, -1, 1.5, "1", None, 10**7])
@@ -2446,9 +2482,12 @@ def test_limit_resets_spoken_says_the_local_use_by_date(new_york):
 
 @pytest.mark.parametrize("kwargs, spoken", [
     ({"left": 2}, "2 limit resets, use by Nov 20"),
-    ({"left": 0, "usable": False}, "no limit resets left"),
     ({"usable": False}, "1 limit reset, not usable now, use by Nov 20"),
     ({"paused": True, "usable": False}, "1 limit reset, paused, use by Nov 20"),
+    # No pill, nothing spoken: nothing left is not a sentence.
+    ({"left": 0, "usable": False}, None),
+    ({"left": 0}, None),
+    ({"left": 0, "paused": True}, None),
 ])
 def test_limit_resets_spoken_states(new_york, kwargs, spoken):
     assert menubar.limit_resets_spoken(_with_resets(**kwargs), _UR_NOW) == spoken
@@ -2457,8 +2496,10 @@ def test_limit_resets_spoken_states(new_york, kwargs, spoken):
 def test_format_account_label_appends_the_resets_after_the_windows():
     label = menubar.format_account_label(2, "loc@papaya.asia", _with_resets(), _UR_NOW)
     assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30% · UR 1"
-    zero = menubar.format_account_label(2, "loc@papaya.asia", _with_resets(left=0), _UR_NOW)
-    assert zero.endswith("$ 30% · UR 0")
+    # Nothing left: the row reads as an account without a grant.
+    for kwargs in ({"left": 0}, {"left": 0, "usable": False}, {"left": 0, "paused": True}):
+        zero = menubar.format_account_label(2, "loc@papaya.asia", _with_resets(**kwargs), _UR_NOW)
+        assert zero == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30%"
 
 
 def test_format_account_label_without_a_grant_is_unchanged():
@@ -2472,7 +2513,9 @@ def test_format_title_never_shows_an_accounts_limit_resets(left):
     # The owner reads the pill in the dropdown only; the title keeps the pcts.
     s = menubar.MenuBarSettings(show_account_name=True, title_pct="both", title_scoped=True)
     usage = {**_with_resets(left=left), "scoped": [{"name": "Fable", "pct": 55.0}]}
-    assert menubar.format_title("loc@papaya.asia", usage, s, now=_UR_NOW) == "⇄ loc · 42% · 18% · Fable 55%"
+    title = menubar.format_title("loc@papaya.asia", usage, s, now=_UR_NOW)
+    assert title == "⇄ loc · 42% · 18% · Fable 55%"
+    assert "UR" not in title
     codex = _cu.CodexState(
         True,
         _cu.CodexReading((_cu.CodexWindow("7d", 56.0, 10080, _UR_NOW + 86400),), "pro", _UR_NOW - 9, "rollout"),
@@ -2513,6 +2556,15 @@ def test_format_usage_log_gains_the_resets():
         "usage a@x.com: 5h 35% (resets 06:59) · 7d 55% (resets Jul 3) · UR 1"
     )
     assert menubar.format_usage_log("a@x.com", {"limit_resets": _resets()}, _UR_NOW) is None  # no window
+
+
+@pytest.mark.parametrize("kwargs", [{"left": 0}, {"left": 0, "usable": False}, {"left": 0, "paused": True}])
+def test_format_usage_log_keeps_a_spent_reset_the_menu_hides(kwargs):
+    # The log is a diagnostic line, not UI: a used reset leaves "UR 0" in
+    # it while the dropdown shows no pill for the same usage.
+    usage = {"five_hour": {"pct": 35.0, "clock": "06:59"}, "limit_resets": _resets(**kwargs)}
+    assert menubar.format_usage_log("a@x.com", usage, _UR_NOW) == "usage a@x.com: 5h 35% (resets 06:59) · UR 0"
+    assert menubar.limit_resets_badge(usage, _UR_NOW) is None
 
 
 def _attested_resets(account_uuid="uuid-1", org_uuid=""):
