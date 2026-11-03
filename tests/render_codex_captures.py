@@ -60,7 +60,8 @@ def _grant(left: int, usable: bool = True, paused: bool = False) -> dict:
 
 def resets_accounts():
     """The dropdown with grants: the active account holds one, account 2
-    has used its reset, account 3 holds one, account 4 has none."""
+    has used its reset (no pill, as for no grant), account 3 holds one,
+    account 4 has none."""
     return [
         _account("1", "first@example.com", "work",
                  {"five_hour": _window(17.0, 3 * HOUR), "seven_day": _window(42.0, 4 * DAY),
@@ -76,8 +77,9 @@ def resets_accounts():
 
 
 def resets_states():
-    """The pill's states on account headers: ok, used, not usable now, a
-    paused grant on a paused account, and two digits on the active one."""
+    """The pill's states on account headers: ok, used (no pill: nothing
+    left is no tag at all), not usable now, a paused grant on a paused
+    account, and two digits on the active one."""
     seven = {"seven_day": _window(30.0, 3 * DAY)}
     return [
         _account("1", "one@example.com", "ok", {**seven, "limit_resets": _grant(1)}),
@@ -97,6 +99,7 @@ def codex(credits=2, alias=None, names_only=False, windows=None, reading=True):
 
 
 def codex_states():
+    """The Codex header: a count, none left (no pill), unknown, then the rest."""
     return [
         codex(2),
         codex(0),

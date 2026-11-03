@@ -32,7 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from claude_swap import oauth, pace
-from claude_swap.codex_usage import CodexState, ur_badge
+from claude_swap.codex_usage import CodexState, ur_text
 from claude_swap.exceptions import (
     AccountNotFoundError,
     ClaudeSwitchError,
@@ -456,8 +456,11 @@ def _local_part(email: str, limit: int = 12) -> str:
 #
 # An account whose usage carries a ``limit_resets`` entry (oauth.parse_limit_resets,
 # kept by the usage store) holds a banked limit reset. The tag shows how
-# many are left, "UR 1", in the same pill the Codex block uses. Accounts
-# without a grant show nothing, so the menu does not fill with red zeros.
+# many are left, "UR 1", in the same pill the Codex block uses. Nothing
+# left is no tag at all, exactly as for an account without a grant (the
+# owner, Nov 3, 2026: an empty count is absence, not an alarm). Only the
+# usage log keeps "UR 0" (``limit_resets_text``), so a used reset leaves a
+# trace in claude-swap.log.
 
 def limit_resets_entry(usage: dict | str | None, now: float) -> dict | None:
     """An account's limit resets as they stand at ``now``, or None.
@@ -472,23 +475,41 @@ def limit_resets_entry(usage: dict | str | None, now: float) -> dict | None:
     return oauth.summarize_limit_resets(usage.get("limit_resets"), now)
 
 
-def limit_resets_badge(usage: dict | str | None, now: float) -> tuple[str, str] | None:
-    """The account's UR pill: ("UR 1", "ok"), ("UR 0", "over") or ("UR 1", "unknown").
+def limit_resets_text(usage: dict | str | None, now: float) -> str | None:
+    """The account's limit resets as the usage log writes them: "UR 1" or "UR 0".
 
-    Red ("over") at zero: the reset was used. Dimmed ("unknown") while the
-    grant is paused, which wins over a zero (a paused reset is not a used
-    one), or not usable right now. None without a live grant.
+    Every count, zero included, so a used reset leaves a trace in the log;
+    the pill (``limit_resets_badge``) shows none at zero. None without a
+    live grant.
     """
     entry = limit_resets_entry(usage, now)
+    return None if entry is None else f"UR {entry['left']}"
+
+
+def _pill_resets(usage: dict | str | None, now: float) -> dict | None:
+    """``limit_resets_entry`` when the account shows a pill: something is left.
+
+    Nothing left is no pill and nothing spoken, whatever ``paused`` or
+    ``usable_now`` say: a spent grant is spent.
+    """
+    entry = limit_resets_entry(usage, now)
+    if entry is None or entry["left"] == 0:
+        return None
+    return entry
+
+
+def limit_resets_badge(usage: dict | str | None, now: float) -> tuple[str, str] | None:
+    """The account's UR pill: ("UR 1", "ok") or ("UR 1", "unknown"), else None.
+
+    Dimmed ("unknown") while the grant is paused or not usable right now.
+    None without a live grant, and when nothing is left: the menu shows no
+    pill rather than a zero.
+    """
+    entry = _pill_resets(usage, now)
     if entry is None:
         return None
-    left = entry["left"]
-    text = f"UR {left}"
-    if entry.get("paused") is True:
-        return text, "unknown"
-    if left == 0:
-        return text, "over"
-    if entry.get("usable_now") is not True:
+    text = f"UR {entry['left']}"
+    if entry.get("paused") is True or entry.get("usable_now") is not True:
         return text, "unknown"
     return text, "ok"
 
@@ -496,17 +517,16 @@ def limit_resets_badge(usage: dict | str | None, now: float) -> tuple[str, str] 
 def limit_resets_spoken(usage: dict | str | None, now: float) -> str | None:
     """What VoiceOver says for the pill: "1 limit reset, use by Nov 30".
 
-    The date is the grant's end in local time. A used grant is "no limit
-    resets left"; a paused or not-yet-usable one says so before the date.
+    The date is the grant's end in local time; a paused or not-yet-usable
+    grant says so before the date. None where there is no pill: no live
+    grant, or nothing left.
     """
-    entry = limit_resets_entry(usage, now)
+    entry = _pill_resets(usage, now)
     if entry is None:
         return None
-    left, paused = entry["left"], entry.get("paused") is True
-    if left == 0 and not paused:
-        return "no limit resets left"
+    left = entry["left"]
     parts = [f"{left} limit reset{'' if left == 1 else 's'}"]
-    if paused:
+    if entry.get("paused") is True:
         parts.append("paused")
     elif entry.get("usable_now") is not True:
         parts.append("not usable now")
@@ -635,19 +655,24 @@ def default_codex_monitor(backup_dir: Path, logger):
 
 
 def codex_usage_log_key(state: CodexState | None, now: float):
-    """De-dupe key for the Codex usage line: each window's pct and the badge.
+    """De-dupe key for the Codex usage line: each window's pct and the reset count.
 
     Like the account rows' key, it leaves out the reading's age and reset times, so
-    an idle account is not logged again on every read.
+    an idle account is not logged again on every read. The count is the log's
+    text (``ur_text``), zero included, so a used reset logs a line of its own.
     """
     if state is None or state.reading is None:
         return None
-    badge, _state = ur_badge(state.reset_credits, state.credits_known(now))
-    return tuple((w.label, w.pct) for w in state.reading.windows), badge
+    count = ur_text(state.reset_credits, state.credits_known(now))
+    return tuple((w.label, w.pct) for w in state.reading.windows), count
 
 
 def format_codex_usage_log(state: CodexState | None, now: float) -> str | None:
-    """"usage codex: 7d 56% (resets Nov 4 10:12) · UR 2", or None without a reading."""
+    """"usage codex: 7d 56% (resets Nov 4 10:12) · UR 2", or None without a reading.
+
+    The count is always written, "UR 0" included, though the dropdown shows
+    no pill at zero: this is a diagnostic line, not UI.
+    """
     if state is None or state.reading is None:
         return None
     from claude_swap.oauth import reset_clock_string
@@ -659,7 +684,7 @@ def format_codex_usage_log(state: CodexState | None, now: float) -> str | None:
             when = datetime.fromtimestamp(window.resets_at, timezone.utc)
             seg += f" (resets {reset_clock_string(when, datetime.fromtimestamp(now, timezone.utc))})"
         parts.append(seg)
-    parts.append(ur_badge(state.reset_credits, state.credits_known(now))[0])
+    parts.append(ur_text(state.reset_credits, state.credits_known(now)))
     return "usage codex: " + " · ".join(parts)
 
 
@@ -669,7 +694,9 @@ def format_usage_log(email: str, usage: dict | str | None, now: float | None = N
     Uses each window's absolute reset ``clock`` rather than a live countdown,
     since log lines are already timestamped. Returns ``None`` when no numeric
     window is available (sentinels, ``None``, or spend-only) so callers can skip
-    logging nothing. An account holding a limit reset ends with "· UR 1".
+    logging nothing. An account holding a limit reset ends with "· UR 1", and
+    one that has used it with "· UR 0": the dropdown hides a zero, the log
+    keeps it.
     """
     parts: list[str] = []
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
@@ -684,9 +711,9 @@ def format_usage_log(email: str, usage: dict | str | None, now: float | None = N
         parts.append(seg)
     if not parts:
         return None
-    badge = limit_resets_badge(usage, time.time() if now is None else now)
-    if badge:
-        parts.append(badge[0])
+    resets = limit_resets_text(usage, time.time() if now is None else now)
+    if resets:
+        parts.append(resets)
     return f"usage {email}: " + " · ".join(parts)
 
 
@@ -1785,8 +1812,7 @@ def create_app(switcher, codex_monitor=None):
             now = time.time()
             for num, email, _is_active, _display, last_good, _alias, _disabled, _fetched_at, *_extra in snap["accounts"]:
                 pcts = _usage_log_key(last_good)
-                badge = limit_resets_badge(last_good, now)
-                key = (pcts, badge[0] if badge else None)  # a used reset is logged too
+                key = (pcts, limit_resets_text(last_good, now))  # a used reset is logged too
                 if pcts == (None, None) or self._last_usage_log.get(num) == key:
                     continue
                 line = format_usage_log(email, last_good, now)

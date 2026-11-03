@@ -73,20 +73,29 @@ def test_capture_folder_accepts_itself_and_folders_inside_it(root):
 
 def test_claude_resets_scenes_show_each_pill_state():
     # The dropdown as the owner has it: the active account holds a grant, one
-    # account has used its reset, one holds one, one has none; then Codex.
+    # account has used its reset (no pill, like the account with none), one
+    # holds one, one has none; then Codex.
     dropdown, highlighted = captures.SCENES["claude-resets"]
     assert highlighted is False
     got = [(p.kind, p.num, p.badge_text, p.badge_state, p.is_active) for p in dropdown()]
     assert got == [
         ("account", "1", "UR 1", "ok", True),
-        ("account", "2", "UR 0", "over", False),
+        ("account", "2", None, "ok", False),
         ("account", "3", "UR 1", "ok", False),
         ("account", "4", None, "ok", False),
         ("codex", "codex", "UR 2", "ok", False),
     ]
     states, _hl = captures.SCENES["claude-resets-states"]
-    assert [(p.badge_text, p.badge_state) for p in states()] == [
-        ("UR 1", "ok"), ("UR 0", "over"), ("UR 1", "unknown"), ("UR 1", "unknown"), ("UR 12", "ok"),
+    assert [(p.name_text, p.badge_text, p.badge_state) for p in states()] == [
+        ("ok", "UR 1", "ok"), ("used", None, "ok"), ("later", "UR 1", "unknown"),
+        ("paused", "UR 1", "unknown"), ("many", "UR 12", "ok"),
     ]
     panels, highlighted = captures.SCENES["claude-resets-highlighted"]
     assert highlighted is True and [p.badge_text for p in panels()] == ["UR 1"]
+
+
+def test_codex_states_scene_shows_nothing_left_as_no_pill():
+    states, _hl = captures.SCENES["codex-states"]
+    badges = [(p.badge_text, p.badge_state) for p in states()]
+    assert badges[:3] == [("UR 2", "ok"), (None, "ok"), ("UR ?", "unknown")]
+    assert all(state != "over" for _text, state in badges)  # no red pill in any scene

@@ -1176,11 +1176,27 @@ class CodexState:
 ABSENT = CodexState(False, None, None, None, None)
 
 
-def ur_badge(credits: int | None, known: bool) -> tuple[str, str]:
-    """The usage-resets badge: ("UR 2", "ok"), ("UR 0", "over") or ("UR ?", "unknown")."""
+def ur_text(credits: int | None, known: bool) -> str:
+    """The banked usage resets as text: "UR 2", "UR 0", or "UR ?" when unknown.
+
+    The usage log writes every count, zero included, so a spent reset
+    leaves a trace; the dropdown's pill (``ur_badge``) shows none at zero.
+    """
+    return f"UR {credits}" if known and credits is not None else "UR ?"
+
+
+def ur_badge(credits: int | None, known: bool) -> tuple[str, str] | None:
+    """The usage-resets pill: ("UR 2", "ok"), ("UR ?", "unknown"), or None.
+
+    None when the count is known to be zero: nothing left is no pill at all
+    (the owner, Nov 3, 2026), drawn, written and spoken as no badge. A count
+    that is unknown or too old stays "UR ?": unknown is not none.
+    """
     if not known or credits is None:
-        return "UR ?", "unknown"
-    return f"UR {credits}", "over" if credits == 0 else "ok"
+        return ur_text(credits, known), "unknown"
+    if credits == 0:
+        return None
+    return ur_text(credits, known), "ok"
 
 
 def _newest(now: float, *readings: CodexReading | None) -> CodexReading | None:
