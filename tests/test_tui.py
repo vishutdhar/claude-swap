@@ -20,7 +20,12 @@ from pathlib import Path
 import pytest
 
 from claude_swap.autoswitch import NoSwitchEvent, SwitchEvent
-from claude_swap.json_output import USAGE_API_KEY, USAGE_TOKEN_EXPIRED
+from claude_swap.json_output import (
+    USAGE_API_KEY,
+    USAGE_NO_CREDENTIALS,
+    USAGE_RELOGIN_REQUIRED,
+    USAGE_TOKEN_EXPIRED,
+)
 from claude_swap.models import AccountSnapshot, AccountsSnapshot
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui import data as tui_data
@@ -190,9 +195,9 @@ class FakeSwitcher:
         print(f"Added Account {slot or 9}")
 
     def set_poll_policy_inputs(
-        self, threshold: float, models: tuple[str, ...]
+        self, threshold: float, weekly_threshold: float | None, models: tuple[str, ...]
     ) -> None:
-        self._poll_inputs_override = (threshold, models)
+        self._poll_inputs_override = (threshold, weekly_threshold, models)
 
     def clear_poll_policy_inputs(self) -> None:
         self._poll_inputs_override = None
@@ -408,6 +413,23 @@ class TestSnapshotSource:
         source.take(store_only=True)
         assert fake.fetch_sets == [set()]
 
+    def test_fresh_re_measures_and_only_when_asked(self, tmp_path):
+        # The menu bar's Refresh now asks for what `cswap list --fresh` does;
+        # every other take is the plain call every existing caller makes.
+        calls = []
+
+        class Fresh(FakeSwitcher):
+            def accounts_snapshot(self, fetch=None, **kw):
+                calls.append((fetch, kw))
+                return super().accounts_snapshot(fetch=fetch)
+
+        fake = Fresh([make_account(1, active=True), make_account(2)], tmp_path)
+        source = tui_data.SnapshotSource(fake)
+        source.take(full=True, fresh=True)
+        source.take()
+        source.take(full=True)
+        assert calls == [(None, {"fresh": True}), (None, {}), (None, {})]
+
     def test_expired_sentinel_retained_until_fetched_at_advances(self, tmp_path):
         expired = make_account(
             1,
@@ -488,6 +510,90 @@ class TestSnapshotSource:
         assert usage.sentinel is None
         assert usage.fetched_at == 200.0
         assert usage.last_good["five_hour"]["pct"] == 80.0
+
+    # A dead login (re-login needed, no credentials) ends only when the
+    # slot's credential changes. A read that no longer reported it but had
+    # no reading of its own used to bring the old verdict back through the
+    # carry-forward, with its old age ("14h 21m ago"), and kept it there
+    # until a fetch of that slot landed.
+
+    @pytest.mark.parametrize("dead", [USAGE_RELOGIN_REQUIRED, USAGE_NO_CREDENTIALS])
+    def test_dead_verdict_is_not_carried_over_a_read_with_no_reading(
+        self, tmp_path, dead
+    ):
+        t0 = time.time() - (14 * 3600 + 21 * 60)
+        verdict = make_account(
+            3, entry=make_usage_at(t0, pct=100.0, sentinel=dead)
+        )
+        no_reading_yet = make_account(3, entry=UsageEntry())
+        fake, source = self._source(tmp_path, [verdict])
+
+        assert source.take().accounts[0].usage.sentinel == dead  # premise
+        fake._accounts = [no_reading_yet]
+        usage = source.take().accounts[0].usage
+
+        assert usage.sentinel is None
+        # The model's own "no reading yet": nothing measured, no age, so
+        # the menu shows "usage unavailable" rather than T0's numbers.
+        assert usage.fetched_at is None
+        assert usage.age_s is None
+        assert usage.last_good is None
+
+    @pytest.mark.parametrize("dead", [USAGE_RELOGIN_REQUIRED, USAGE_NO_CREDENTIALS])
+    def test_dead_verdict_drops_but_newer_numbers_stay_over_an_older_reading(
+        self, tmp_path, dead
+    ):
+        verdict = make_account(
+            1, entry=make_usage_at(200.0, pct=80.0, sentinel=dead)
+        )
+        older = make_account(1, entry=make_usage_at(100.0, pct=10.0))
+        fake, source = self._source(tmp_path, [verdict])
+
+        source.take()
+        fake._accounts = [older]
+        usage = source.take().accounts[0].usage
+
+        assert usage.sentinel is None
+        # The carry-forward's purpose is kept: an older reading never
+        # replaces the newer numbers already on screen.
+        assert usage.fetched_at == 200.0
+        assert usage.last_good["five_hour"]["pct"] == 80.0
+
+    def test_dead_verdict_the_current_read_still_reports_keeps_its_reading(
+        self, tmp_path
+    ):
+        verdict = make_account(
+            1, entry=make_usage_at(100.0, sentinel=USAGE_RELOGIN_REQUIRED)
+        )
+        same_verdict_no_reading = make_account(
+            1, entry=UsageEntry(sentinel=USAGE_RELOGIN_REQUIRED)
+        )
+        fake, source = self._source(tmp_path, [verdict])
+
+        source.take()
+        fake._accounts = [same_verdict_no_reading]
+        usage = source.take().accounts[0].usage
+
+        assert usage.sentinel == USAGE_RELOGIN_REQUIRED
+        assert usage.fetched_at == 100.0
+
+    def test_expired_sentinel_still_rides_a_read_with_no_reading(self, tmp_path):
+        # Token expired is not a dead login: it retries on its own and is
+        # held until a newer reading lands, as before.
+        expired = make_account(
+            1,
+            active=True,
+            entry=make_usage_at(100.0, sentinel=USAGE_TOKEN_EXPIRED),
+        )
+        no_reading_yet = make_account(1, active=True, entry=UsageEntry())
+        fake, source = self._source(tmp_path, [expired])
+
+        source.take()
+        fake._accounts = [no_reading_yet]
+        usage = source.take(store_only=True).accounts[0].usage
+
+        assert usage.sentinel == USAGE_TOKEN_EXPIRED
+        assert usage.fetched_at == 100.0
 
 
 class TestUsageRows:
@@ -1495,6 +1601,104 @@ class TestAutoScreen:
                 "user2@example.com"
             )
 
+    async def test_candidates_rank_by_policy_headroom_under_a_weekly_line(
+        self, tmp_path, fake_engine
+    ):
+        """The 'Next best' list is the engine's own ordering: under a weekly
+        line a 7d 93% account outranks a 5h 95% one (18.5 vs 5 policy points;
+        raw pct would put it last), each row names the window that binds and
+        the line it is judged against, and the summary shows the line."""
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"threshold": 85, "weeklyThreshold": 97},
+        }))
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
+                make_account(2, entry=make_entry(5.0, 93.0)),
+                make_account(3, entry=make_entry(95.0, 47.0)),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert plain.index("user2@example.com") < plain.index(
+                "user3@example.com"
+            )
+            assert "7d  93% used (line 97%)" in plain
+            assert "5h  95% used (line 85%)" in plain
+            summary = app.screen.query_one("#auto-summary", Static).render().plain
+            assert "threshold 85%" in summary and "weekly 97%" in summary
+            assert app.weekly_threshold_pct == 97.0
+
+    async def test_candidates_follow_a_session_threshold_adjust(
+        self, tmp_path, fake_engine
+    ):
+        """The list ranks by the lines in force: a session adjust must re-rank
+        it and move the 5h rows' line label at once, not at the next snapshot.
+        At 85/97 the 7d 93% row (18.5 policy points) outranks the 5h 83% row
+        (17); at 88/97 it falls to 15.6 and the order flips."""
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"threshold": 85, "weeklyThreshold": 97},
+        }))
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
+                make_account(2, entry=make_entry(83.0, 10.0)),
+                make_account(3, entry=make_entry(5.0, 93.0)),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert plain.index("user3@example.com") < plain.index("user2@example.com")
+            assert "5h  83% used (line 85%)" in plain
+            await pilot.press("t", "right", "right", "right")
+            await pilot.pause()
+            assert app.screen._settings.threshold == 88.0
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert plain.index("user2@example.com") < plain.index("user3@example.com")
+            assert "5h  83% used (line 88%)" in plain
+            assert "7d  93% used (line 97%)" in plain
+
+    async def test_candidates_show_no_line_without_a_weekly_one(
+        self, tmp_path, fake_engine
+    ):
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
+                make_account(2, entry=make_entry(42.0, 10.0)),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert "5h  42% used" in plain
+            assert "(line" not in plain
+            summary = app.screen.query_one("#auto-summary", Static).render().plain
+            assert "weekly" not in summary
+            assert app.weekly_threshold_pct is None
+
     async def test_candidates_ranking_honors_configured_model(
         self, tmp_path, fake_engine
     ):
@@ -1585,6 +1789,28 @@ class TestAccountsSnapshot:
         assert all(not acc.switchable for acc in snap.accounts)
         assert all(acc.usage.sentinel is not None for acc in snap.accounts)
         assert isinstance(snap.taken_at, float)
+
+    def test_fresh_reaches_the_usage_collection(self, temp_home, mock_claude_config, monkeypatch):
+        # Routed exactly as `cswap list --fresh` routes it: into the one
+        # collection pass, where UsageStore.reserve decides what is re-measured.
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        data = switcher._get_sequence_data()
+        data["sequence"] = [1]
+        data["accounts"] = {"1": {"email": "test@example.com", "uuid": "test-uuid-1234"}}
+        switcher._write_json(switcher.sequence_file, data)
+        seen = []
+        real = switcher._collect_usage_entries
+
+        def spy(accounts_info, fetch=None, **kw):
+            seen.append((fetch, kw.get("fresh")))
+            return real(accounts_info, fetch=fetch, **kw)
+
+        monkeypatch.setattr(switcher, "_collect_usage_entries", spy)
+        switcher.accounts_snapshot(fetch=set(), fresh=True)  # store-only: no network
+        switcher.accounts_snapshot(fetch=set())
+        assert seen == [(set(), True), (set(), False)]
 
 
 # ---------------------------------------------------------------------------
@@ -1710,3 +1936,26 @@ class TestThemeWiring:
             assert app._theme_name == "light"
             assert app.theme == "cswap-light"
 
+
+class TestWeeklyTick:
+    def test_the_weekly_rows_tick_at_the_weekly_line(self):
+        from claude_swap.tui.widgets import _BAR_TICK, account_card_text
+
+        acc = make_account(
+            1, active=True, entry=make_entry(50.0, 50.0, scoped=[("Fable", 50.0)])
+        )
+
+        def ticks(**lines):
+            plain = account_card_text(acc, 100, **lines).plain
+            rows = {
+                ln.split()[0]: ln
+                for ln in plain.splitlines()
+                if ln.strip().startswith(("5h", "7d", "Fable"))
+            }
+            return {label: ln.index(_BAR_TICK) for label, ln in rows.items()}
+
+        with_weekly = ticks(threshold=85.0, weekly_threshold=97.0)
+        assert with_weekly["7d"] > with_weekly["5h"]
+        assert with_weekly["Fable"] == with_weekly["7d"]
+        without = ticks(threshold=85.0)
+        assert without["5h"] == without["7d"] == without["Fable"] == with_weekly["5h"]

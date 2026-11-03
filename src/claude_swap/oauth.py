@@ -5,13 +5,21 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import re
+import shutil
+import subprocess
 import sys
+import threading
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Protocol
 
+from claude_swap.codex_usage import MAX_RESET_CREDITS, finite_float
 from claude_swap.printer import warning as print_warning
 
 OAUTH_BETA_HEADER = "oauth-2025-04-20"
@@ -407,6 +415,379 @@ def request_usage_data(access_token: str) -> dict:
         return json.loads(resp.read().decode())
 
 
+# ---- limit resets ----------------------------------------------------------
+#
+# Some accounts hold a banked "limit reset" (claude.ai Settings > Usage, "Limit
+# resets"). The usage endpoint reports them in a ``cedar_ember`` object, but
+# only when asked (``?cedar_ember=1``) and only to Claude Code's own client:
+# with cswap's User-Agent it answers ``ineligible_reason: "surface"`` and no
+# grants. So this one read mirrors the User-Agent of the Claude Code install
+# the token was issued to. It is a separate, rare call (paced per account by
+# the usage store), never a change to the paced usage poll above, which
+# keeps its own User-Agent and URL: the endpoint budgets polling
+# per surface, and this is Claude Code's surface. Nothing here ever uses a
+# reset; the read only displays.
+
+LIMIT_RESETS_URL = "https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1"
+# The Claude Code version named when none can be read from the install: the
+# one the cedar_ember answer was verified against on 2026-11-02.
+CLAUDE_CODE_VERSION_FALLBACK = "2.1.316"
+CLAUDE_CODE_VERSIONS_DIR = Path(".local") / "share" / "claude" / "versions"  # under the home folder
+CLAUDE_VERSION_TIMEOUT_S = 5.0
+# A version as Claude Code names its installs ("2.1.316"). Nothing else may
+# reach the header: a name with a space or a line break would forge one.
+_VERSION_RE = re.compile(r"\d{1,4}(?:\.\d{1,6}){1,3}")
+
+_CLAUDE_CODE_UA: str | None = None
+_CLAUDE_CODE_UA_LOCK = threading.Lock()
+
+
+def _version_key(version: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in version.split("."))
+
+
+def _installed(entry: os.DirEntry) -> bool:
+    """Whether a versions-folder entry is an install: a file (as Claude Code
+    keeps them) or a folder, its links followed. A link whose target is
+    gone, or is anything else, is not."""
+    try:
+        return entry.is_file() or entry.is_dir()
+    except OSError:
+        return False
+
+
+def _run_claude_version(binary: str | None = None) -> str | None:
+    """What ``claude --version`` prints, or None when it cannot be run.
+
+    The menu bar's launch agent may not have ``~/.local/bin`` on its PATH,
+    so the usual install place is tried after the PATH lookup.
+    """
+    if binary is None:
+        binary = shutil.which("claude")
+        if binary is None:
+            fallback = Path.home() / ".local" / "bin" / "claude"
+            binary = str(fallback) if fallback.is_file() else None
+    if binary is None:
+        return None
+    try:
+        done = subprocess.run(
+            [binary, "--version"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=CLAUDE_VERSION_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    return done.stdout if done.returncode == 0 else None
+
+
+def claude_code_version(
+    versions_dir: Path | None = None, run: Callable[[], str | None] | None = None
+) -> str:
+    """The installed Claude Code's version, for the resets read's User-Agent.
+
+    The newest version-named install under ``~/.local/share/claude/versions``
+    (compared by number: 2.1.316 is newer than 2.1.99; a dangling link is
+    skipped), else the first word of ``claude --version``, else
+    ``CLAUDE_CODE_VERSION_FALLBACK``. Only a plain dotted number is ever
+    returned.
+    """
+    folder = versions_dir if versions_dir is not None else Path.home() / CLAUDE_CODE_VERSIONS_DIR
+    try:
+        with os.scandir(folder) as entries:
+            names = [
+                entry.name
+                for entry in entries
+                if _VERSION_RE.fullmatch(entry.name) and _installed(entry)
+            ]
+    except OSError:
+        names = []
+    if names:
+        return max(names, key=_version_key)
+    try:
+        answer = (run or _run_claude_version)()
+    except Exception:
+        answer = None
+    words = answer.split() if isinstance(answer, str) else []
+    if words and _VERSION_RE.fullmatch(words[0]):
+        return words[0]
+    return CLAUDE_CODE_VERSION_FALLBACK
+
+
+def claude_code_user_agent() -> str:
+    """Claude Code's own User-Agent (``claude-cli/2.1.316 (external, cli)``),
+    the version discovered once per process."""
+    global _CLAUDE_CODE_UA
+    with _CLAUDE_CODE_UA_LOCK:
+        if _CLAUDE_CODE_UA is None:
+            _CLAUDE_CODE_UA = f"claude-cli/{claude_code_version()} (external, cli)"
+        return _CLAUDE_CODE_UA
+
+
+def request_limit_resets(access_token: str) -> dict | None:
+    """The account's ``cedar_ember`` object, or None when nothing was learned.
+
+    One GET of the usage endpoint with ``cedar_ember=1&skip_spend=1`` and
+    Claude Code's User-Agent. None on any failure (network, HTTP status, a
+    body that is not JSON, no ``cedar_ember`` object), and also for a
+    ``"surface"`` refusal: then the server did not judge this client's
+    grants at all, which says nothing about whether the account has one.
+    Failures are logged at debug level, without the token. Never raises.
+    """
+    try:
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "anthropic-beta": OAUTH_BETA_HEADER,
+            "User-Agent": claude_code_user_agent(),
+        }
+        req = urllib.request.Request(LIMIT_RESETS_URL, headers=headers)
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception as e:
+        kind, _retry_after = _classify_usage_error(e)
+        _logger.debug("Limit resets read failed: %s", kind)
+        return None
+    cedar = data.get("cedar_ember") if isinstance(data, dict) else None
+    if not isinstance(cedar, dict):
+        _logger.debug("Limit resets read: the answer carried no cedar_ember object")
+        return None
+    if cedar.get("ineligible_reason") == "surface":
+        _logger.debug("Limit resets read: refused for this client (surface)")
+        return None
+    return cedar
+
+
+def _grant_count(value) -> int | None:
+    """A grant's reset count: a whole number in 0..MAX_RESET_CREDITS, else None."""
+    number = finite_float(value)
+    if number is None or not number.is_integer() or not 0 <= number <= MAX_RESET_CREDITS:
+        return None
+    return int(number)
+
+
+def iso_epoch(value) -> float | None:
+    """An ISO 8601 time as an epoch; one without a zone is UTC. None if unreadable."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        when = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return when.timestamp()
+
+
+def _utc_iso(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, timezone.utc).isoformat()
+
+
+def parse_limit_resets(cedar_ember, now: float) -> dict | None:
+    """The ``limit_resets`` entry kept beside an account's usage windows.
+
+    ``{"grants": [...], "eligible": bool}``: every grant whose ``ends_at``
+    is ahead of ``now``, as ``{"id", "label", "left", "total", "ends_at"
+    (ISO, UTC), "usable_now", "paused"}``, kept one by one so the menu can
+    sum them up when it draws (``summarize_limit_resets``) and a grant that
+    ends between reads drops out on its own. None when the answer is not an
+    object or has no live grant (``no_grant``, ``surface``, every grant
+    ended). A grant without a readable ``ends_at`` or ``resets_left`` is
+    left out: a reset that cannot be dated is not promised. A missing
+    ``resets_total`` counts what is left. Flags count only when they are
+    ``true`` itself.
+    """
+    if not isinstance(cedar_ember, dict):
+        return None
+    raw = cedar_ember.get("grants")
+    if not isinstance(raw, list):
+        return None
+    grants = []
+    for grant in raw:
+        if not isinstance(grant, dict):
+            continue
+        ends = iso_epoch(grant.get("ends_at"))
+        left = _grant_count(grant.get("resets_left"))
+        if ends is None or ends <= now or left is None:
+            continue
+        total = _grant_count(grant.get("resets_total"))
+        grant_id, label = grant.get("id"), grant.get("label")
+        grants.append({
+            "id": grant_id if isinstance(grant_id, str) else None,
+            "label": label if isinstance(label, str) else None,
+            "left": left,
+            "total": left if total is None else total,
+            "ends_at": _utc_iso(ends),
+            "usable_now": grant.get("usable_now") is True,
+            "paused": grant.get("paused") is True,
+        })
+    if not grants:
+        return None
+    return {"grants": grants, "eligible": cedar_ember.get("eligible") is True}
+
+
+def summarize_limit_resets(entry, now: float) -> dict | None:
+    """What the menu shows for a stored ``limit_resets`` entry at ``now``.
+
+    Summed over the stored grants whose ``ends_at`` is still ahead of
+    ``now`` and that are not paused: ``left`` and ``total``, ``usable_now``
+    (one of them is usable now and still has resets left: a spent grant
+    never makes another's reset usable, and a paused one never is),
+    ``label`` (the first one's) and ``ends_at``, the soonest
+    end among those that still have resets left (among all of them when
+    none has: a used reset still shows until it ends). When every live grant
+    is paused, those are summed instead and ``paused`` is true: a paused
+    reset is not a used one. ``eligible`` is the answer's own flag. None
+    when no stored grant is live and readable, and for an entry in any
+    other shape (the summed one written before grants were kept).
+    """
+    if not isinstance(entry, dict):
+        return None
+    grants = entry.get("grants")
+    if not isinstance(grants, list):
+        return None
+    live = []  # (grant, ends epoch, left, total)
+    for grant in grants:
+        if not isinstance(grant, dict):
+            continue
+        ends = iso_epoch(grant.get("ends_at"))
+        left = _grant_count(grant.get("left"))
+        if ends is None or ends <= now or left is None:
+            continue
+        total = _grant_count(grant.get("total"))
+        live.append((grant, ends, left, left if total is None else total))
+    if not live:
+        return None
+    counted = [item for item in live if item[0].get("paused") is not True]
+    paused = not counted
+    if paused:
+        counted = live
+    dated = [item for item in counted if item[2] > 0] or counted
+    label = counted[0][0].get("label")
+    return {
+        "left": sum(left for _grant, _ends, left, _total in counted),
+        "total": sum(total for _grant, _ends, _left, total in counted),
+        "ends_at": _utc_iso(min(ends for _grant, ends, _left, _total in dated)),
+        "label": label if isinstance(label, str) else None,
+        "usable_now": any(
+            grant.get("usable_now") is True and left > 0 and grant.get("paused") is not True
+            for grant, _ends, left, _total in counted
+        ),
+        "eligible": entry.get("eligible") is True,
+        "paused": paused,
+    }
+
+
+@dataclass(frozen=True)
+class LimitResetsRead:
+    """One limit-resets read made beside a usage read.
+
+    ``cedar_ember`` is what ``request_limit_resets`` answered: the object,
+    or None when the read failed and nothing was learned. The usage store
+    parses it with its own clock and keeps the previous entry on a failure.
+    """
+
+    cedar_ember: dict | None
+    # Whose account the token that asked belongs to, as the server says
+    # (``fetch_oauth_profile`` with the same token, before the resets read):
+    # the answer is kept for a slot only when these are the slot's stored
+    # ``uuid`` and ``organizationUuid``. None when the probe failed.
+    account_uuid: str | None = None
+    org_uuid: str | None = None
+
+
+class LimitResetsGate(Protocol):
+    """What paces one limit-resets read, asked at each step before a request.
+
+    ``reserve()`` before anything is sent: the slot's own account's read
+    must be due, and it is stamped. ``admit(account_uuid)`` once the profile
+    probe has named the account the token belongs to, before the resets
+    request: that account's read must be due too (it is the slot's own,
+    just reserved, or it is stamped now). False at either step sends
+    nothing more.
+    """
+
+    def reserve(self) -> bool: ...
+
+    def admit(self, account_uuid: str) -> bool: ...
+
+
+def _read_limit_resets(access_token: str, gate: LimitResetsGate) -> LimitResetsRead | None:
+    """The limit-resets read for one token, probe first, none of it able to
+    fail the usage read it rides on.
+
+    1. ``gate.reserve()``: the slot's account is paced (None: nothing sent).
+    2. The profile probe (``fetch_oauth_profile``) with this token: whose
+       account it is. No answer: no resets request.
+    3. ``gate.admit(uuid)``: that account's read must be due, and is
+       stamped, so an account already read this interval through another
+       slot (a swap half published) is not asked again.
+    4. The resets request, with this token.
+
+    The read carries the server's ids for the attestation at record time;
+    its ``cedar_ember`` is None whenever no resets answer was had.
+
+    Accepted residual: the probe is paced by the slot's stored account
+    (step 1), because whose token it is is known only from the probe
+    itself. Slots whose stored accounts are stale and whose tokens are one
+    real account's (a duplicated token in the roster, an operator error)
+    each send one profile probe per interval; that account's resets
+    request still goes out once (step 3). The overrun is bounded at one
+    extra probe, cswap's existing ownership call, per duplicate slot per
+    interval.
+    """
+    try:
+        reserved = gate.reserve() is True
+    except Exception as e:
+        _logger.debug("Limit resets reservation failed: %r", e)
+        return None
+    if not reserved:
+        return None
+    # Accepted residual (see above): paced per slot, as the token's account
+    # is not known until this answers.
+    try:
+        profile = fetch_oauth_profile(access_token)
+    except Exception as e:  # it never raises; a bug must not cost the usage
+        _logger.debug("Limit resets attestation raised: %r", e)
+        profile = None
+    account_uuid = profile.get("uuid") if isinstance(profile, dict) else None
+    if not account_uuid:
+        return LimitResetsRead(None)
+    org_uuid = profile.get("organizationUuid")
+    try:
+        admitted = gate.admit(account_uuid) is True
+    except Exception as e:
+        _logger.debug("Limit resets admission failed: %r", e)
+        admitted = False
+    if not admitted:
+        return LimitResetsRead(None, account_uuid, org_uuid)
+    try:
+        cedar = request_limit_resets(access_token)
+    except Exception as e:  # the contract says never; same reason
+        _logger.debug("Limit resets read raised: %r", e)
+        cedar = None
+    return LimitResetsRead(cedar, account_uuid, org_uuid)
+
+
+def read_limit_resets_for(
+    credentials: str, gate: LimitResetsGate
+) -> LimitResetsRead | None:
+    """The limit-resets read made with ``credentials``' access token, behind
+    its gate; None when the gate refuses or there is no token.
+
+    For a caller that must settle who owns a credential between its usage
+    read and its resets read (the active account's ownership probe): it
+    reads with the token the usage read used, as long as nothing refreshed
+    it in between (``try_fetch_usage_for_account`` with ``is_active=True``
+    never does).
+    """
+    token = extract_access_token(credentials)
+    if not token:
+        return None
+    return _read_limit_resets(token, gate)
+
+
 def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
     """Map a usage-fetch exception to ``(kind, retry_after_s)``.
 
@@ -535,6 +916,13 @@ def build_usage_result(data: dict) -> dict | None:
     return result if result else None
 
 
+# Label of the 5-hour window as ``relevant_windows`` reports it. The only
+# window that is NOT weekly: every consumer that treats the 5h window
+# differently (``lines.window_line``, the TUI's per-row switch-line tick) keys
+# on this constant, so the label is spelled in one place.
+FIVE_HOUR_LABEL = "5h"
+
+
 def relevant_windows(
     usage: dict | None, models: Sequence[str] = ()
 ) -> list[tuple[str, float, str | None]]:
@@ -553,7 +941,7 @@ def relevant_windows(
     if not isinstance(usage, dict):
         return []
     windows: list[tuple[str, float, str | None]] = []
-    for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
+    for key, label in (("five_hour", FIVE_HOUR_LABEL), ("seven_day", "7d")):
         window = usage.get(key)
         if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)):
             windows.append((label, float(window["pct"]), window.get("resets_at")))
@@ -612,6 +1000,9 @@ class UsageOutcome:
     # permanent auth kind — lets the store bind the strike to that
     # generation (see usage_store.FetchRecord.struck_fp).
     struck_fp: str | None = None
+    # The limit-resets read made right after a successful usage read, when
+    # one was asked for; None when none was made.
+    limit_resets: LimitResetsRead | None = None
 
 
 def fetch_usage(access_token: str) -> dict | None:
@@ -643,6 +1034,7 @@ def try_fetch_usage_for_account(
     is_active: bool,
     persist_credentials: Callable[[str, str, str], None] | None = None,
     refresh_via: Callable[[str, str, str], RefreshOutcome] | None = None,
+    limit_resets: LimitResetsGate | None = None,
 ) -> UsageOutcome:
     """Fetch usage for an account, refreshing expired tokens for inactive accounts only.
 
@@ -652,6 +1044,14 @@ def try_fetch_usage_for_account(
     freshest copy under the slot lock, persists via fingerprint CAS, and
     never consumes a superseded snapshot. ``persist_credentials`` is then
     unused for the refresh (the gate persists internally).
+
+    ``limit_resets`` asks for the rare limit-resets read as well. It is the
+    read's gate (``LimitResetsGate``), asked only after a usage read that
+    succeeded with window data; the profile probe and the resets request go
+    out with the token that read used, each only when the gate lets it
+    (``_read_limit_resets``), and the read is carried in
+    ``UsageOutcome.limit_resets``. Neither the gate, the probe nor the read
+    can fail the usage read.
     """
     context = f"for account {account_num}"  # no email: paste-safe for public issues
     oauth = extract_oauth_data(credentials)
@@ -702,9 +1102,15 @@ def try_fetch_usage_for_account(
         # A transient refresh failure falls through to try the (expired) token;
         # the 401 path below retries the refresh.
 
+    def succeeded(data: dict, token: str) -> UsageOutcome:
+        usage = build_usage_result(data)
+        if limit_resets is None or usage is None:
+            return UsageOutcome(usage)
+        return UsageOutcome(usage, limit_resets=_read_limit_resets(token, limit_resets))
+
     try:
         data = request_usage_data(access_token)
-        return UsageOutcome(build_usage_result(data))
+        return succeeded(data, access_token)
     except urllib.error.HTTPError as e:
         kind, retry_after = _classify_usage_error(e)
         if (
@@ -753,7 +1159,7 @@ def try_fetch_usage_for_account(
 
         try:
             data = request_usage_data(new_token)
-            return UsageOutcome(build_usage_result(data))
+            return succeeded(data, new_token)
         except Exception as retry_error:
             kind, retry_after = _classify_usage_error(retry_error)
             _log_usage_failure(context + " after refresh", retry_error, kind, retry_after)

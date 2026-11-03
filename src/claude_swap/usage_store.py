@@ -35,6 +35,8 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from claude_swap.codex_usage import dated_ahead, finite_float
+from claude_swap.exceptions import LockError
 from claude_swap.locking import FileLock
 from claude_swap import oauth
 from claude_swap.poll_policy import (
@@ -62,6 +64,150 @@ STALE_OK_S = 300.0  # trusted for switch decisions; older → headroom unknown
 CLAIM_TTL_S = 90.0  # in-flight claim window: skip just-claimed accounts
 LEGACY_CLAIM_TTL_S = 10.0  # additive-schema overlap with older collectors
 
+# The limit-resets read (oauth.request_limit_resets) speaks with Claude Code's
+# User-Agent, so it spends Claude Code's polling budget on the usage
+# endpoint, not ours. The resets change rarely (a grant is added, used or
+# ends), so a slot is asked at most once an hour, inside its own usage
+# fetch, paced from the last try whether it answered or not (a failing read
+# must not retry on every poll). Refresh now (and ``list --fresh``) may ask
+# again after ten minutes. The try time is fetch state, kept on the row as
+# in ``LimitResetsAttempts`` and written by ``reserve_limit_resets`` right
+# before the request is sent: a read whose record is later thrown away (a
+# foreign-credential sentinel, a collector killed mid-fetch) still paces the
+# next one. The entry itself, with its own ``fetched_at``, rides in
+# ``lastGood`` beside the windows.
+#
+# The interval belongs to the ACCOUNT, not to the slot's row: a row is
+# replaced whenever its slot's identity changes (a swap, an add over the
+# slot), and a stamp kept on it would go with it. And it lives in its own
+# file, not in usage.json: other writers rewrite usage.json knowing only
+# its schemaVersion and accounts (an older build's store, cswap-renew's
+# heal, an import), and a stamp kept there would be erased by them.
+LIMIT_RESETS_EVERY_S = 3600.0
+LIMIT_RESETS_MANUAL_EVERY_S = 600.0
+LIMIT_RESETS_ATTEMPTS_FILE = "limit_resets_attempts.json"
+LIMIT_RESETS_ATTEMPTS_KEEP_S = 7 * 86400.0  # a departed account's stamp older than this is dropped
+LIMIT_RESETS_LOCK_WAIT_S = 2.0  # a fetch worker waits no longer for the attempts lock
+
+
+class LimitResetsAttempts:
+    """When each account last tried its limit-resets read, and which
+    reservation wrote that.
+
+    ``cache/limit_resets_attempts.json``: ``{"attempts": {"<account uuid>":
+    {"t": epoch, "id": token}}}``, the token the reservation's own (as the
+    Codex launch budget tokens its launches), so a reservation can tell
+    whether the stamp is still its own before it sends. A bare number (no
+    released build wrote one) reads as a stamp with no token, which no
+    reservation owns. Its own file with its own lock sidecar (``<file>.lock``), as
+    the Codex launch budget keeps its log, and written only here, so
+    nothing that rewrites usage.json can erase it, and nothing in it can
+    break a usage read. Every value goes through ``finite_float``: a number
+    too large for a float, or anything not a number, is dropped and never
+    raises. An unreadable file reads as empty: the file only paces a
+    display read, so the worst a lost file costs is one read per account
+    earlier than its interval.
+
+    On write, a stamp is dropped only when its account is no longer in the
+    roster (``roster()``: the stored account uuids, read at that moment) and
+    it is older than LIMIT_RESETS_ATTEMPTS_KEEP_S. A roster account's stamp
+    is never dropped, so a clock that jumps ahead for a while cannot erase a
+    fresh stamp; the file holds the roster plus the accounts that left in
+    the last week. With no roster given, every stamp is judged by age
+    alone; with one that cannot be read (``roster()`` is None, or raises),
+    nothing is dropped.
+    """
+
+    def __init__(
+        self,
+        cache_dir: Path,
+        clock: Callable[[], float],
+        roster: Callable[[], Iterable[str] | None] | None = None,
+    ):
+        self.path = cache_dir / LIMIT_RESETS_ATTEMPTS_FILE
+        self._lock_path = cache_dir / (LIMIT_RESETS_ATTEMPTS_FILE + ".lock")
+        self.clock = clock
+        self._roster = roster
+
+    def _entries(self) -> dict[str, tuple[float, str | None]]:
+        """``{uuid: (stamp, reservation token or None)}``; an unreadable file
+        is empty. Never raises."""
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, RecursionError):
+            return {}
+        stamps = raw.get("attempts") if isinstance(raw, dict) else None
+        out: dict[str, tuple[float, str | None]] = {}
+        if isinstance(stamps, dict):
+            for uuid, value in stamps.items():
+                if isinstance(value, dict):
+                    stamp = finite_float(value.get("t"))
+                    token = value.get("id")
+                    token = token if isinstance(token, str) and token else None
+                else:
+                    stamp, token = finite_float(value), None
+                if isinstance(uuid, str) and uuid and stamp is not None:
+                    out[uuid] = (stamp, token)
+        return out
+
+    def read(self) -> dict[str, float]:
+        """The stamps, by account uuid; an unreadable file is empty. Never raises."""
+        return {uuid: stamp for uuid, (stamp, _token) in self._entries().items()}
+
+    def holds(self, account_uuid: str, token: str | None) -> bool:
+        """Whether ``account_uuid``'s stamp is still the one the reservation
+        ``token`` wrote: no newer reservation has taken the account since."""
+        entry = self._entries().get(account_uuid)
+        return token is not None and entry is not None and entry[1] == token
+
+    def due(self, account_uuid: str, max_age_s: float, stamps: dict[str, float] | None = None) -> bool:
+        """Whether ``account_uuid``'s read is due (``_limit_resets_due``)."""
+        stamps = self.read() if stamps is None else stamps
+        return _limit_resets_due(stamps.get(account_uuid), self.clock(), max_age_s)
+
+    def reserve(self, account_uuid: str, max_age_s: float) -> str | None:
+        """Under the lock: stamp ``account_uuid`` now when its read is due.
+
+        Returns the reservation's token, written beside the stamp; None
+        when it is not due, or the lock cannot be had, or the file cannot
+        be written: no stamp, no read.
+        """
+        if not account_uuid:
+            return None
+        try:
+            with FileLock(self._lock_path, timeout=LIMIT_RESETS_LOCK_WAIT_S):
+                now = self.clock()
+                entries = self._entries()
+                stamp = entries.get(account_uuid, (None, None))[0]
+                if not _limit_resets_due(stamp, now, max_age_s):
+                    return None
+                token = uuid.uuid4().hex
+                entries[account_uuid] = (now, token)
+                self._write(entries, now)
+                return token
+        except (LockError, OSError):
+            return None
+
+    def _roster_now(self) -> set[str] | None:
+        """The roster's account uuids, empty without a roster, None when it
+        cannot be read."""
+        if self._roster is None:
+            return set()
+        try:
+            uuids = self._roster()
+        except Exception:
+            return None
+        return None if uuids is None else set(uuids)
+
+    def _write(self, entries: dict[str, tuple[float, str | None]], now: float) -> None:
+        roster = self._roster_now()
+        kept = {
+            account: {"t": stamp, "id": token}
+            for account, (stamp, token) in entries.items()
+            if roster is None or account in roster or now - stamp <= LIMIT_RESETS_ATTEMPTS_KEEP_S
+        }
+        atomic_write_json(self.path, {"attempts": kept})
+
 
 def _live_claim(
     claim_until: float | None, last_attempt_at: float | None, now: float
@@ -81,6 +227,33 @@ def _live_claim(
         last_attempt_at is not None
         and (now - last_attempt_at) < LEGACY_CLAIM_TTL_S
     )
+
+
+def _recent_429(
+    last_429_at: float | None,
+    last_error: object,
+    backoff_until: float | None,
+    now: float,
+) -> bool:
+    """Whether a token's 429 is recent enough to keep the post-429 cadence.
+
+    The single source of truth for 429 recency. ``UsageEntry.recent_429``
+    (the poll planner's input) and ``_row_eligible``'s ``fresh`` mode must
+    agree, or a forced re-measure could spend the budget the planner's
+    post-429 floor is holding back. See ``UsageEntry.recent_429`` for why the
+    anchor is the 429 backoff's end rather than the stamp.
+    """
+    if last_429_at is None:
+        return False
+    anchor = last_429_at
+    if (
+        last_error == "http-429"
+        and backoff_until is not None
+        and backoff_until > anchor
+    ):
+        anchor = backoff_until
+    return now < anchor + RECENT_429_WINDOW_S
+
 
 # Deliberate staleness (failure backoff, scheduler-chosen cadence) extends
 # decision trust past STALE_OK_S, but never past this ceiling: a forever-failing
@@ -267,6 +440,10 @@ class FetchRecord:
     # persists: later passes skip the request while the credential still
     # carries that token, and a success clears it.
     rejected_fp: str | None = None
+    # The limit-resets read made with this success, or None when none was
+    # made (or its answer was not attested for this slot and is not kept).
+    # See _with_limit_resets for how it lands in lastGood.
+    limit_resets: oauth.LimitResetsRead | None = None
 
 
 @dataclass(frozen=True)
@@ -310,12 +487,20 @@ class UsageEntry:
     # Appended to preserve positional compatibility for the older read-model
     # fields while exposing whether a fetch lease is currently live.
     claim_until: float | None = None
+    # Until when a reading adopted from another machine (``cswap
+    # import-usage``) keeps every collector off this slot. Appended for the
+    # same positional compatibility as ``claim_until``.
+    held_until: float | None = None
 
     def fresh(self, now: float, ttl: float = SERVE_TTL_S) -> bool:
         return self.fetched_at is not None and (now - self.fetched_at) <= ttl
 
     def in_backoff(self, now: float) -> bool:
         return self.backoff_until is not None and now < self.backoff_until
+
+    def held(self, now: float) -> bool:
+        """Whether an adopted reading's hold still keeps collectors off."""
+        return self.held_until is not None and now < self.held_until
 
     def recent_429(self, now: float) -> bool:
         """Whether this token 429'd recently enough to keep the post-429 cadence.
@@ -332,22 +517,15 @@ class UsageEntry:
         still expires normally. Bounded by ``RECENT_429_WINDOW_S`` past the
         anchor so it clears once the saturated window has aged out.
         """
-        if self.last_429_at is None:
-            return False
-        anchor = self.last_429_at
         # Use the backoff anchor only while the LIVE backoff is a 429 backoff.
         # last429At is never cleared, but backoffUntil/lastError are rewritten by
         # any later failure — so without the lastError guard an unrelated timeout
         # on a token that 429'd long ago would install a fresh backoffUntil and
         # spuriously re-arm the post-429 cadence. Success clears lastError and
         # backoffUntil; only a 429 sets last429At and backoffUntil together.
-        if (
-            self.last_error == "http-429"
-            and self.backoff_until is not None
-            and self.backoff_until > anchor
-        ):
-            anchor = self.backoff_until
-        return now < anchor + RECENT_429_WINDOW_S
+        return _recent_429(
+            self.last_429_at, self.last_error, self.backoff_until, now
+        )
 
     def claimed(self, now: float) -> bool:
         """Whether another collector's bounded fetch lease is still live."""
@@ -431,24 +609,24 @@ def plan_oversleeps_interval(entry: UsageEntry, now: float) -> bool:
 def due_candidate(
     candidates: list[str], entries: dict[str, UsageEntry], now: float
 ) -> str | None:
-    """The due candidate with the stalest data, or None.
+    """The due candidate least recently attempted or measured, or None.
 
-    Due = past its ``nextPollAt`` and not in failure backoff. Sentinel
+    Due = past its ``nextPollAt``, not in failure backoff and not held for
+    another machine's reading (``UsageStore.adopt``). Sentinel
     accounts (api-key / no credentials) have nothing to fetch. A
     perpetually failing account can't monopolize the slot: its backoff
     removes it from the due set between attempts.
 
-    Shared by the auto engine and the TUI watch view so both pick the same
-    single alternate to poll per pass. Poll plans
+    The auto engine's one-alternate-per-tick pick. Poll plans
     (``nextPollAt``/``pollIntervalS``) are written by whichever collector
     fetched (see the plan persistence in ``_collect_usage_entries``), so
     every surface inherits the same adaptive cadence.
     """
-    due: list[tuple[int, float, str]] = []
+    due: list[tuple[float, str]] = []
     for num in candidates:
         entry = entries.get(num)
         if entry is None:
-            due.append((0, 0.0, num))
+            due.append((0.0, num))
             continue
         if entry.sentinel is not None:
             continue
@@ -456,20 +634,31 @@ def due_candidate(
             continue  # dead refresh-token: quarantined, needs a re-login
         if entry.in_backoff(now):
             continue
+        if entry.held(now):
+            continue
         if (
             entry.next_poll_at is not None
             and now < entry.next_poll_at
             and not plan_oversleeps_interval(entry, now)
         ):
             continue
-        if entry.fetched_at is None:
-            due.append((0, 0.0, num))
-        else:
-            due.append((1, entry.fetched_at, num))
+        # Least recently touched wins: the last attempt (``reserve`` stamps
+        # it on every claim) or the last measurement, whichever is later. A
+        # fetch-path sentinel -- a live session's expired or refused
+        # credential -- records no measurement, plan or backoff, so keyed on
+        # ``fetchedAt`` alone that slot stayed the stalest due row and took
+        # this pick every tick while the other alternates went unpolled;
+        # keyed on the attempt, a no-op pick rotates to the back and only
+        # fills ticks nothing else is due on, where re-deriving it costs no
+        # request. An adopted reading (``adopt``) moves ``fetchedAt`` with no
+        # attempt, hence the later of the two. A never-touched row keys 0.
+        due.append(
+            (max(entry.fetched_at or 0.0, entry.last_attempt_at or 0.0), num)
+        )
     if not due:
         return None
     due.sort()
-    return due[0][2]
+    return due[0][1]
 
 
 def _earliest_reset(last_good: dict | None, models: tuple[str, ...] = ()) -> float | None:
@@ -834,10 +1023,19 @@ class UsageStore:
     on a single slot).
     """
 
-    def __init__(self, cache_dir: Path, clock: Callable[[], float] = time.time):
+    def __init__(
+        self,
+        cache_dir: Path,
+        clock: Callable[[], float] = time.time,
+        roster: Callable[[], Iterable[str] | None] | None = None,
+    ):
         self.path = cache_dir / "usage.json"
         self._lock_path = cache_dir / ".usage.lock"
         self.clock = clock
+        # The limit-resets try stamps, kept apart from usage.json (see
+        # LimitResetsAttempts); they follow this store's clock, and
+        # ``roster`` (the stored account uuids) keeps theirs from the trim.
+        self.attempts = LimitResetsAttempts(cache_dir, lambda: self.clock(), roster)
 
     # -- raw I/O ------------------------------------------------------------
 
@@ -902,6 +1100,7 @@ class UsageStore:
             next_poll_at = _num_or_none(row.get("nextPollAt"))
             last_attempt_at = _num_or_none(row.get("lastAttemptAt"))
             claim_until = _num_or_none(row.get("claimUntil"))
+            held_until = _num_or_none(row.get("heldUntil"))
             # Strict < mirrors due_candidate: at nextPollAt the entry is due,
             # its staleness no longer scheduler-chosen. A live claim keeps the
             # trust bridge up: when another collector just won the fetch, this
@@ -924,12 +1123,17 @@ class UsageStore:
             else:
                 within_ceiling = age_s is not None and age_s <= TRUST_MAX_AGE_S
             live_claim = _live_claim(claim_until, last_attempt_at, now)
+            # A live hold is deliberate staleness as well: another machine
+            # polls this account and hands its readings over, so between two
+            # hand-overs the last one is what decisions should run on.
+            held = held_until is not None and now < held_until
             trust_extended = (
                 within_ceiling
                 and (
                     consecutive_failures > 0
                     or (next_poll_at is not None and now < next_poll_at)
                     or live_claim
+                    or held
                 )
             )
             out[num] = UsageEntry(
@@ -948,6 +1152,7 @@ class UsageStore:
                 rejected_fingerprint=row.get("rejectedFingerprint"),
                 trust_extended=trust_extended,
                 claim_until=claim_until,
+                held_until=held_until,
             )
         return out
 
@@ -997,6 +1202,7 @@ class UsageStore:
         *,
         respect_plans: bool,
         repair_overslept: bool = False,
+        fresh: bool = False,
     ) -> dict[str, str]:
         """Atomically win the right to fetch: re-check eligibility and stamp
         a bounded lease in one locked pass, returning slot → fencing id.
@@ -1004,8 +1210,9 @@ class UsageStore:
         Deciding eligibility on a lock-free :meth:`entries` read and then
         claiming separately lets two collectors both pass the check and both
         fetch; the re-check under the lock closes that window. Eligibility:
-        not quarantined (dead token), not in failure backoff, not claimed
-        within ``CLAIM_TTL_S``, and then by caller mode —
+        not quarantined (dead token), not in failure backoff, not held for
+        another machine's reading (:meth:`adopt`), not claimed within
+        ``CLAIM_TTL_S``, and then by caller mode —
 
         - ``respect_plans=True`` (on-demand callers: list/status/switch,
           dashboards): the entry must be stale (older than ``SERVE_TTL_S``)
@@ -1019,6 +1226,14 @@ class UsageStore:
           ``repair_overslept``, this becomes the non-escalating scheduler mode:
           due plans and stale impossible plans win, but valid future plans do
           not.
+
+        ``fresh=True`` (``cswap list --fresh``) skips the mode rules above:
+        the caller asked to re-measure now, so neither the serve TTL nor the
+        poll plan holds a slot back. The guards still do: quarantine, backoff
+        and a live claim refuse it as always. A token that 429'd recently
+        (``UsageEntry.recent_429``), or whose post-429 floor plan may still
+        be pending (``_post_429_floor_pending``), keeps the mode rules, so a
+        forced re-measure never spends what that floor is saving.
         """
         nums = list(nums)
         if not nums:
@@ -1035,7 +1250,7 @@ class UsageStore:
                 else:
                     assert isinstance(row, dict)
                     if not _row_eligible(
-                        row, now, respect_plans, repair_overslept
+                        row, now, respect_plans, repair_overslept, fresh
                     ):
                         continue
                 claim_id = uuid.uuid4().hex
@@ -1053,6 +1268,7 @@ class UsageStore:
         identities: dict[str, Identity],
         claims: dict[str, str] | None = None,
         plans: dict[str, tuple[float | None, float | None]] | None = None,
+        post_429_floors: Iterable[str] = (),
     ) -> set[str]:
         """Merge outcomes fenced by the leases that produced them.
 
@@ -1065,7 +1281,16 @@ class UsageStore:
         credential stamp one may carry. Unfenced callers
         (no ``claims``) defer to a live lease but never to an expired one.
         Returns the accepted slots.
+
+        ``post_429_floors`` names the slots whose supplied plan is the
+        planner's post-429 floor. Its end (the plan's ``nextPollAt``) is kept
+        as ``post429FloorUntil``, because this same success clears the 429's
+        own fields and a ``fresh`` reservation must still honour the floor.
+        Every success that installs a plan writes the field, null when the
+        plan has no floor; a success without a plan leaves the stored plan,
+        and so the field (or its absence), as it was.
         """
+        post_429_floors = set(post_429_floors)
         if not outcomes:
             return set()
         now = self.clock()
@@ -1082,13 +1307,21 @@ class UsageStore:
                 return
             row["lastAttemptAt"] = now
             if rec.error is None:
-                row["lastGood"] = rec.usage
+                # The resets try was stamped when it was reserved, and that
+                # stamp stands whatever the answer: the record only fills
+                # in what it answered.
+                row["lastGood"] = _with_limit_resets(
+                    rec.usage, row.get("lastGood"), rec.limit_resets, now
+                )
                 row["fetchedAt"] = now
                 # Replace the old, possibly due plan in the outcome transaction
                 # so no collector can slip into a record→replan gap.
                 plan = plans.get(num) if plans is not None else None
                 if plan is not None:
                     row["nextPollAt"], row["pollIntervalS"] = plan
+                    row["post429FloorUntil"] = (
+                        plan[0] if num in post_429_floors else None
+                    )
                 row["consecutiveFailures"] = 0
                 row["lastError"] = None
                 row["backoffUntil"] = None
@@ -1149,6 +1382,70 @@ class UsageStore:
                 self._write_rows(rows)
         return accepted
 
+    def adopt(
+        self,
+        readings: dict[str, tuple[dict, float]],
+        identities: dict[str, Identity],
+        hold_s: float | None = None,
+    ) -> set[str]:
+        """Merge measurements another machine took for the same accounts.
+
+        ``readings`` maps slot → ``(usage, age_s)``: the usage dict in the
+        shape :func:`oauth.build_usage_result` produces, and how old that
+        measurement was when it was handed over. An age rather than a
+        timestamp, so the two machines' clocks never have to agree:
+        ``fetchedAt`` becomes ``now - age_s`` on this store's clock.
+
+        A reading replaces ``lastGood`` only when it is newer than the stored
+        one, so a measurement this machine made itself is never downgraded.
+        Fetch state (failures, backoff, poll plan, claim) is left alone: it
+        describes this machine's own requests, and a fetch already in flight
+        still records normally when it lands.
+
+        ``hold_s`` > 0 stamps ``heldUntil``: no collector fetches the slot
+        before then (``_row_eligible``, ``due_candidate``), and its last-good
+        stays decision-trusted meanwhile. The hold never runs past the stored
+        reading's earliest window reset, scoped windows included (after it the
+        reading no longer describes that window), nor past ``TRUST_MAX_AGE_S``
+        from the stored measurement, so a slot cannot sit unfetched on data
+        too old to act on, and a producer that stops renewing it gets ordinary
+        collection back when it lapses. The latest hold replaces an earlier
+        one, so ``hold_s`` 0 lifts it; ``None`` leaves it as it is. Returns
+        the slots whose ``lastGood`` was replaced.
+        """
+        if not readings:
+            return set()
+        now = self.clock()
+        adopted: set[str] = set()
+
+        def apply(num: str, row: dict) -> None:
+            usage, age_s = readings[num]
+            fetched_at = now - max(0.0, age_s)
+            stored = _num_or_none(row.get("fetchedAt"))
+            if stored is None or fetched_at > stored:
+                # An exported reading never carries a limit-resets entry, so
+                # the slot's own one rides on as across a local usage read.
+                row["lastGood"] = _with_limit_resets(usage, row.get("lastGood"), None, now)
+                row["fetchedAt"] = fetched_at
+                stored = fetched_at
+                adopted.add(num)
+            if hold_s is None:
+                return
+            held_until = min(now + hold_s, stored + TRUST_MAX_AGE_S)
+            # Every scoped window, not only the models this machine watches:
+            # the store does not know them, and a hold lifted early costs one
+            # fetch at most.
+            reset_at = _earliest_reset(row.get("lastGood"), ("all",))
+            if reset_at is not None:
+                held_until = min(held_until, reset_at)
+            if held_until > now:
+                row["heldUntil"] = held_until
+            else:
+                row.pop("heldUntil", None)
+
+        self._mutate(identities, readings.keys(), apply)
+        return adopted
+
     def set_poll_plan(
         self,
         plans: dict[str, tuple[float | None, float | None]],
@@ -1190,20 +1487,141 @@ class UsageStore:
 
         self._mutate(identities, nums, apply)
 
+    def limit_resets_due(
+        self, account_uuids: dict[str, str], max_age_s: float
+    ) -> set[str]:
+        """The slots whose account's limit-resets read looks due.
+
+        ``account_uuids`` maps each candidate slot to its stored account
+        uuid; a slot without one is never due (nothing could attest its
+        answer). Due per ``LimitResetsAttempts.due``. Read without a lock:
+        a cheap first cut, so only these slots get a gate. The read itself
+        is sent only after ``reserve_limit_resets`` wins it.
+        """
+        stamps = self.attempts.read()
+        return {
+            num for num, uuid in account_uuids.items()
+            if uuid and self.attempts.due(uuid, max_age_s, stamps)
+        }
+
+    def reserve_limit_resets(
+        self,
+        num: str,
+        identity: Identity,
+        claim_id: str,
+        max_age_s: float,
+        *,
+        account_uuid: str,
+    ) -> str | None:
+        """Win the right to send one limit-resets read for ``num``, now.
+
+        Asked right before the request is sent. Under this store's lock the
+        row must still be this identity's and still carry the usage lease
+        ``claim_id`` that this fetch holds (a collector whose lease was
+        taken over sends nothing); then, under the attempts file's own lock,
+        ``account_uuid``'s read must be due and is stamped before any byte
+        goes out (``LimitResetsAttempts.reserve``), so its next read is
+        paced from it whatever becomes of this one's record or of the
+        slot's row. Returns the reservation's token (see
+        ``LimitResetsAttempts``). A lock that cannot be had, or a file that
+        cannot be written, refuses: no reservation (None), no read.
+        """
+        if not account_uuid:
+            return None
+        try:
+            with self._lock():
+                row = self._read_rows().get(num)
+                if not self._matches(row, identity) or row.get("claimId") != claim_id:
+                    return None
+                return self.attempts.reserve(account_uuid, max_age_s)
+        except (LockError, OSError):
+            return None
+
+
+class SlotResetsGate:
+    """The ``oauth.LimitResetsGate`` of one slot's fetch in one pass.
+
+    ``reserve()`` wins the slot's read for its stored account
+    (``UsageStore.reserve_limit_resets``: the usage lease still held, the
+    account due, and stamped) and keeps the reservation's token.
+    ``admit(uuid)`` lets the resets request go to the account the profile
+    probe named. When it is the slot's own, only while the stamp is still
+    this reservation's: a probe that outlived the interval while a newer
+    collector reserved the account sends nothing. Any other account must be
+    due too, and is then reserved (``LimitResetsAttempts.reserve``), so an
+    account read through another slot is paced as well.
+    """
+
+    def __init__(
+        self,
+        store: "UsageStore",
+        num: str,
+        identity: Identity,
+        claim_id: str,
+        max_age_s: float,
+        account_uuid: str,
+    ) -> None:
+        self.store = store
+        self.num = num
+        self.identity = identity
+        self.claim_id = claim_id
+        self.max_age_s = max_age_s
+        self.account_uuid = account_uuid
+        self._token: str | None = None
+
+    def reserve(self) -> bool:
+        self._token = self.store.reserve_limit_resets(
+            self.num, self.identity, self.claim_id, self.max_age_s,
+            account_uuid=self.account_uuid,
+        )
+        return self._token is not None
+
+    def admit(self, account_uuid: str) -> bool:
+        if account_uuid == self.account_uuid:
+            return self.store.attempts.holds(account_uuid, self._token)
+        return self.store.attempts.reserve(account_uuid, self.max_age_s) is not None
+
 
 def _num_or_none(value: object) -> float | None:
     return float(value) if isinstance(value, (int, float)) else None
 
 
+def _post_429_floor_pending(row: dict, now: float) -> bool:
+    """Whether a row's stored plan may still be a pending post-429 floor.
+
+    :meth:`UsageStore.record` writes ``post429FloorUntil`` with every plan it
+    installs: the floor's end, or null for a plan without one. A row without
+    the field was planned by a version that never recorded floors, so its
+    pending plan may be protective and nothing says otherwise: that counts as
+    pending until a successful poll writes the field. A value that is neither
+    null nor a number is just as unknown.
+    """
+    if "post429FloorUntil" not in row:
+        return True
+    floor_until = row["post429FloorUntil"]
+    if floor_until is None:
+        return False
+    if not isinstance(floor_until, (int, float)):
+        return True
+    return now < floor_until
+
+
 def _row_eligible(
-    row: dict, now: float, respect_plans: bool, repair_overslept: bool = False
+    row: dict,
+    now: float,
+    respect_plans: bool,
+    repair_overslept: bool = False,
+    fresh: bool = False,
 ) -> bool:
     """Fetch eligibility of a stored row, evaluated under the write lock
-    (see :meth:`UsageStore.reserve` for the two caller modes)."""
+    (see :meth:`UsageStore.reserve` for the caller modes)."""
     if int(row.get("authDeadStrikes") or 0) >= AUTH_DEAD_STRIKES:
         return False
     backoff_until = _num_or_none(row.get("backoffUntil"))
     if backoff_until is not None and now < backoff_until:
+        return False
+    held_until = _num_or_none(row.get("heldUntil"))
+    if held_until is not None and now < held_until:
         return False
     if _live_claim(
         _num_or_none(row.get("claimUntil")),
@@ -1211,6 +1629,21 @@ def _row_eligible(
         now,
     ):
         return False
+    # After every guard, never before: a forced re-measure still respects
+    # quarantine, backoff and another collector's lease. The floor is checked
+    # on its own because recency alone lapses: the success that installs the
+    # floor clears the 429's fields, and after an hour-scale block the 429's
+    # stamp is already older than its recency window.
+    if fresh and not (
+        _recent_429(
+            _num_or_none(row.get("last429At")),
+            row.get("lastError"),
+            backoff_until,
+            now,
+        )
+        or _post_429_floor_pending(row, now)
+    ):
+        return True
     fetched_at = _num_or_none(row.get("fetchedAt"))
     stale = fetched_at is None or (now - fetched_at) > SERVE_TTL_S
     next_poll_at = _num_or_none(row.get("nextPollAt"))
@@ -1225,6 +1658,61 @@ def _row_eligible(
     if repair_overslept:
         return poll_due or (stale and (next_poll_at is None or overslept))
     return poll_due or stale
+
+
+def _limit_resets_due(stamp: float | None, now: float, max_age_s: float) -> bool:
+    """Whether an account's limit-resets read is due.
+
+    Paced from the account's last try (its reservation's stamp) and nothing
+    else: not the entry's ``fetched_at``, which a failing read carries
+    forward and a clock put back can leave in the future, and not the
+    entry's shape. No stamp, or one too far ahead of the clock
+    (``codex_usage.dated_ahead``: a wrong clock's), is due; one a little
+    ahead counts as a try just made.
+    """
+    if stamp is None or dated_ahead(stamp, now):
+        return True
+    return now - stamp >= max_age_s
+
+
+def _with_limit_resets(
+    usage: dict | None,
+    previous: object,
+    read: oauth.LimitResetsRead | None,
+    now: float,
+) -> dict | None:
+    """A success's ``lastGood``: its windows, and the limit-resets entry.
+
+    An answered, attested read (one whose ``account_uuid`` the server
+    named) replaces the entry: the live grants (``oauth.parse_limit_resets``)
+    with ``fetched_at`` = ``now`` (the store's clock) and the attested
+    ``account_uuid``/``org_uuid``, which the menu compares with the slot's
+    current ids before it shows the entry; or no key at all when the account
+    has no live grant. A read without an attested account is kept no more
+    than a failed one. A failed read, or none made, carries the
+    previous ``lastGood``'s entry forward unchanged, so a usage read in
+    between never loses it. A success without window data stays None:
+    ``lastGood`` is never an entry with no windows.
+    """
+    if not isinstance(usage, dict):
+        return usage
+    if read is not None and read.cedar_ember is not None and read.account_uuid:
+        merged = {k: v for k, v in usage.items() if k != "limit_resets"}
+        entry = oauth.parse_limit_resets(read.cedar_ember, now)
+        if entry is not None:
+            merged["limit_resets"] = {
+                **entry,
+                "fetched_at": now,
+                "account_uuid": read.account_uuid,
+                "org_uuid": read.org_uuid or "",
+            }
+        return merged
+    if "limit_resets" in usage or not isinstance(previous, dict):
+        return usage
+    carried = previous.get("limit_resets")
+    if not isinstance(carried, dict):
+        return usage
+    return {**usage, "limit_resets": carried}
 
 
 def with_sentinel(entry: UsageEntry, sentinel: str | None) -> UsageEntry:

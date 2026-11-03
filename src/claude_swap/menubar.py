@@ -21,15 +21,27 @@ import os
 import platform
 import plistlib
 import re
+import shlex
+import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
 
-from claude_swap import pace
-from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
+from claude_swap import oauth, pace
+from claude_swap.codex_usage import CodexState, ur_text
+from claude_swap.exceptions import (
+    AccountNotFoundError,
+    ClaudeSwitchError,
+    CredentialReadError,
+    LockError,
+)
+from claude_swap.locking import FileLock
+from claude_swap.models import clean_alias_text, normalize_alias
 from claude_swap.printer import warning
 from claude_swap.switcher import SENTINEL_NOTES
 
@@ -48,9 +60,11 @@ def ensure_notification_identity(
 ) -> Path | None:
     """Ensure rumps can resolve a bundle identifier for notifications.
 
-    Command-line Python tools have no app bundle, so rumps looks for an
-    ``Info.plist`` beside the interpreter. uv/pipx reinstalls can recreate that
-    environment; repair the tiny plist on every launch when needed.
+    Fallback for runs outside the wrapper bundle (``claude_swap.app_bundle``),
+    whose Info.plist already carries the identifier: a bare command-line
+    interpreter has no app bundle, so rumps looks for an ``Info.plist`` beside
+    it. uv/pipx reinstalls can recreate that environment; repair the tiny
+    plist on every launch when needed.
     """
     if platform != "darwin":
         return None
@@ -99,6 +113,11 @@ class MenuBarSettings:
     title_scoped: bool = False  # append per-model weekly limits (e.g. Fable) to the title
     refresh_interval: int = 60
     auto_switch_enabled: bool = False
+    show_usage_bars: bool = True  # draw each account as a panel of usage bars
+    show_names_only: bool = False  # an aliased account shows its alias without the email
+    show_codex: bool = True  # the Codex block after the accounts; off stops every Codex read
+    title_codex: bool = True  # append Codex's weekly pct to the title
+    codex_alias: str = ""  # the Codex block's name; empty is "Codex" (display only)
 
     @classmethod
     def load(cls, path: Path) -> "MenuBarSettings":
@@ -178,6 +197,14 @@ def _live_countdown(window: dict | str | None, now: float) -> str | None:
     ts = _resets_at_ts(window)
     if ts == float("inf"):
         return None
+    return _countdown_until(ts, now)
+
+
+def _countdown_until(ts: float, now: float) -> str | None:
+    """Time left until ``ts`` as the rows show it ("4d 22h", "2h 5m", "28m").
+
+    ``None`` once ``ts`` has passed.
+    """
     remaining = int(ts - now)
     if remaining <= 0:
         return None
@@ -275,6 +302,113 @@ def usage_summary(
     return " · ".join(parts) if parts else "usage unavailable"
 
 
+# ---- held or paused --------------------------------------------------------
+#
+# cswap keeps one disabled flag per account. The owner sets it (``cswap
+# disable``) to pause an account, and the rotation daemon (``cswap-rotate``,
+# a separate script) sets the same flag for its 5-hour guard, holding an
+# account out of rotation for a while near its 5-hour limit. The daemon
+# records each of its holds in a marker file; that file is the only way to
+# tell the two apart, so the menu bar reads it, with the daemon's own
+# tolerant rules (``read_hold_marker`` in that script).
+
+HOLD_MARKER_NAME = "cswap-rotate.hold5h"
+_HOLD_SLOT_RE = re.compile(r"^\d+$")
+_HOLD_RELEASE_STATES = ("releasing", "released")
+
+
+def hold_marker_path() -> Path:
+    """The rotation daemon's hold marker (resolved on each call, from ``$HOME``)."""
+    return Path.home() / "Library" / "Logs" / HOLD_MARKER_NAME
+
+
+def _hold_time(text: str) -> float | None:
+    """Epoch seconds of an ISO 8601 time with an offset; None for anything else."""
+    try:
+        when = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        return None  # the daemon refuses a time without an offset too
+    return when.timestamp()
+
+
+def read_hold_marker(path: Path | None = None) -> dict[str, tuple[str | None, float | None, str | None]] | None:
+    """The rotation guard's holds on disk: slot -> (email, release time, release state).
+
+    Mirrors the daemon's parser. Each whitespace-separated entry is
+    ``N:email:<ISO release time>``, with ``:releasing`` (the guard is
+    enabling it; still the guard's) or ``:released`` (the guard is done with
+    it) appended while a release is under way. Older entries are a bare
+    ``N`` or ``N:email``. A missing file is no holds (``{}``); a file that
+    cannot be read, or any entry that does not parse, is unknown (``None``):
+    nothing in it can be trusted then. ``path`` defaults to
+    ``hold_marker_path()``.
+    """
+    try:
+        raw = (path if path is not None else hold_marker_path()).read_bytes().decode("utf-8")
+    except FileNotFoundError:
+        return {}
+    except (OSError, RuntimeError, UnicodeDecodeError):  # RuntimeError: no home directory
+        return None
+    out: dict[str, tuple[str | None, float | None, str | None]] = {}
+    for token in raw.split():
+        num, _, rest = token.partition(":")
+        if not _HOLD_SLOT_RE.match(num):
+            return None
+        email, _, when = rest.partition(":")
+        state = None
+        for candidate in _HOLD_RELEASE_STATES:
+            if when == candidate or when.endswith(":" + candidate):
+                state = candidate
+                when = "" if when == candidate else when[: -len(":" + candidate)]
+                break
+        until = _hold_time(when) if when else None
+        if when and until is None:
+            return None
+        out[num] = (email or None, until, state)
+    return out
+
+
+@dataclass(frozen=True)
+class GuardHold:
+    """The rotation guard's hold on one account."""
+
+    until: float | None  # when the guard is due to release it (epoch seconds), if recorded
+
+
+def guard_hold(holds, num, email: str) -> GuardHold | None:
+    """The rotation guard's hold on this account, from a ``read_hold_marker`` read.
+
+    An entry counts only when it names this slot AND this email, as the
+    daemon checks: a hold belongs to the account it was taken on, not to
+    whoever sits in the slot now, and a bare slot names no account. A
+    ``released`` entry is the guard done with it, so a slot still disabled
+    is the owner's. An unknown read (``None``) holds nothing.
+    """
+    entry = (holds or {}).get(str(num))
+    if entry is None:
+        return None
+    held_email, until, state = entry
+    if held_email is None or held_email != email or state == "released":
+        return None
+    return GuardHold(until)
+
+
+def out_of_rotation_word(hold: GuardHold | None, now: float) -> str:
+    """Why a disabled account is out of rotation: "held · 28m", "held" or "paused".
+
+    "held" is the rotation guard's temporary hold, followed by the time
+    until its recorded release in the rows' countdown format; just "held"
+    when no release time is recorded or it has passed (the guard lets it go
+    on its next tick). Any other disable is the owner's: "paused".
+    """
+    if hold is None:
+        return "paused"
+    countdown = _countdown_until(hold.until, now) if hold.until is not None else None
+    return f"held · {countdown}" if countdown else "held"
+
+
 def format_account_label(
     num,
     email: str,
@@ -283,11 +417,35 @@ def format_account_label(
     alias: str | None = None,
     disabled: bool = False,
     fetched_at: float | None = None,
+    names_only: bool = False,
+    holds=None,
 ) -> str:
-    """Build one account row's menu label."""
-    label = f"{alias}  ({email})" if alias else email
-    marker = "  (disabled)" if disabled else ""
-    return f"{num}  {label}{marker}  {usage_summary(usage, now, fetched_at)}"
+    """Build one account row's menu label.
+
+    A disabled account says why, from ``holds`` (the snapshot's read of the
+    rotation guard's marker): "(held · 28m)" or "(paused)". An account
+    holding a limit reset ends with its tag: "... · UR 1".
+    """
+    if now is None:
+        now = time.time()
+    marker = f"  ({out_of_rotation_word(guard_hold(holds, num, email), now)})" if disabled else ""
+    identity = account_identity(email, alias, names_only=names_only)
+    label = f"{num}  {identity}{marker}  {usage_summary(usage, now, fetched_at)}"
+    badge = limit_resets_badge(usage, now)
+    return f"{label} · {badge[0]}" if badge else label
+
+
+def account_identity(email: str, alias: str | None = None, names_only: bool = False) -> str:
+    """How an account names itself in a menu row.
+
+    ``alias  (email)`` when it has an alias, else the email; with
+    ``names_only`` (Settings → Show names only) an aliased account is just
+    its alias. The single source for the text rows, the panels, the rename
+    submenu and the accessibility label.
+    """
+    if not alias:
+        return email
+    return alias if names_only else f"{alias}  ({email})"
 
 
 def _local_part(email: str, limit: int = 12) -> str:
@@ -298,18 +456,167 @@ def _local_part(email: str, limit: int = 12) -> str:
     return local
 
 
+# ---- limit resets (the UR tag on an account) ---------------------------------
+#
+# An account whose usage carries a ``limit_resets`` entry (oauth.parse_limit_resets,
+# kept by the usage store) holds a banked limit reset. The tag shows how
+# many are left, "UR 1", in the same pill the Codex block uses. Nothing
+# left is no tag at all, exactly as for an account without a grant (the
+# owner, Nov 3, 2026: an empty count is absence, not an alarm). Only the
+# usage log keeps "UR 0" (``limit_resets_text``), so a used reset leaves a
+# trace in claude-swap.log.
+
+def limit_resets_entry(usage: dict | str | None, now: float) -> dict | None:
+    """An account's limit resets as they stand at ``now``, or None.
+
+    The stored grants summed up when the menu draws
+    (``oauth.summarize_limit_resets``): a grant that has ended since the
+    last read drops out, and the others still show. None for a sentinel or
+    no usage, and when no stored grant is live and readable.
+    """
+    if not isinstance(usage, dict):
+        return None
+    return oauth.summarize_limit_resets(usage.get("limit_resets"), now)
+
+
+def limit_resets_text(usage: dict | str | None, now: float) -> str | None:
+    """The account's limit resets as the usage log writes them: "UR 1" or "UR 0".
+
+    Every count, zero included, so a used reset leaves a trace in the log;
+    the pill (``limit_resets_badge``) shows none at zero. None without a
+    live grant.
+    """
+    entry = limit_resets_entry(usage, now)
+    return None if entry is None else f"UR {entry['left']}"
+
+
+def _pill_resets(usage: dict | str | None, now: float) -> dict | None:
+    """``limit_resets_entry`` when the account shows a pill: something is left.
+
+    Nothing left is no pill and nothing spoken, whatever ``paused`` or
+    ``usable_now`` say: a spent grant is spent.
+    """
+    entry = limit_resets_entry(usage, now)
+    if entry is None or entry["left"] == 0:
+        return None
+    return entry
+
+
+def limit_resets_badge(usage: dict | str | None, now: float) -> tuple[str, str] | None:
+    """The account's UR pill: ("UR 1", "ok") or ("UR 1", "unknown"), else None.
+
+    Dimmed ("unknown") while the grant is paused or not usable right now.
+    None without a live grant, and when nothing is left: the menu shows no
+    pill rather than a zero.
+    """
+    entry = _pill_resets(usage, now)
+    if entry is None:
+        return None
+    text = f"UR {entry['left']}"
+    if entry.get("paused") is True or entry.get("usable_now") is not True:
+        return text, "unknown"
+    return text, "ok"
+
+
+def limit_resets_spoken(usage: dict | str | None, now: float) -> str | None:
+    """What VoiceOver says for the pill: "1 limit reset, use by Nov 30".
+
+    The date is the grant's end in local time; a paused or not-yet-usable
+    grant says so before the date. None where there is no pill: no live
+    grant, or nothing left.
+    """
+    entry = _pill_resets(usage, now)
+    if entry is None:
+        return None
+    left = entry["left"]
+    parts = [f"{left} limit reset{'' if left == 1 else 's'}"]
+    if entry.get("paused") is True:
+        parts.append("paused")
+    elif entry.get("usable_now") is not True:
+        parts.append("not usable now")
+    ends = datetime.fromtimestamp(oauth.iso_epoch(entry["ends_at"]), timezone.utc).astimezone()
+    parts.append(f"use by {ends:%b} {ends.day}")
+    return ", ".join(parts)
+
+
+CODEX_NAME = "Codex"
+TITLE_NAME_MAX = 12  # the title's longest name, as ``_local_part`` cuts an email
+
+
+def _title_name(name: str, limit: int = TITLE_NAME_MAX) -> str:
+    """``name`` cut in the middle to ``limit`` characters for the menu bar title.
+
+    The status item takes whatever width its title asks for, so a long
+    (valid) alias would push other menu bar items aside. The dropdown and
+    the alias itself keep the full name.
+    """
+    if len(name) <= limit:
+        return name
+    head = limit // 2
+    return name[:head] + "\u2026" + name[-(limit - 1 - head):]
+
+
+def codex_alias_name(text: str) -> str | None:
+    """The Codex block's alias as stored, when the account alias rule accepts it.
+
+    The rename prompt only ever stores names ``normalize_alias`` accepts; a
+    name edited into the settings file by hand is held to the same rule, and
+    anything it refuses (or an empty name) shows as "Codex".
+    """
+    try:
+        return normalize_alias(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def codex_title_segments(
+    settings: MenuBarSettings, codex: CodexState | None, alias: str | None, now: float
+) -> list[str]:
+    """The title's Codex segment: ``["Codex 56%"]``, or none.
+
+    Shown with the block and "Codex in title" on, while the reading has a
+    current percentage: the longest window's (the weekly one today). With
+    no reading, or once that window's reset time has passed (never rolled
+    forward), there is no segment at all, not a bare name. The usage-resets
+    count is never in the title: the owner reads it in the dropdown.
+    """
+    if not (settings.show_codex and settings.title_codex) or codex is None or codex.reading is None:
+        return []
+    windows = codex.reading.windows
+    if not windows:
+        return []
+    window = max(windows, key=lambda w: w.window_minutes)
+    if window.resets_at is not None and _countdown_until(window.resets_at, now) is None:
+        return []
+    return [f"{_title_name(alias or CODEX_NAME)} {window.pct:.0f}%"]
+
+
 def format_title(
     active_email: str | None,
     active_usage: dict | str | None,
     settings: MenuBarSettings,
     now: float | None = None,
     alias: str | None = None,
+    codex: CodexState | None = None,
+    codex_alias: str | None = None,
 ) -> str:
-    """Build the menu-bar title from the active account and settings."""
-    if active_email is None:
-        return ICON
+    """Build the menu-bar title from the active account, Codex and settings."""
     if now is None:
         now = time.time()
+    segments: list[str] = []
+    if active_email is not None:
+        segments.extend(_account_title_segments(active_email, active_usage, settings, now, alias))
+    segments.extend(codex_title_segments(settings, codex, codex_alias, now))
+    if not segments:
+        return ICON
+    return f"{ICON} " + " · ".join(segments)
+
+
+def _account_title_segments(active_email, active_usage, settings, now, alias) -> list[str]:
+    """The active account's title segments: name, windows, model limits.
+
+    Never the limit resets: the owner reads those in the dropdown only.
+    """
     segments: list[str] = []
     if settings.show_account_name:
         segments.append(alias if alias else _local_part(active_email))
@@ -330,18 +637,70 @@ def format_title(
             window = _rolled_weekly_window(window, now)
             if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)) and window.get("name"):
                 segments.append(f"{window['name']} {window['pct']:.0f}%")
-    if not segments:
-        return ICON
-    return f"{ICON} " + " · ".join(segments)
+    return segments
 
 
-def format_usage_log(email: str, usage: dict | str | None) -> str | None:
+CODEX_LAUNCH_LOG = "menubar_codex_launches.json"  # beside the menu bar settings
+CODEX_RENAME_SPACES = "Names cannot contain spaces; use - or _"
+
+
+def default_codex_monitor(backup_dir: Path, logger):
+    """The Codex monitor the menu bar runs: the rollouts in ``codex_home()``'s
+    sessions folder (the same home the app-server child resolves), the CLI
+    on its usual paths, and the launch budget's log beside the menu bar
+    settings."""
+    from claude_swap.codex_usage import CodexMonitor, LaunchBudget, codex_home, find_codex_binary
+
+    try:
+        sessions = codex_home() / "sessions"
+    except RuntimeError:  # no home directory: no rollouts to read
+        sessions = Path("/nonexistent/.codex/sessions")
+    return CodexMonitor(sessions, LaunchBudget(Path(backup_dir) / CODEX_LAUNCH_LOG), find_codex_binary(), logger)
+
+
+def codex_usage_log_key(state: CodexState | None, now: float):
+    """De-dupe key for the Codex usage line: each window's pct and the reset count.
+
+    Like the account rows' key, it leaves out the reading's age and reset times, so
+    an idle account is not logged again on every read. The count is the log's
+    text (``ur_text``), zero included, so a used reset logs a line of its own.
+    """
+    if state is None or state.reading is None:
+        return None
+    count = ur_text(state.reset_credits, state.credits_known(now))
+    return tuple((w.label, w.pct) for w in state.reading.windows), count
+
+
+def format_codex_usage_log(state: CodexState | None, now: float) -> str | None:
+    """"usage codex: 7d 56% (resets Nov 4 10:12) · UR 2", or None without a reading.
+
+    The count is always written, "UR 0" included, though the dropdown shows
+    no pill at zero: this is a diagnostic line, not UI.
+    """
+    if state is None or state.reading is None:
+        return None
+    from claude_swap.oauth import reset_clock_string
+
+    parts = []
+    for window in state.reading.windows:
+        seg = f"{window.label} {window.pct:.0f}%"
+        if window.resets_at is not None:
+            when = datetime.fromtimestamp(window.resets_at, timezone.utc)
+            seg += f" (resets {reset_clock_string(when, datetime.fromtimestamp(now, timezone.utc))})"
+        parts.append(seg)
+    parts.append(ur_text(state.reset_credits, state.credits_known(now)))
+    return "usage codex: " + " · ".join(parts)
+
+
+def format_usage_log(email: str, usage: dict | str | None, now: float | None = None) -> str | None:
     """A log line of an account's session (5h) and weekly (7d) limits.
 
     Uses each window's absolute reset ``clock`` rather than a live countdown,
     since log lines are already timestamped. Returns ``None`` when no numeric
     window is available (sentinels, ``None``, or spend-only) so callers can skip
-    logging nothing.
+    logging nothing. An account holding a limit reset ends with "· UR 1", and
+    one that has used it with "· UR 0": the dropdown hides a zero, the log
+    keeps it.
     """
     parts: list[str] = []
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
@@ -356,6 +715,9 @@ def format_usage_log(email: str, usage: dict | str | None) -> str | None:
         parts.append(seg)
     if not parts:
         return None
+    resets = limit_resets_text(usage, time.time() if now is None else now)
+    if resets:
+        parts.append(resets)
     return f"usage {email}: " + " · ".join(parts)
 
 
@@ -388,6 +750,221 @@ def parse_switch_history(log_text: str, limit: int = SWITCH_HISTORY_LIMIT) -> li
     return out[-limit:][::-1]
 
 
+def purge_menu_callbacks(registry: dict, nsmenu) -> None:
+    """Drop every native item of ``nsmenu`` (and its submenus) from ``registry``.
+
+    ``registry`` is rumps' process-global ``NSApp._ns_to_py_and_callback``,
+    which ``Menu.clear()`` never prunes; see ``rebuild_menu``. Items whose
+    content is a custom view (the usage-bar panels) are ordinary entries of
+    ``itemArray()``, so they are covered the same way.
+    """
+    for item in nsmenu.itemArray():
+        registry.pop(item, None)
+        sub = item.submenu()
+        if sub is not None:
+            purge_menu_callbacks(registry, sub)
+
+
+# ---- snapshot worker log -------------------------------------------------------
+#
+# The snapshot worker keeps the last good snapshot when a read fails, so a
+# failing or stalled read freezes the menu while its ages keep ticking on
+# every draw. These lines are the only trace of that, so they are WARNINGs,
+# rate-limited so a read failing every minute cannot flood the log.
+#
+# A failure is logged as its class, where it was raised and, when it has
+# one, an integer status. Nothing from the exception's message reaches any
+# level: the usage and credential paths can put a secret in it, and no
+# pattern can be trusted to find every secret's shape. For the same reason
+# a class is named only when a trusted module really holds it under that
+# name (a class built at run time can be named anything), and a status is
+# printed only when it is exactly an int.
+
+SNAPSHOT_FAILURE_WINDOW_S = 600.0  # one failure line per window, any class
+SNAPSHOT_FAILURE_NAMES_MAX = 8  # class names a rolled window's line lists
+SLOW_SNAPSHOT_S = 60.0  # a read longer than this logs its duration
+# Integer attributes that say what failed without saying anything secret
+# (HTTPError.status/.code, OSError.errno, CalledProcessError.returncode).
+STATUS_ATTRIBUTES = ("status", "status_code", "code", "errno", "returncode")
+# Modules whose exception classes are named in the log: the builtins (the
+# OSError family included), this package, and the libraries its reads use.
+TRUSTED_EXCEPTION_MODULES = (
+    "builtins", "claude_swap", "requests", "urllib", "urllib3", "http", "ssl",
+    "socket", "subprocess", "json", "keyring",
+)
+UNNAMED_FAILURE = "Exception"  # the name for any class not trusted to name itself
+FALLBACK_FAILURE_LINE = f"menubar snapshot failed: {UNNAMED_FAILURE}"
+_PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _frames(exc: BaseException) -> list[tuple[str, bool]]:
+    """Each traceback frame as ("file.py:123 in func", inside this package),
+    outermost first. Never source lines: a frame's own source could hold a
+    secret, and the log does not need it."""
+    out = []
+    tb = exc.__traceback__
+    while tb is not None:
+        code = tb.tb_frame.f_code
+        path = os.path.abspath(code.co_filename)
+        out.append((
+            f"{os.path.basename(path)}:{tb.tb_lineno} in {code.co_name}",
+            path.startswith(_PACKAGE_DIR + os.sep),
+        ))
+        tb = tb.tb_next
+    return out
+
+
+def _raise_site(frames: list[tuple[str, bool]]) -> str | None:
+    """The innermost frame inside this package, else the innermost frame."""
+    ours = [site for site, inside in frames if inside]
+    if ours:
+        return ours[-1]
+    return frames[-1][0] if frames else None
+
+
+def _status(exc: BaseException) -> str | None:
+    """The first status-style attribute that is exactly an int, as "status
+    429", or None. ``type()`` and ``int.__repr__`` run no code of the value's:
+    an int subclass could print anything, and ``isinstance`` would consult a
+    ``__class__`` the value defines."""
+    for attr in STATUS_ATTRIBUTES:
+        try:
+            value = getattr(exc, attr, None)
+        except Exception:
+            continue
+        if type(value) is int:
+            return f"{attr} {int.__repr__(value)}"
+    return None
+
+
+def _class_name(cls: type) -> str:
+    """The class's name when a trusted module holds this very class under
+    it, else ``UNNAMED_FAILURE``. A class's own ``__module__`` is not proof:
+    ``type(name, bases, {"__module__": "builtins"})`` claims it freely."""
+    module, qualname = cls.__module__, cls.__qualname__
+    if type(module) is not str or type(qualname) is not str:
+        return UNNAMED_FAILURE
+    if not any(module == m or module.startswith(m + ".") for m in TRUSTED_EXCEPTION_MODULES):
+        return UNNAMED_FAILURE
+    held = sys.modules.get(module)
+    for part in qualname.split("."):
+        held = getattr(held, part, None)
+    return qualname if held is cls else UNNAMED_FAILURE
+
+
+def failure_record(exc: BaseException) -> tuple[str, str, str]:
+    """``(class name, WARNING line, DEBUG frames)`` for a failed read: the
+    class (``_class_name``), its integer status and its raise site. May
+    raise on a hostile exception; ``SnapshotLog.failed`` falls back then."""
+    name = _class_name(type(exc))
+    status = _status(exc)
+    frames = _frames(exc)
+    site = _raise_site(frames)
+    line = (
+        f"menubar snapshot failed: {name}"
+        + (f" ({status})" if status else "")
+        + (f" at {site}" if site else "")
+    )
+    return name, line, "; ".join(frame for frame, _inside in frames)
+
+
+class SnapshotLog:
+    """What the menu bar's snapshot worker writes to the log.
+
+    One window of ``SNAPSHOT_FAILURE_WINDOW_S`` for every class: the first
+    failure writes its line (``failure_record``) and opens the window; later
+    failures inside it are only counted, with up to
+    ``SNAPSHOT_FAILURE_NAMES_MAX`` of their class names. When the window has
+    rolled, the next failure writes its own line with that count and those
+    names appended and opens the next window; a good read (``succeeded``)
+    writes them as a line of its own. The record is built before any window
+    is touched, and a record that cannot be built becomes
+    ``FALLBACK_FAILURE_LINE``: a failure always gets its line, and a broken
+    one can never leave a window open that silences the ones after it.
+    ``took`` writes the duration of a read slower than ``SLOW_SNAPSHOT_S``.
+    ``clock`` is monotonic so a clock change cannot open or close a window;
+    the worker also times its reads with it.
+    """
+
+    def __init__(
+        self,
+        logger: logging.Logger,
+        clock=time.monotonic,
+        window_s: float = SNAPSHOT_FAILURE_WINDOW_S,
+        slow_s: float = SLOW_SNAPSHOT_S,
+        names_max: int = SNAPSHOT_FAILURE_NAMES_MAX,
+    ) -> None:
+        self._logger = logger
+        self.clock = clock
+        self._window_s = window_s
+        self._slow_s = slow_s
+        self._names_max = names_max
+        self._lock = threading.Lock()
+        self._window_start: float | None = None
+        self._held_back = 0  # failures inside the window after its line
+        self._held_names: set[str] = set()  # at most names_max of their classes
+        self._held_unnamed = 0  # held-back failures whose class is not in the set
+
+    def took(self, seconds: float) -> None:
+        if seconds > self._slow_s:
+            self._logger.warning(
+                "menubar snapshot took %.0fs (over %.0fs)", seconds, self._slow_s
+            )
+
+    def failed(self, exc: BaseException) -> None:
+        try:
+            name, line, frames = failure_record(exc)
+        except Exception:
+            name, line, frames = UNNAMED_FAILURE, FALLBACK_FAILURE_LINE, None
+        now = self.clock()
+        with self._lock:
+            rolled = self._roll(now)
+            if self._window_start is not None:
+                self._held_back += 1
+                if name not in self._held_names:
+                    if len(self._held_names) < self._names_max:
+                        self._held_names.add(name)
+                    else:
+                        self._held_unnamed += 1
+                return
+            self._window_start = now
+        if rolled:
+            held_back, listed = rolled
+            line += f"; {held_back} more in the previous {self._window_s / 60:.0f} min: {listed}"
+        self._logger.warning(line)
+        if frames is not None:
+            self._logger.debug("menubar snapshot failure frames, outermost first: %s", frames)
+
+    def succeeded(self) -> None:
+        with self._lock:
+            rolled = self._roll(self.clock())
+        if rolled:
+            held_back, listed = rolled
+            self._logger.warning(
+                "menubar snapshot failed %d more %s in the %.0f min after the last line: %s",
+                held_back, "time" if held_back == 1 else "times", self._window_s / 60, listed,
+            )
+
+    def _roll(self, now: float) -> tuple[int, str] | None:
+        """Close a window that has rolled (lock held): what it held back, as
+        ``(count, "A, B (+K others)")``, if anything."""
+        if self._window_start is None or now - self._window_start < self._window_s:
+            return None
+        held_back, names, unnamed = self._held_back, sorted(self._held_names), self._held_unnamed
+        self._window_start = None
+        self._held_back = 0
+        self._held_names = set()
+        self._held_unnamed = 0
+        if not held_back:
+            return None
+        return held_back, ", ".join(names) + (f" (+{unnamed} others)" if unnamed else "")
+
+
+def sentinel_note(sentinel: str) -> str:
+    """What the menu shows for a usage sentinel: its note, else the sentinel itself."""
+    return SENTINEL_NOTES.get(sentinel, sentinel)
+
+
 def _account_display_usage(entry) -> dict | str | None:
     """Menu-display usage for a ``UsageEntry``.
 
@@ -396,8 +973,29 @@ def _account_display_usage(entry) -> dict | str | None:
     ``None``.
     """
     if entry.sentinel:
-        return SENTINEL_NOTES.get(entry.sentinel, entry.sentinel)
+        return sentinel_note(entry.sentinel)
     return entry.last_good
+
+
+def _attested_for_slot(usage, account_uuid: str, org_uuid: str):
+    """``usage`` with its limit-resets entry only while it was attested for
+    this slot's current account: the entry's ``account_uuid`` and
+    ``org_uuid`` (what the server said the asking token belonged to) must be
+    the slot's stored uuid and organization now. Anything else (a slot
+    since given to another account, a token-only slot, an entry with no
+    attested ids) shows without it. The stored entry is left as it is.
+    """
+    if not isinstance(usage, dict) or "limit_resets" not in usage:
+        return usage
+    entry = usage["limit_resets"]
+    if (
+        isinstance(entry, dict)
+        and account_uuid
+        and entry.get("account_uuid") == account_uuid
+        and (entry.get("org_uuid") or "") == (org_uuid or "")
+    ):
+        return usage
+    return {key: value for key, value in usage.items() if key != "limit_resets"}
 
 
 EMPTY_SNAPSHOT: dict = {
@@ -405,28 +1003,43 @@ EMPTY_SNAPSHOT: dict = {
     "active_email": None,
     "active_usage": None,
     "active_alias": None,
+    "orgs": {},  # account number -> organization uuid ("" = personal)
+    "holds": {},  # the rotation guard's holds (read_hold_marker); None when unreadable
 }
 
 
-def _adapt_snapshot(snap) -> dict:
+def _adapt_snapshot(snap, marker_path: Path | None = None) -> dict:
     """Adapt an ``AccountsSnapshot`` to the menu bar's render dict.
 
     Shape: ``{"accounts": [(num, email, is_active, display_usage, last_good, alias, disabled, fetched_at), ...],
     "active_email": str | None, "active_usage": dict | str | None,
-    "active_alias": str | None}``. The snapshot itself is produced by
-    ``SnapshotSource`` (the paced read path), so this is a pure transform — no
-    fetching, no I/O. Per-account ``fetched_at`` is the underlying
-    measurement's fetch time, used only for the pace marker (issue #125).
+    "active_alias": str | None, "holds": ...}``. The snapshot itself is
+    produced by ``SnapshotSource`` (the paced read path), so this fetches
+    nothing; its one read is the rotation guard's small hold marker
+    (``read_hold_marker``, at ``marker_path``), taken here once per snapshot
+    on the worker thread so that every row, panel and redraw of this
+    snapshot agrees on which accounts are held, and no menu draw touches the
+    disk. Per-account ``fetched_at`` is the underlying measurement's fetch
+    time, used only for the pace marker (issue #125).
     """
     accounts = []
+    orgs = {}
     active_email = None
     active_usage = None
     active_alias = None
     for acc in snap.accounts:
-        display = _account_display_usage(acc.usage)
+        orgs[acc.number] = getattr(acc, "org_uuid", "") or ""
+        # A limit-resets entry reaches the menu only while it is this slot's
+        # current account's (the pill, text row, VoiceOver, title and log
+        # all read these two): the slot's stored uuid and organization, read
+        # together after the collection.
+        account_uuid = getattr(acc, "account_uuid", "") or ""
+        account_org = getattr(acc, "account_org_uuid", "") or ""
+        display = _attested_for_slot(_account_display_usage(acc.usage), account_uuid, account_org)
+        last_good = _attested_for_slot(acc.usage.last_good, account_uuid, account_org)
         accounts.append(
             (
-                acc.number, acc.email, acc.is_active, display, acc.usage.last_good,
+                acc.number, acc.email, acc.is_active, display, last_good,
                 acc.alias, acc.disabled, acc.usage.fetched_at,
             )
         )
@@ -437,7 +1050,396 @@ def _adapt_snapshot(snap) -> dict:
         "active_email": active_email,
         "active_usage": active_usage,
         "active_alias": active_alias,
+        "orgs": orgs,
+        "holds": read_hold_marker(marker_path),
     }
+
+
+# ---- open dashboard -------------------------------------------------------------
+#
+# A menu can only show rows of text; the Textual dashboard (``cswap watch``)
+# already draws the usage bars, so the menu bar opens it in a Terminal window
+# rather than re-implementing it. It writes a small launcher script under the
+# backup directory and asks Terminal to open that file: no command line passes
+# through the login shell's quoting, and ``open`` needs no Automation
+# permission.
+
+DASHBOARD_NAMES: tuple[str, ...] = ("cswap", "claude-swap")
+# One launcher file per click, named by mkstemp: two menu bars sharing a
+# backup directory can never overwrite each other's script. The name is
+# "open-dashboard.<pid>.<random>.command", where <pid> is the menu bar that
+# created it, so a later sweep can tell whose file it is without a clock.
+DASHBOARD_SCRIPT_PREFIX = "open-dashboard."
+DASHBOARD_SCRIPT_SUFFIX = ".command"
+TERMINAL_BUNDLE_ID = "com.apple.Terminal"  # by id, so a renamed Terminal.app resolves
+OPEN_TIMEOUT = 30  # seconds
+
+
+def _is_package_main(path: str) -> bool:
+    """True when ``path`` is this package's ``__main__.py`` (a ``-m`` launch)."""
+    return (
+        os.path.basename(path) == "__main__.py"
+        and os.path.basename(os.path.dirname(path)) == "claude_swap"
+    )
+
+
+def dashboard_executable(
+    argv0: str | None = None,
+    which=shutil.which,
+    python: str = sys.executable,
+) -> list[str]:
+    """Argv for the watch dashboard, using the cswap that launched this process.
+
+    Reusing the launching executable keeps pipx, uv tool, and venv installs on
+    their own build instead of whatever ``cswap`` happens to be first on PATH.
+    Order: the launching console script; a ``python -m claude_swap`` launch
+    (the same interpreter, before PATH can pick another install); PATH; and
+    finally the current interpreter. Every result is absolute, because
+    Terminal starts the command in the user's home directory, not our cwd.
+    """
+    arg = sys.argv[0] if argv0 is None else argv0
+    if arg and os.path.basename(arg) in DASHBOARD_NAMES:
+        if os.path.dirname(arg):
+            return [os.path.abspath(arg), "watch"]
+        found = which(arg)  # bare name: abspath would anchor it to the cwd
+        if found:
+            return [os.path.abspath(found), "watch"]
+    if arg and _is_package_main(arg):
+        return [python, "-m", "claude_swap", "watch"]
+    for name in DASHBOARD_NAMES:
+        found = which(name)
+        if found:
+            return [os.path.abspath(found), "watch"]
+    return [python, "-m", "claude_swap", "watch"]
+
+
+# Environment variables that decide which profile, data directory, and copy of
+# the package the dashboard runs with. The dashboard starts in a fresh Terminal
+# shell whose rc files may export their own values, so each key is pinned to
+# the menu bar's state: set to its value when the menu bar has it (even when
+# empty), removed when it does not. Nothing else from the environment is
+# touched. PYTHONPATH keeps a checkout-run ``python -m`` install importable.
+# HOME is here because the account store (~/.claude-swap-backup) and, with
+# CLAUDE_CONFIG_DIR unset, the default profile both resolve through it; a
+# menu bar started with another HOME than Terminal's login shell would
+# otherwise open a different store. The launcher's own ``cd`` uses the
+# absolute working directory, so nothing in the script depends on HOME.
+DASHBOARD_ENV_KEYS: tuple[str, ...] = (
+    "CLAUDE_CONFIG_DIR",
+    "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+    "XDG_DATA_HOME",
+    "PYTHONPATH",
+    "HOME",
+)
+
+# macOS's BSD env supports ``-u`` (checked: ``env -u HOME env`` prints no
+# HOME=).
+ENV_PROGRAM = "/usr/bin/env"
+
+DASHBOARD_CWD_GONE = (
+    "The menu bar's working directory no longer exists; restart the menu bar."
+)
+
+
+def dashboard_env(environ=None) -> dict[str, str | None]:
+    """Each of DASHBOARD_ENV_KEYS mapped to its value, or None when unset.
+
+    Values are never rewritten: the keychain service name is derived from the
+    exact CLAUDE_CONFIG_DIR string, so absolutizing a relative value would
+    make the dashboard read a different credential. A relative value keeps its
+    meaning because the dashboard starts in the menu bar's working directory.
+    """
+    source = os.environ if environ is None else environ
+    return {key: source.get(key) for key in DASHBOARD_ENV_KEYS}
+
+
+def dashboard_cwd(getcwd=os.getcwd) -> str | None:
+    """The menu bar's working directory, or None if it no longer exists.
+
+    None means the dashboard must not be opened: without the cd, relative
+    profile and PYTHONPATH values would resolve somewhere else.
+    """
+    try:
+        return getcwd()
+    except OSError:
+        return None
+
+
+_PAUSE = (
+    "printf '%s\\n' 'Press Return to close this window.' >&2\n"
+    "read -r _ || :\n"
+)
+
+
+def _indent(text: str, prefix: str) -> str:
+    return "".join(prefix + line + "\n" for line in text.splitlines())
+
+
+def dashboard_script(
+    cmd: list[str],
+    env: dict[str, str | None] | None,
+    cwd: str,
+) -> str:
+    """The launcher script Terminal runs to open the dashboard.
+
+    It deletes itself first (the shell keeps reading its open copy), enters
+    the menu bar's working directory, and runs ``env -u ... K=v ... <cmd>``
+    in the foreground. It does not ``exec``: it stays behind so that when
+    the dashboard cannot start or exits with an error, it can say so. Both
+    that case and a directory Terminal cannot enter (a privacy-protected
+    folder, say) print a message and wait for Return, because Terminal runs
+    the file as ``<file> ; exit;`` and a profile set to close the window when
+    the shell exits would otherwise hide it. The script never calls ``exit``.
+
+    The status variable is not named ``status``: that is read-only in zsh.
+
+    env takes its first ``NAME=value`` operand as an assignment, so a program
+    path containing ``=`` is run through ``/bin/sh -c 'exec "$0" "$@"'``
+    rather than being env's utility operand.
+    """
+    argv = list(cmd)
+    if env:
+        unset = [key for key, value in env.items() if value is None]
+        assigned = [f"{key}={value}" for key, value in env.items() if value is not None]
+        if "=" in argv[0]:
+            argv = ["/bin/sh", "-c", 'exec "$0" "$@"', *argv]
+        argv = [ENV_PROGRAM, *(arg for key in unset for arg in ("-u", key)), *assigned, *argv]
+    cd_message = (
+        f"cswap: cannot open the dashboard from {cwd} "
+        "(Terminal may not have access to it). Run: cswap watch"
+    )
+    return (
+        "#!/bin/sh\n"
+        'rm -f -- "$0"\n'
+        f"if cd {shlex.quote(cwd)}; then\n"
+        f"    {' '.join(shlex.quote(part) for part in argv)}\n"
+        "    dashboard_status=$?\n"
+        '    if [ "$dashboard_status" -ne 0 ]; then\n'
+        "        printf '%s\\n' \"cswap: the dashboard exited with status"
+        " $dashboard_status. Run: cswap watch\" >&2\n"
+        + _indent(_PAUSE, "        ")
+        + "    fi\n"
+        "else\n"
+        f"    printf '%s\\n' {shlex.quote(cd_message)} >&2\n"
+        + _indent(_PAUSE, "    ")
+        + "fi\n"
+    )
+
+
+def create_dashboard_script(directory: Path, text: str) -> Path:
+    """Write ``text`` to a new, uniquely named owner-only executable.
+
+    mkstemp picks a name no other creation collides with, so the name is
+    never reused across launches: one menu bar's click cannot overwrite the
+    script another click (or another menu bar sharing the backup directory)
+    is about to run. On any failure the file is removed.
+    """
+    fd, name = tempfile.mkstemp(
+        dir=directory,
+        prefix=f"{DASHBOARD_SCRIPT_PREFIX}{os.getpid()}.",
+        suffix=DASHBOARD_SCRIPT_SUFFIX,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.chmod(name, 0o700)
+    except BaseException:
+        _remove_quietly(name)
+        raise
+    return Path(name)
+
+
+PID_MAX = 2**31 - 1  # pid_t is a signed 32-bit int
+
+
+def _launcher_pid(name: str) -> int | None:
+    """The creating pid from a launcher script name, or None if it has none.
+
+    Only plain ASCII digits up to PID_MAX count; anything else is not a pid
+    this sweep can reason about.
+    """
+    if not (name.startswith(DASHBOARD_SCRIPT_PREFIX) and name.endswith(DASHBOARD_SCRIPT_SUFFIX)):
+        return None
+    segment = name[len(DASHBOARD_SCRIPT_PREFIX):].split(".", 1)[0]
+    if not (segment.isascii() and segment.isdigit()):
+        return None
+    pid = int(segment)
+    return pid if pid <= PID_MAX else None
+
+
+def _pid_alive(pid: int) -> bool:
+    """Whether a process with this pid exists. Unknown counts as alive."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:  # PermissionError: it exists but belongs to someone else
+        return True
+    except (OverflowError, ValueError):  # not representable as a pid_t
+        return True
+    return True
+
+
+def sweep_stale_dashboard_scripts(directory: Path) -> int:
+    """Delete launcher scripts left by menu bars that are no longer running.
+
+    A script normally deletes itself when Terminal runs it, but ``open`` can
+    succeed while Terminal never runs the file (quit mid-launch, a cancelled
+    dialog), and the menu bar that made it may then quit. Each name carries
+    the creating pid; a file is removed only when that process is gone, so a
+    running instance's pending launch is never touched, whatever the clock
+    does. Names without a parsable pid, and anything that is not a regular
+    file, are left alone. Returns how many were removed. Never raises: an
+    unexpected error on one entry is logged at debug and the sweep goes on.
+    """
+    try:
+        entries = list(os.scandir(directory))
+    except Exception:  # OSError for a missing directory; anything else too
+        return 0
+    removed = 0
+    for entry in entries:
+        try:
+            pid = _launcher_pid(entry.name)
+            if pid is None or not entry.is_file(follow_symlinks=False):
+                continue
+            if not _pid_alive(pid):
+                os.unlink(entry.path)
+                removed += 1
+        except OSError:
+            continue
+        except Exception:
+            # One odd entry must never block the launch that is sweeping.
+            logging.getLogger("claude-swap").debug(
+                "Skipped launcher %s during sweep", entry.name, exc_info=True
+            )
+            continue
+    return removed
+
+
+def _remove_quietly(path) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def open_dashboard_terminal(
+    cmd: list[str],
+    script_dir: Path,
+    cwd: str,
+    env: dict[str, str | None] | None = None,
+    run=None,
+    create=create_dashboard_script,
+) -> tuple[bool, str]:
+    """Write a launcher script and open it in Terminal. Returns (ok, message).
+
+    Never raises. When ``open`` fails, nothing will run the script, so it is
+    removed here; otherwise the script removes itself. ``run`` defaults to
+    ``subprocess.run``, looked up at call time.
+    """
+    try:
+        script_path = create(script_dir, dashboard_script(cmd, env=env, cwd=cwd))
+    except OSError as exc:
+        return False, f"Could not write the dashboard launcher script: {exc}"
+    run = run or subprocess.run
+    try:
+        proc = run(
+            ["open", "-b", TERMINAL_BUNDLE_ID, str(script_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=OPEN_TIMEOUT,
+        )
+    except FileNotFoundError:
+        _remove_quietly(script_path)
+        return False, "the open command was not found"
+    except subprocess.TimeoutExpired:
+        _remove_quietly(script_path)
+        return False, f"open did not finish within {OPEN_TIMEOUT}s"
+    except OSError as exc:
+        _remove_quietly(script_path)
+        return False, f"open failed to start: {exc}"
+    if proc.returncode != 0:
+        _remove_quietly(script_path)
+        reason = (proc.stderr or "").strip().splitlines()
+        return False, (reason[-1][:200] if reason else f"open exited with status {proc.returncode}")
+    return True, "Opened dashboard in Terminal"
+
+
+def _open_dashboard_from_here(script_dir: Path) -> tuple[bool, str]:
+    """Open the dashboard with this process's install, profile, and cwd.
+
+    Runs on the launcher's worker thread. Stale scripts from launches
+    Terminal never ran are swept first, before this launch creates its own.
+    """
+    sweep_stale_dashboard_scripts(script_dir)
+    cwd = dashboard_cwd()
+    if cwd is None:
+        return False, DASHBOARD_CWD_GONE  # fail closed rather than drop the cd
+    return open_dashboard_terminal(
+        dashboard_executable(), script_dir, cwd, env=dashboard_env()
+    )
+
+
+class DashboardLauncher:
+    """Opens the dashboard on a worker thread so the menu never freezes.
+
+    rumps runs click handlers on the main thread, so writing the launcher
+    script and waiting on ``open`` (up to OPEN_TIMEOUT) inline would stall
+    every menu action and timer. Mirrors the refresh
+    worker: an in-flight flag drops repeat clicks, the worker only rebinds a
+    plain attribute, and the main-thread sync tick collects any failure with
+    :meth:`take_error` to show it.
+    """
+
+    def __init__(self, logger, script_dir=None, open_fn=None, start_thread=None):
+        self._logger = logger
+        if open_fn is None:
+            if script_dir is None:
+                raise ValueError("DashboardLauncher needs script_dir or open_fn")
+            script_dir = Path(script_dir)
+            open_fn = lambda: _open_dashboard_from_here(script_dir)  # noqa: E731
+        self._open = open_fn
+        self._start_thread = start_thread or (
+            lambda target: threading.Thread(target=target, daemon=True).start()
+        )
+        self._lock = threading.Lock()
+        self._error: str | None = None
+        self.in_flight = False
+
+    def start(self) -> bool:
+        """Begin opening the dashboard; False if an open is already running."""
+        if self.in_flight:
+            return False
+        self.in_flight = True
+        try:
+            self._start_thread(self._run)
+        except Exception as exc:
+            self.in_flight = False
+            self._fail(str(exc) or type(exc).__name__)
+        return True
+
+    def _run(self) -> None:
+        try:
+            try:
+                ok, message = self._open()
+            except Exception as exc:  # the helper returns errors; this is a backstop
+                ok, message = False, str(exc) or type(exc).__name__
+            if not ok:
+                self._fail(message)
+        finally:
+            self.in_flight = False
+
+    def _fail(self, message: str) -> None:
+        self._logger.warning("Could not open dashboard: %s", message)
+        with self._lock:
+            self._error = message
+
+    def take_error(self) -> str | None:
+        """Return and clear the pending failure message (main thread)."""
+        with self._lock:
+            error, self._error = self._error, None
+        return error
 
 
 # macOS 26 stopped drawing status items for processes launched through an
@@ -518,14 +1520,6 @@ def framework_build_warning(
 
 def run(switcher) -> int:
     """Entry point for ``cswap --menubar``. Blocks until the user quits."""
-    ensure_notification_identity()
-    _warn = framework_build_warning()
-    if _warn:
-        # stderr, not stdout: launchd sends stdout to the .log file where it
-        # would sit in a block buffer for the life of the process, and the
-        # install output points the user at the .err file anyway. stderr stays
-        # line-buffered even when redirected, so it lands immediately.
-        warning(_warn, file=sys.stderr)
     try:
         import rumps  # lazy: optional dependency, imported only when launching
         import AppKit  # ships with rumps (pyobjc-framework-Cocoa), never fails alone
@@ -539,6 +1533,23 @@ def run(switcher) -> int:
             "Install with: pip install 'claude-swap[menubar]'"
         ) from e
 
+    from claude_swap import app_bundle
+
+    # Hop into the wrapper .app before anything AppKit-side is set up, so the
+    # status item's owner has a bundle identifier that menu bar managers can
+    # key on. Returns only when staying in this interpreter (already bundled,
+    # opted out, framework build, or the bundle could not be built).
+    app_bundle.maybe_reexec(switcher.backup_dir)
+    if not app_bundle.in_bundle():
+        ensure_notification_identity()
+    _warn = framework_build_warning()
+    if _warn:
+        # stderr, not stdout: launchd sends stdout to the .log file where it
+        # would sit in a block buffer for the life of the process, and the
+        # install output points the user at the .err file anyway. stderr stays
+        # line-buffered even when redirected, so it lands immediately.
+        warning(_warn, file=sys.stderr)
+
     # rumps never sets an activation policy, so under a framework Python the
     # process launches as a regular app and parks a "Python" icon in the Dock
     # for as long as the menu bar runs. Accessory keeps the status item and
@@ -546,6 +1557,56 @@ def run(switcher) -> int:
     AppKit.NSApplication.sharedApplication().setActivationPolicy_(
         AppKit.NSApplicationActivationPolicyAccessory
     )
+
+    create_app(switcher).run()
+    return 0
+
+
+def plain_text_entry(prompt) -> None:
+    """Keep a rumps prompt's field to what the user types.
+
+    Its field editor comes with text replacement, spelling correction and
+    completion on, and inline prediction at the system default; any of them
+    can put characters into a name that the user did not type (an owner's
+    "Personal" arrived with an invisible character). All are turned off
+    before the prompt runs. Anything else (a stand-in in tests, a rumps
+    without these internals, a nil field editor) is left as it is.
+    """
+    import AppKit
+
+    try:
+        field = prompt._textfield
+        window = prompt._alert.window()
+    except AttributeError:
+        return
+    editor = window.fieldEditor_forObject_(True, field) if window is not None else None
+    if field is None or editor is None:
+        return  # nothing to adjust; the prompt still opens
+    for setter in (
+        "setAutomaticTextReplacementEnabled_",
+        "setAutomaticSpellingCorrectionEnabled_",
+        "setAutomaticTextCompletionEnabled_",
+        "setAutomaticQuoteSubstitutionEnabled_",
+        "setAutomaticDashSubstitutionEnabled_",
+        "setAutomaticDataDetectionEnabled_",
+        "setAutomaticLinkDetectionEnabled_",
+        "setContinuousSpellCheckingEnabled_",
+    ):
+        getattr(editor, setter)(False)
+    if editor.respondsToSelector_("setInlinePredictionType:"):
+        editor.setInlinePredictionType_(getattr(AppKit, "NSTextInputTraitTypeNo", 1))
+    if field.respondsToSelector_("setAutomaticTextCompletionEnabled:"):
+        field.setAutomaticTextCompletionEnabled_(False)
+
+
+def create_app(switcher, codex_monitor=None):
+    """Build the menu bar app for ``switcher`` without starting its event loop.
+
+    ``run`` starts it; tests drive the returned app directly (rebuilds, the
+    sync tick, panel activation) with a fake switcher. ``codex_monitor``
+    replaces the Codex monitor (``default_codex_monitor``), for tests.
+    """
+    import rumps
 
     from claude_swap.autoswitch import AutoSwitchEngine
     from claude_swap.settings import load_settings, set_setting
@@ -565,18 +1626,63 @@ def run(switcher) -> int:
             # of a full pass per tick — which kept every token at its per-account
             # rate-limit edge. Reused across refreshes to hold its pacing state.
             self._snapshot_source = SnapshotSource(switcher)
+            self._snapshot_log = SnapshotLog(switcher._logger)
             self.snapshot = dict(EMPTY_SNAPSHOT)
             self._dirty = False
             self._snapshot_at = 0.0
             self._refreshing = False
             self._config_path = switcher._get_claude_config_path()
             self._config_mtime = 0.0
-            self._last_usage_log: dict = {}  # account num -> last-logged (5h, 7d) key
+            self._last_usage_log: dict = {}  # account num -> last-logged ((5h, 7d), UR tag) key
             # Auto-switch engine (the same one `cswap auto` runs), hosted in a
             # background thread while enabled.
             self._engine = None
             self._engine_events: list = []
             self._event_lock = threading.Lock()
+            self._dashboard = DashboardLauncher(switcher._logger, switcher.backup_dir)
+            # Native menu support (usage panels, deferred rebuilds). The
+            # target and the delegate live as long as the app; rebuilds
+            # never replace them.
+            self._menu_open = False
+            self._rebuild_pending = False  # a rebuild waiting for the menu to close
+            self._bars_broken = False  # a panel failed to draw: text rows this session
+            self._account_target = None
+            # Store changes that take the account lock (renames, pause and
+            # resume) run off the main thread, one at a time in the order asked
+            # (a FIFO of ("rename" | "toggle", args) drained by a single
+            # worker); outcomes queue for the tick.
+            self._rename_queue: list = []
+            self._rename_worker_running = False
+            self._rename_outcomes: list = []
+            self._renames_in_flight = 0
+            self._toggles_in_flight = 0  # pause or resume jobs not yet answered
+            # Set by Quit: a rename still waiting for the account lock gives up.
+            self._renames_abandoned = False
+            # Guards "compare generation, then publish" in the refresh worker
+            # against "apply rename, bump generation" on the main thread.
+            self._snapshot_lock = threading.Lock()
+            # Bumped by a local change to the store (a rename, a pause or
+            # resume); a refresh started under an older generation must not
+            # overwrite it.
+            self._snapshot_gen = 0
+            self._refresh_again = False  # a refresh asked for while one ran
+            self._fresh_again = False  # ... and it must re-measure (Refresh now)
+            # Refresh now keeps the menu open: set from the press until its
+            # reading has been shown, while the row says "Refreshing…".
+            self._press_pending = False
+            self._refresh_row = None  # the Refresh now row's view in the current menu
+            self._shown_rows: list = []  # (number, item) of the current menu's account rows
+            # Codex runs on its own worker (see codex_usage), never in the
+            # snapshot worker above. Its reads publish a state; the app only
+            # marks the menu dirty when that state changed.
+            self._codex = (
+                codex_monitor if codex_monitor is not None
+                else default_codex_monitor(switcher.backup_dir, switcher._logger)
+            )
+            self._codex.enabled = self.settings.show_codex  # off: no read runs at all
+            self._codex_seen = self._codex.state  # the state last reported (worker thread)
+            self._last_codex_log = None  # codex_usage_log_key of the last line logged
+            self._setup_native_menu()
             self.rebuild_menu()
             # Background display refresh on the user's interval, plus a fast
             # UI-sync tick that applies snapshots + engine events on the main thread.
@@ -585,37 +1691,249 @@ def run(switcher) -> int:
             self.sync_timer = rumps.Timer(self.on_sync_tick, 1)
             self.sync_timer.start()
             self.refresh_async()  # first display fetch
+            if self.settings.show_codex:
+                self._request_codex()  # first Codex read: the rollouts, and the launch at start
             if self.settings.auto_switch_enabled:
                 self._start_engine()
 
         # ---- display refresh plumbing ----------------------------------------
-        def refresh_async(self, full=False):
+        def refresh_async(self, full=False, fresh=False):
             if self._refreshing:
                 return  # in-flight guard: one worker at a time (SnapshotSource
                         # pacing state is only touched by this single worker)
             self._refreshing = True
-            threading.Thread(target=self._worker, args=(full,), daemon=True).start()
+            try:
+                threading.Thread(
+                    target=self._worker, args=(full, self._snapshot_gen, fresh), daemon=True
+                ).start()
+            except BaseException:
+                self._refreshing = False  # no worker started; do not block the next read
+                raise
 
-        def _worker(self, full):
+        def _request_refresh(self):
+            """Refresh now, or right after the refresh already running.
+
+            One read pays for a read already owed: with nothing running, the
+            read started here takes the owed one's place and keeps its
+            re-measure (a Refresh now pressed while another read ran), so a
+            change never adds a second read and never downgrades a fresh one.
+            """
+            if self._refreshing:
+                self._refresh_again = True  # an owed re-measure stays owed
+                return
+            fresh = False
+            if self._refresh_again:
+                self._refresh_again = False
+                fresh, self._fresh_again = self._fresh_again, False
+            self._start_owed_read(fresh)
+
+        def _start_owed_read(self, fresh):
+            """Start a read that is owed, already taken off the owed flags.
+
+            When no thread can start (the process is out of threads), the
+            read stays owed, with its re-measure, and the next sync tick
+            tries again: nothing in flight blocks it (``refresh_async``
+            clears its own flag) and nothing owed is lost. Returns whether
+            the read started.
+            """
+            try:
+                self.refresh_async(full=fresh, fresh=fresh)
+                return True
+            except Exception:
+                self.switcher._logger.debug("could not start a refresh; it stays owed", exc_info=True)
+                self._refresh_again = True
+                self._fresh_again = self._fresh_again or fresh
+                return False
+
+        def _worker(self, full, generation=0, fresh=False):
             # Lock-free handoff: worker only rebinds plain attributes (atomic in
             # CPython); the main-thread sync tick reads them. While the engine
-            # runs it already paces all fetching, so the display reads store-only.
+            # runs it already paces all fetching, so the display reads store-only;
+            # Refresh now (``fresh``) re-measures all the same, as
+            # ``cswap list --fresh`` may while ``cswap auto`` runs.
+            log = self._snapshot_log
             try:
+                started = log.clock()
                 try:
                     raw = self._snapshot_source.take(
-                        full=full, store_only=self._engine is not None
+                        full=full,
+                        store_only=self._engine is not None and not fresh,
+                        fresh=fresh,
                     )
-                except Exception:
-                    # Keep the last good snapshot rather than blanking the menu.
-                    self.switcher._logger.debug("menubar snapshot failed", exc_info=True)
+                except Exception as exc:
+                    # Keep the last good snapshot rather than blanking the menu,
+                    # and say so in the log (rate-limited, never the message).
+                    log.took(log.clock() - started)
+                    log.failed(exc)
                     return
+                log.took(log.clock() - started)
+                log.succeeded()
                 snap = _adapt_snapshot(raw)
                 self._log_usage(snap)
-                self.snapshot = snap
-                self._snapshot_at = time.time()
-                self._dirty = True  # picked up by on_sync_tick on the main thread
+                with self._snapshot_lock:  # one step: nothing lands between check and publish
+                    if generation != self._snapshot_gen:
+                        # Read before a local change (a rename, a pause or
+                        # resume) landed: showing it would undo that change.
+                        # Drop it and read again.
+                        self._refresh_again = True
+                        return
+                    self.snapshot = snap
+                    self._snapshot_at = time.time()
+                    self._dirty = True  # picked up by on_sync_tick on the main thread
             finally:
                 self._refreshing = False
+                if self._press_pending:
+                    # The sync tick cannot run while the menu is open; this
+                    # reaches the main thread at once either way.
+                    self._report_refresh()
+
+        def _report_refresh(self):
+            """Hand the end of a reading to the main thread (``_refresh_finished``)."""
+            try:
+                from claude_swap import menubar_panel_view as pv
+
+                pv.call_on_main(self._refresh_finished)
+            except Exception:
+                # The sync tick finishes the press once the menu has closed.
+                self.switcher._logger.debug("could not report a refresh to the main thread", exc_info=True)
+
+        def on_refresh_pressed(self):
+            """Refresh now: re-measure every account; the open menu redraws in place.
+
+            Runs on the main thread, during menu tracking when the row was
+            pressed, so it only marks the row and starts (or queues) the
+            reading. The reading's end comes back in ``_refresh_finished``.
+            """
+            if self._press_pending:
+                return  # the row already says Refreshing…
+            self._press_pending = True
+            self._show_refreshing(True)
+            if self.settings.show_codex:
+                # Its own worker; the launch budget decides whether this one
+                # may start the app-server (at most once per half hour).
+                self._request_codex(manual=True)
+            if self._refreshing:
+                # One worker at a time: the reading asked for runs as soon as
+                # the one in flight reports back.
+                self._refresh_again = True
+                self._fresh_again = True
+            else:
+                self.refresh_async(full=True, fresh=True)
+
+        def _refresh_finished(self):
+            """A reading ended while a press waited (main thread, also during tracking).
+
+            The open menu takes the current snapshot in place when its rows
+            still fit; otherwise it is rebuilt after it closes, as always. A
+            reading still owed to the press (it came while another ran, or a
+            rename dropped one) starts now, whether or not the repaint
+            worked: while the menu tracks, nothing else would start it. The
+            row stays Refreshing… until that reading answers, and ends as
+            Refresh now only once no reading is owed, so it never stays
+            Refreshing… however the reading ended. Idempotent: the hop and
+            the sync tick may both call it.
+            """
+            if not self._press_pending or self._refreshing:
+                return  # nothing waits, or the reading in flight reports back itself
+            try:
+                if self._menu_open and not self.apply_snapshot_in_place(self.snapshot):
+                    self._rebuild_pending = True  # rows changed: rebuild after the close
+            except Exception:
+                self.switcher._logger.debug("Refresh now could not repaint in place", exc_info=True)
+                self._rebuild_pending = True  # today's way: rebuild after the close
+            if self._refresh_again:
+                self._refresh_again = False
+                fresh, self._fresh_again = self._fresh_again, False
+                # Nothing was reading (checked above), so this starts one.
+                # Whether it did is known here, not from _refreshing later:
+                # a quick reading may already have finished by then.
+                try:
+                    self.refresh_async(full=fresh, fresh=fresh)
+                except Exception:
+                    self.switcher._logger.debug("Refresh now could not start its reading", exc_info=True)
+                    self._refreshing = False  # no worker started; do not block the next one
+                else:
+                    return  # it reports back in turn; the row stays Refreshing…
+            self._press_pending = False
+            self._show_refreshing(False)
+
+        def _show_refreshing(self, busy):
+            row = self._refresh_row
+            if row is None:
+                return
+            try:
+                row.set_busy(busy)
+            except Exception:
+                self.switcher._logger.debug("could not update the Refresh now row", exc_info=True)
+
+        def apply_snapshot_in_place(self, snap) -> bool:
+            """Redraw the open menu from ``snap`` without rebuilding it; False when a rebuild is owed.
+
+            A rebuild swaps every row under the pointer, so it waits for the
+            menu to close (``rebuild_menu``). The account rows and the Codex
+            row are matched apart: a part whose rows still stand for the same
+            accounts (or the same block) at the same heights takes the new
+            reading where it is, each panel view its new model or each text
+            row its new title; a part that changed (an account added, the
+            Codex block gaining a window or going away) keeps its drawing
+            until the rebuild, and False says one is owed. Every panel drawn
+            shares one layout, so the columns still line up. The menu bar
+            title follows the account rows. ``snapshot`` and ``_dirty`` are
+            left as they are, so the rebuild after the menu closes draws this
+            same snapshot, submenus included.
+            """
+            from claude_swap import menubar_panel_view as pv
+            from claude_swap.menubar_panel import CODEX_KEY, fits_in_place
+
+            codex = self._codex_shown()  # read once, as the snapshot is
+            rows = self._shown_rows
+            views = [item._menuitem.view() for _num, item in rows]
+            holds = snap.get("holds")
+            applied = {}  # part (is_codex) -> whether it took the new reading
+
+            def part(pairs, is_codex):
+                return [pair for pair in pairs if (pair[0] == CODEX_KEY) == is_codex]
+
+            if views and all(isinstance(view, pv.CswapUsagePanelView) for view in views):
+                keyed = self._panels_for(snap, codex, time.time())
+                probe = pv.PanelLayout([panel for _key, panel in keyed])  # heights need only the fonts
+                shown = [(num, view) for (num, _item), view in zip(rows, views)]
+                drawn = []  # (view, panel): the new model where its part fits, else its own
+                for is_codex in (False, True):
+                    part_views = [view for _num, view in part(shown, is_codex)]
+                    part_panels = [panel for _k, panel in part(keyed, is_codex)]
+                    applied[is_codex] = fits_in_place(
+                        [(view.panel.num, view.frame().size.height) for view in part_views],
+                        [(panel.num, probe.height(panel)) for panel in part_panels],
+                    )
+                    if applied[is_codex]:
+                        drawn.extend(zip(part_views, part_panels))
+                    else:
+                        drawn.extend((view, view.panel) for view in part_views)
+                layout = pv.PanelLayout([panel for _view, panel in drawn])
+                for view, panel in drawn:
+                    pv.update_panel_view(view, panel, layout)
+            elif all(view is None for view in views):
+                sources = [(entry[0], entry) for entry in snap["accounts"]]
+                if codex is not None:
+                    sources.append((CODEX_KEY, codex))
+                for is_codex in (False, True):
+                    part_rows, part_sources = part(rows, is_codex), part(sources, is_codex)
+                    applied[is_codex] = fits_in_place(
+                        [(num, None) for num, _item in part_rows], [(key, None) for key, _s in part_sources]
+                    )
+                    if not applied[is_codex]:
+                        continue
+                    for (_num, item), (key, source) in zip(part_rows, part_sources):
+                        if key == CODEX_KEY:
+                            self._label_codex_row(item, source)
+                        else:
+                            self._label_text_row(item, source, holds)
+            else:
+                return False
+            if applied[False]:
+                self._set_title(snap, codex)
+            return applied[False] and applied[True]
 
         def _log_usage(self, snap):
             """Log each account's session/weekly limits when they change.
@@ -624,24 +1942,128 @@ def run(switcher) -> int:
             but de-dupes per account on the (5h, 7d) percentages so an idle
             machine doesn't churn the rotating log with identical lines.
             """
-            for num, email, _is_active, _display, last_good, _alias, _disabled, _fetched_at in snap["accounts"]:
-                key = _usage_log_key(last_good)
-                if key == (None, None) or self._last_usage_log.get(num) == key:
+            now = time.time()
+            for num, email, _is_active, _display, last_good, _alias, _disabled, _fetched_at, *_extra in snap["accounts"]:
+                pcts = _usage_log_key(last_good)
+                key = (pcts, limit_resets_text(last_good, now))  # a used reset is logged too
+                if pcts == (None, None) or self._last_usage_log.get(num) == key:
                     continue
-                line = format_usage_log(email, last_good)
+                line = format_usage_log(email, last_good, now)
                 if line:
                     self.switcher._logger.info(line)
                     self._last_usage_log[num] = key
 
         def on_refresh_tick(self, _timer):
             self.refresh_async()
+            if self.settings.show_codex:
+                self._request_codex()
+
+        # ---- Codex -----------------------------------------------------------
+        def _request_codex(self, manual=False):
+            """Start (or queue) a Codex read on its own worker. Never raises."""
+            try:
+                self._codex.request(manual=manual, on_done=self._on_codex_done)
+            except Exception:
+                self.switcher._logger.debug("could not start a Codex read", exc_info=True)
+
+        def _on_codex_done(self, state):
+            """A Codex read ended (the Codex worker thread): log it, and redraw on a change.
+
+            Only plain attributes are written here; the sync tick rebuilds.
+            While the menu is open the sync tick cannot run, so the change
+            is also carried to the main thread (``_codex_repaint``), as the
+            end of a reading is in ``_report_refresh``.
+            """
+            self._log_codex_usage(state)
+            if state != self._codex_seen:
+                self._codex_seen = state
+                self._dirty = True
+                if self._menu_open:
+                    try:
+                        from claude_swap import menubar_panel_view as pv
+
+                        pv.call_on_main(self._codex_repaint)
+                    except Exception:
+                        # The rebuild after the close still shows it.
+                        self.switcher._logger.debug("could not report a Codex read to the main thread", exc_info=True)
+
+        def _codex_repaint(self):
+            """A Codex reading came in while the menu was open (main thread): show it in place."""
+            if not self._menu_open:
+                return  # closed meanwhile: the sync tick rebuilds (_dirty)
+            try:
+                if not self.apply_snapshot_in_place(self.snapshot):
+                    self._rebuild_pending = True
+            except Exception:
+                self.switcher._logger.debug("Codex could not repaint in place", exc_info=True)
+                self._rebuild_pending = True
+
+        def _log_codex_usage(self, state):
+            now = time.time()
+            key = codex_usage_log_key(state, now)
+            if key is None or key == self._last_codex_log:
+                return
+            line = format_codex_usage_log(state, now)
+            if line:
+                self.switcher._logger.info(line)
+                self._last_codex_log = key
+
+        def _codex_shown(self):
+            """The Codex state to draw, read once per draw; None when the block is hidden."""
+            if not self.settings.show_codex:
+                return None
+            state = self._codex.state
+            return state if state.present else None
+
+        def _codex_alias(self):
+            return codex_alias_name(self.settings.codex_alias)
+
+        def _codex_panel(self, codex, now):
+            from claude_swap.menubar_panel import build_codex_panel
+
+            return build_codex_panel(
+                codex, now, alias=self._codex_alias(), names_only=self.settings.show_names_only
+            )
+
+        def _panels_for(self, snap, codex, now):
+            """``(key, panel)`` for every row the menu shows, in order: the accounts, then Codex."""
+            from claude_swap.menubar_panel import CODEX_KEY, build_account_panel
+
+            names_only = self.settings.show_names_only
+            holds = snap.get("holds")
+            keyed = [
+                (entry[0], build_account_panel(entry, now, names_only=names_only, holds=holds))
+                for entry in snap["accounts"]
+            ]
+            if codex is not None:
+                keyed.append((CODEX_KEY, self._codex_panel(codex, now)))
+            return keyed
+
+        def _label_codex_row(self, item, codex):
+            """The Codex text row: its title, no checkmark, and the spoken label."""
+            from claude_swap.menubar_panel import accessibility_label
+
+            panel = self._codex_panel(codex, time.time())
+            item.title = panel.text_label
+            item.state = 0
+            item._menuitem.setAccessibilityTitle_(accessibility_label(panel))
 
         def on_sync_tick(self, _timer):
-            if self._dirty:
+            if self._dirty or (self._rebuild_pending and not self._menu_open):
                 self._dirty = False
-                self.rebuild_menu()
+                self.rebuild_menu()  # defers again by itself while the menu is open
             self._detect_active_change()
             self._drain_engine_events()
+            self._drain_rename_outcomes()
+            if self._refresh_again and not self._refreshing:
+                self._refresh_again = False
+                fresh, self._fresh_again = self._fresh_again, False
+                self._start_owed_read(fresh)
+            elif self._press_pending and not self._refreshing:
+                self._refresh_finished()  # its hop has not landed yet, or never will
+            dashboard_error = self._dashboard.take_error()
+            if dashboard_error:
+                rumps.notification("claude-swap", "Could not open dashboard", dashboard_error)
 
         def _detect_active_change(self):
             # Reflect account switches from any source (menu, CLI, auto engine)
@@ -733,12 +2155,17 @@ def run(switcher) -> int:
 
         # ---- menu construction -----------------------------------------------
         def rebuild_menu(self):
-            self.title = format_title(
-                self.snapshot["active_email"],
-                self.snapshot["active_usage"],
-                self.settings,
-                alias=self.snapshot.get("active_alias"),
-            )
+            if self._menu_open:
+                # Rebuilding purges the rumps callbacks of the items on
+                # screen and swaps rows under the pointer; wait for close.
+                self._rebuild_pending = True
+                return
+            self._rebuild_pending = False
+            # Read once: a worker refresh can replace self.snapshot at any
+            # moment, and every part of this menu must describe one snapshot.
+            snap = self.snapshot
+            codex = self._codex_shown()  # likewise read once
+            self._set_title(snap, codex)
             # Stop a rumps memory leak: rumps registers each menu item's callback
             # in the process-global NSApp._ns_to_py_and_callback, but Menu.clear()
             # never removes them, so rebuilding the whole menu on every refresh
@@ -751,44 +2178,180 @@ def run(switcher) -> int:
             # it, degrade to "leaks again" rather than crashing on every rebuild.
             _reg = getattr(rumps.rumps.NSApp, "_ns_to_py_and_callback", None)
             if _reg is not None:
-                def _purge(nsmenu):
-                    for _it in nsmenu.itemArray():
-                        _reg.pop(_it, None)
-                        _sub = _it.submenu()
-                        if _sub is not None:
-                            _purge(_sub)
-                _purge(self.menu._menu)
+                purge_menu_callbacks(_reg, self.menu._menu)
             self.menu.clear()
-            account_items = []
-            for num, email, is_active, display, _last_good, alias, disabled, fetched_at in self.snapshot["accounts"]:
-                item = rumps.MenuItem(
-                    format_account_label(
-                        num, email, display, alias=alias, disabled=disabled, fetched_at=fetched_at
-                    ),
-                    callback=self._make_switch_to(num),
-                )
-                item.state = 1 if is_active else 0
-                account_items.append(item)
-            if not account_items:
-                account_items.append(rumps.MenuItem("No managed accounts", callback=None))
+            account_items = self._account_items(snap, codex)
+            refresh_item = rumps.MenuItem("Refresh now", callback=self.on_refresh_now)
+            self._attach_refresh_row(refresh_item)
 
             self.menu = [
                 *account_items,
+                None,
+                rumps.MenuItem("Open dashboard…", callback=self.on_open_dashboard),
                 None,
                 rumps.MenuItem("Rotate to next", callback=self._switch(None)),
                 rumps.MenuItem("Switch to best", callback=self._switch("best")),
                 rumps.MenuItem("Next available", callback=self._switch("next-available")),
                 None,
                 self._add_menu(rumps),
-                self._disable_menu(rumps),
-                self._remove_menu(rumps),
+                self._disable_menu(rumps, snap),
+                self._rename_menu(rumps, snap, codex),
+                self._remove_menu(rumps, snap),
                 rumps.MenuItem("Refresh current credentials", callback=self.on_refresh_creds),
                 self._history_menu(rumps),
                 None,
+                # Refresh now, the frequent action, is kept off Quit.
+                refresh_item,
                 self._settings_menu(rumps),
-                rumps.MenuItem("Refresh now", callback=self.on_refresh_now),
                 rumps.MenuItem("Quit", callback=self.on_quit),
             ]
+
+        def _set_title(self, snap, codex=None):
+            self.title = format_title(
+                snap["active_email"],
+                snap["active_usage"],
+                self.settings,
+                alias=snap.get("active_alias"),
+                codex=codex,
+                codex_alias=self._codex_alias(),
+            )
+
+        def _attach_refresh_row(self, item):
+            """Draw Refresh now as a row whose press keeps the menu open.
+
+            If the row cannot be made, the native item stays: it closes the
+            menu, as it always did, and still re-measures.
+            """
+            self._refresh_row = None
+            if self._account_target is None:
+                return
+            try:
+                from claude_swap import menubar_panel_view as pv
+
+                view = pv.make_refresh_row_view(target=self._account_target, busy=self._press_pending)
+                item._menuitem.setView_(view)
+            except Exception:
+                self.switcher._logger.debug("Refresh now row unavailable; native item", exc_info=True)
+                return
+            self._refresh_row = view
+
+        def _label_text_row(self, item, entry, holds=None):
+            """An account text row's title, checkmark and accessible name.
+
+            ``holds`` is the snapshot's read of the rotation guard's marker.
+            """
+            num, email, is_active, display, _last_good, alias, disabled, fetched_at, *_extra = entry
+            now = time.time()  # one clock: the two labels' countdowns agree
+            item.title = format_account_label(
+                num, email, display, now, alias=alias, disabled=disabled,
+                fetched_at=fetched_at, names_only=self.settings.show_names_only, holds=holds,
+            )
+            item.state = 1 if is_active else 0
+            # The accessible name (AXTitle, what VoiceOver reads) is always the
+            # full row: with names only the visible row hides an alias's email.
+            item._menuitem.setAccessibilityTitle_(format_account_label(
+                num, email, display, now, alias=alias, disabled=disabled, fetched_at=fetched_at,
+                holds=holds,
+            ))
+
+        def _account_items(self, snap, codex=None):
+            """One row per account, then the Codex block when shown: text rows,
+            drawn as usage panels when enabled. The Codex row is not a switch
+            (no callback)."""
+            from claude_swap.menubar_panel import CODEX_KEY
+
+            rows = []  # (account number or CODEX_KEY, item)
+            holds = snap.get("holds")
+            for entry in snap["accounts"]:
+                num = entry[0]
+                item = rumps.MenuItem(str(num), callback=self._make_switch_to(num))
+                self._label_text_row(item, entry, holds)
+                rows.append((num, item))
+            head = [] if rows else [rumps.MenuItem("No managed accounts", callback=None)]
+            if codex is not None:
+                item = rumps.MenuItem(CODEX_NAME, callback=None)
+                self._label_codex_row(item, codex)
+                rows.append((CODEX_KEY, item))
+            self._shown_rows = rows
+            if not rows:
+                return head
+            if (
+                self.settings.show_usage_bars
+                and not self._bars_broken
+                and self._account_target is not None
+            ):
+                self._attach_usage_bars(rows, snap, codex)
+            return head + [item for _num, item in rows]
+
+        def _attach_usage_bars(self, rows, snap, codex=None):
+            """Draw every row (accounts, then Codex) as a usage panel, or leave them all as text.
+
+            Panels are paired with rows by account number (the Codex row by
+            its key). Any failure here (building, attaching, installing the
+            delegate) is rolled back by ``attach_usage_panels`` to the exact
+            text rows.
+            """
+            try:
+                from claude_swap import menubar_panel_view as pv
+
+                panels = dict(self._panels_for(snap, codex, time.time()))
+                pv.attach_usage_panels(
+                    [(item, panels[num]) for num, item in rows],
+                    target=self._account_target,
+                    on_draw_failure=self._panel_draw_failed,
+                    after_attach=self._install_menu_delegate,
+                )
+            except Exception:
+                self.switcher._logger.debug("usage bars unavailable; showing text rows", exc_info=True)
+
+        def _setup_native_menu(self):
+            try:
+                from claude_swap import menubar_panel_view as pv
+
+                self._account_target = pv.make_account_target(
+                    self._activate_account,
+                    is_open=lambda: self._menu_open,
+                    menu=self.menu._menu,
+                    on_refresh=self.on_refresh_pressed,
+                )
+                self._install_menu_delegate()
+            except Exception:
+                self.switcher._logger.debug("native menu support unavailable", exc_info=True)
+
+        def _install_menu_delegate(self):
+            from claude_swap import menubar_panel_view as pv
+
+            pv.install_menu_delegate(
+                self.menu._menu, on_open=self._menu_will_open, on_close=self._menu_did_close
+            )
+
+        def _menu_will_open(self):
+            self._menu_open = True
+
+        def _menu_did_close(self):
+            self._menu_open = False  # a pending rebuild runs on the next sync tick
+
+        def _activate_account(self, num):
+            """Switch for a usage panel, checked against the snapshot current now.
+
+            The panel was drawn from an earlier snapshot; the account may have
+            been removed since, in which case nothing is switched.
+            """
+            if not any(str(entry[0]) == num for entry in self.snapshot["accounts"]):
+                self.switcher._logger.info(
+                    "Menu bar: account %s is no longer listed; not switching", num
+                )
+                return
+            self._make_switch_to(num)(None)
+
+        def _panel_draw_failed(self):
+            # Called from inside a panel's drawRect_ error handler.
+            if not self._bars_broken:
+                self._bars_broken = True
+                self.switcher._logger.warning(
+                    "Menu bar usage bars failed to draw; showing text rows", exc_info=True
+                )
+            self._rebuild_pending = True
 
         def _add_menu(self, rumps):
             menu = rumps.MenuItem("Add account")
@@ -797,31 +2360,92 @@ def run(switcher) -> int:
                 menu.add(rumps.MenuItem("From setup-token…", callback=self.on_add_token))
             return menu
 
-        def _remove_menu(self, rumps):
+        def _remove_menu(self, rumps, snap):
             menu = rumps.MenuItem("Remove account")
-            accounts = self.snapshot["accounts"]
+            accounts = snap["accounts"]
             if not accounts:
                 menu.add(rumps.MenuItem("No managed accounts", callback=None))
-            for num, email, _is_active, _display, _last_good, alias, _disabled, _fetched_at in accounts:
+            for num, email, _is_active, _display, _last_good, alias, _disabled, _fetched_at, *_extra in accounts:
                 label = f"{num}  {alias}  ({email})" if alias else f"{num}  {email}"
                 menu.add(rumps.MenuItem(label, callback=self._make_remove(num)))
             return menu
 
-        def _disable_menu(self, rumps):
-            menu = rumps.MenuItem("Disable / enable account")
-            accounts = self.snapshot["accounts"]
+        def _disable_menu(self, rumps, snap):
+            # cswap's disable flag, named for what the owner does with it: a
+            # pause is theirs, unlike a hold of the rotation guard.
+            menu = rumps.MenuItem("Pause / resume account")
+            accounts = snap["accounts"]
             if not accounts:
                 menu.add(rumps.MenuItem("No managed accounts", callback=None))
-            for num, email, _is_active, _display, _last_good, alias, disabled, _fetched_at in accounts:
+            for num, email, _is_active, _display, _last_good, alias, disabled, _fetched_at, *_extra in accounts:
                 name = f"{alias}  ({email})" if alias else email
                 item = rumps.MenuItem(
                     f"{num}  {name}", callback=self._make_toggle_disabled(num, disabled)
                 )
-                # A check-mark reads as "held out of rotation" — same glyph the
-                # active row uses, but here it means disabled, not selected.
+                # A check-mark reads as "out of rotation" (paused, or held by
+                # the rotation guard): the active row's glyph, not "selected".
                 item.state = 1 if disabled else 0
                 menu.add(item)
             return menu
+
+        def _rename_menu(self, rumps, snap, codex=None):
+            menu = rumps.MenuItem("Rename account")
+            accounts = snap["accounts"]
+            if not accounts:
+                menu.add(rumps.MenuItem("No managed accounts", callback=None))
+            saving = bool(self._renames_in_flight)
+            for num, email, _is_active, _display, _last_good, alias, _disabled, _fetched_at, *_extra in accounts:
+                # Always the full identity here: the email says which account.
+                title = f"{num}  {account_identity(email, alias)}"
+                if saving:
+                    # One rename at a time: the next prompt opens once this saved.
+                    menu.add(rumps.MenuItem(f"{title} (saving…)", callback=None))
+                    continue
+                menu.add(rumps.MenuItem(
+                    title,
+                    callback=self._make_rename(num, email, alias, snap.get("orgs", {}).get(num)),
+                ))
+            if codex is not None:
+                # Last, while the block is shown. Its name is the menu bar's
+                # own setting, not the account store's: no lock, no worker.
+                menu.add(rumps.MenuItem(
+                    account_identity(CODEX_NAME, self._codex_alias()), callback=self._make_codex_rename()
+                ))
+            return menu
+
+        def _make_codex_rename(self):
+            def cb(_sender):
+                # An accessory app is not frontmost; bring it forward or the
+                # prompt can render blank (as with "From setup-token…").
+                import AppKit
+                AppKit.NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+                prompt = rumps.Window(
+                    title="Rename Codex",
+                    message="Name for the Codex block. Leave empty to use Codex.",
+                    default_text=self._codex_alias() or "",
+                    ok="Rename", cancel="Cancel", dimensions=(320, 24),
+                )
+                plain_text_entry(prompt)
+                response = prompt.run()
+                if response.clicked != 1:
+                    return
+                self._rename_codex(response.text)
+            return cb
+
+        def _rename_codex(self, text):
+            """Name the Codex block by the account alias rule; empty is "Codex" again."""
+            name = clean_alias_text(text)
+            if name:
+                if any(ch.isspace() for ch in name):
+                    rumps.alert(title="claude-swap", message=CODEX_RENAME_SPACES)
+                    return
+                try:
+                    name = normalize_alias(name)
+                except ValueError as e:
+                    rumps.alert(title="claude-swap", message=str(e))
+                    return
+            self.settings.codex_alias = name
+            self._save_and_rebuild()
 
         def _history_menu(self, rumps):
             menu = rumps.MenuItem("Switch history")
@@ -859,6 +2483,22 @@ def run(switcher) -> int:
             )
             scoped_item.state = 1 if self.settings.title_scoped else 0
             menu.add(scoped_item)
+
+            bars_item = rumps.MenuItem("Show usage bars", callback=self.on_toggle_usage_bars)
+            bars_item.state = 1 if self.settings.show_usage_bars else 0
+            menu.add(bars_item)
+
+            names_item = rumps.MenuItem("Show names only", callback=self.on_toggle_names_only)
+            names_item.state = 1 if self.settings.show_names_only else 0
+            menu.add(names_item)
+
+            codex_item = rumps.MenuItem("Show Codex", callback=self.on_toggle_codex)
+            codex_item.state = 1 if self.settings.show_codex else 0
+            menu.add(codex_item)
+
+            codex_title_item = rumps.MenuItem("Codex in title", callback=self.on_toggle_title_codex)
+            codex_title_item.state = 1 if self.settings.title_codex else 0
+            menu.add(codex_title_item)
 
             interval = rumps.MenuItem("Refresh interval")
             labels = {30: "30 seconds", 60: "60 seconds", 300: "5 minutes"}
@@ -933,11 +2573,58 @@ def run(switcher) -> int:
             # `disabled` is this row's current state; selecting it flips it.
             target = not disabled
             def cb(_sender):
-                if self._guard(
-                    lambda: self.switcher.set_account_disabled(str(num), target)
-                ):
-                    self.refresh_async()
+                self._set_disabled(num, target)
             return cb
+
+        def _set_disabled(self, num, disabled):
+            """Queue a pause (``disabled=True``) or resume of slot ``num``.
+
+            The store call holds the account lock, which a switch, a rename
+            or the rotate daemon may hold for seconds, so it runs on the
+            rename worker, in order with any rename, and the menu stays free.
+            The tick reports the outcome (``_drain_rename_outcomes``): a
+            refresh on success, the store's message in an alert on failure.
+            """
+            self._queue_store_job("toggle", (str(num), disabled))
+
+        def _queue_store_job(self, kind, job):
+            """Queue a ``"rename"`` or ``"toggle"`` job for the store worker,
+            starting the worker when none runs.
+
+            When no thread can start (the process is out of threads), the job
+            is taken back under the same lock, nothing is left counted as in
+            flight or the worker as running (or later jobs would wait forever
+            and Quit with them), and one failure outcome goes through the
+            usual drain, so the user sees one alert.
+            """
+            with self._event_lock:
+                self._rename_queue.append((kind, job))
+                if kind == "toggle":
+                    self._toggles_in_flight += 1
+                else:
+                    self._renames_in_flight += 1
+                start = not self._rename_worker_running
+                if start:
+                    self._rename_worker_running = True
+            if not start:
+                return
+            try:
+                threading.Thread(target=self._rename_loop, daemon=True).start()
+            except Exception as e:
+                self.switcher._logger.warning("could not start the store worker", exc_info=True)
+                reason = str(e) or type(e).__name__
+                with self._event_lock:
+                    # No worker ran since the queue was last empty, so this
+                    # job is the only one queued.
+                    self._rename_queue.remove((kind, job))
+                    self._rename_worker_running = False
+                    if kind == "toggle":
+                        self._toggles_in_flight -= 1
+                        failure = ("toggle_failed", f"Could not pause or resume the account: {reason}")
+                    else:
+                        self._renames_in_flight -= 1
+                        failure = ("failed", reason)  # shown as "Could not rename: ..."
+                    self._rename_outcomes.append(failure)
 
         def on_add_login(self, _sender):
             if self._guard(self.switcher.add_account):
@@ -976,6 +2663,10 @@ def run(switcher) -> int:
             target = log_path if log_path.exists() else log_path.parent
             subprocess.run(["open", "-R", str(target)], check=False)
 
+        def on_open_dashboard(self, _sender):
+            # Opens on a worker thread; a failure surfaces via on_sync_tick.
+            self._dashboard.start()
+
         def on_refresh_creds(self, _sender):
             if self.switcher._get_current_account() is None:
                 rumps.alert(title="claude-swap",
@@ -1000,9 +2691,38 @@ def run(switcher) -> int:
             self.refresh_async()
 
         def on_refresh_now(self, _sender):
-            self.refresh_async(full=True)  # explicit user refresh → full pass
+            # The native item, shown only when the row view could not be made.
+            self.on_refresh_pressed()
 
         def on_quit(self, _sender):
+            # A rename still saving would be lost silently with the process.
+            # So would a pause or resume.
+            deadline = time.monotonic() + 3.0
+            while (self._renames_in_flight or self._toggles_in_flight) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if self._renames_in_flight:
+                # One still waiting for the account lock gives up now; one
+                # already in the store finishes on the store's terms (its lock
+                # wait is bounded). Either way the worker answers, so the
+                # alert below says what happened, never what might.
+                self._renames_abandoned = True
+            # A pause or resume finishes on the store's terms too: its lock
+            # wait is bounded, and a refusal is shown below.
+            while self._renames_in_flight or self._toggles_in_flight:
+                time.sleep(0.05)
+            # Outcomes the sync tick has not shown yet (a rejected name) are
+            # shown now; after quit nothing would.
+            self._drain_rename_outcomes(quitting=True)
+            # A Codex read in flight runs a child in its own session, which
+            # would outlive the app: end it (bounded) before going. If the
+            # monitor's worker did not stop in time, its child's group is
+            # killed from here, so nothing is left running either way.
+            try:
+                if not self._codex.close(timeout=2.0):
+                    self._codex.kill_child()
+                    self.switcher._logger.debug("Codex monitor did not stop in time; its child was killed")
+            except Exception:
+                self.switcher._logger.debug("could not close the Codex monitor", exc_info=True)
             self._stop_engine()
             rumps.quit_application()
 
@@ -1010,8 +2730,234 @@ def run(switcher) -> int:
             self.settings.show_account_name = not self.settings.show_account_name
             self._save_and_rebuild()
 
+        def _make_rename(self, num, email, alias, org=None):
+            def cb(_sender):
+                if self._renames_in_flight:
+                    return  # a rename is still saving: one at a time
+                # An accessory app is not frontmost; bring it forward or the
+                # prompt can render blank (as with "From setup-token…").
+                import AppKit
+                AppKit.NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+                prompt = rumps.Window(
+                    title="Rename account",
+                    message=f"Name for account {num} ({email}). Leave empty to remove the name.",
+                    default_text=alias or "",
+                    ok="Rename", cancel="Cancel", dimensions=(320, 24),
+                )
+                plain_text_entry(prompt)
+                response = prompt.run()
+                if response.clicked != 1:
+                    return
+                self._rename_account(num, email, response.text, org)
+            return cb
+
+        def _rename_account(self, num, email, text, org=None):
+            """Queue a rename of the account shown as ``(email, org)`` in slot ``num``.
+
+            The store call runs on a worker thread: it waits on the account
+            lock, which the rotate daemon or the auto-switch engine may hold
+            for seconds, and the menu must not freeze meanwhile. Renames run
+            one at a time in the order asked, so the last one asked is the
+            one that sticks. The pin makes a swap in between rename that
+            account, not whatever now sits in slot ``num``. Outcomes are
+            handled on the sync tick (``_drain_rename_outcomes``).
+            """
+            self._dirty = True  # show the Rename submenu as saving
+            self._queue_store_job("rename", (num, email, clean_alias_text(text), org))
+
+        def _rename_loop(self):
+            while True:
+                with self._event_lock:
+                    if not self._rename_queue:
+                        self._rename_worker_running = False
+                        return
+                    kind, job = self._rename_queue.pop(0)
+                # Every way out of a job (the lock wait, the store, anything
+                # unexpected) publishes exactly one outcome and ends the job,
+                # or the menu stays "saving" and Quit waits for it forever.
+                failed = "toggle_failed" if kind == "toggle" else "failed"
+                outcome = (failed, f"the {'change' if kind == 'toggle' else 'rename'} stopped unexpectedly")
+                try:
+                    outcome = self._run_toggle(*job) if kind == "toggle" else self._run_rename(*job)
+                except BaseException as e:
+                    self.switcher._logger.warning("%s failed", kind, exc_info=True)
+                    outcome = (failed, str(e) or type(e).__name__)
+                finally:
+                    with self._event_lock:
+                        self._rename_outcomes.append(outcome)
+                        if kind == "toggle":
+                            self._toggles_in_flight -= 1
+                        else:
+                            self._renames_in_flight -= 1
+
+        def _run_toggle(self, num, disabled):
+            """Pause or resume one slot; ``("toggled",)`` or ``("toggle_failed", message)``.
+
+            The store waits on the account lock itself, bounded by the lock's
+            own timeout; a refusal keeps its message (a held lock reads
+            "Failed to acquire lock - another instance may be running").
+            """
+            try:
+                self.switcher.set_account_disabled(num, disabled)
+                return ("toggled",)
+            except ClaudeSwitchError as e:
+                return ("toggle_failed", str(e))
+            except Exception as e:  # never lose the outcome
+                self.switcher._logger.warning("pause or resume failed", exc_info=True)
+                return ("toggle_failed", str(e) or type(e).__name__)
+
+        def _wait_for_the_account_lock(self):
+            """``"free"``, ``"abandoned"`` (Quit gave up on it) or ``"busy"``.
+
+            The store call below takes the account lock and cannot be
+            interrupted while it waits, so the wait happens here, where Quit
+            can end it: renames abandoned by Quit never reach the store.
+            """
+            path = getattr(self.switcher, "lock_file", None)
+            deadline = time.monotonic() + 10.0  # the store's own lock timeout
+            while not self._renames_abandoned:
+                if path is None:
+                    return "free"
+                probe = FileLock(path)
+                if probe.acquire(timeout=0):
+                    probe.release()
+                    return "abandoned" if self._renames_abandoned else "free"
+                if time.monotonic() > deadline:
+                    return "busy"
+                time.sleep(0.05)
+            return "abandoned"
+
+        def _run_rename(self, num, email, name, org):
+            if any(ch.isspace() for ch in name):
+                # The store would refuse it too, in CLI terms; say why here.
+                return (
+                    "rejected",
+                    "Names cannot contain spaces (they are used on the command line); use - or _",
+                )
+            state = self._wait_for_the_account_lock()
+            if state != "free":
+                return (state,)
+            try:
+                if name:
+                    slot, alias = self.switcher.set_alias(
+                        str(num), name, expected_email=email, expected_org=org
+                    )
+                else:
+                    slot = self.switcher.unset_alias(
+                        str(num), expected_email=email, expected_org=org
+                    )
+                    alias = None
+                return ("ok", str(slot), email, org, alias)
+            except AccountNotFoundError:
+                return ("gone",)
+            except LockError:
+                return ("busy",)
+            except ClaudeSwitchError as e:
+                return ("rejected", str(e))
+            except Exception as e:  # never lose the outcome
+                self.switcher._logger.warning("rename failed", exc_info=True)
+                return ("rejected", str(e) or type(e).__name__)
+
+        def _drain_rename_outcomes(self, quitting=False):
+            with self._event_lock:
+                outcomes, self._rename_outcomes = self._rename_outcomes, []
+                idle = not self._renames_in_flight
+            renamed = [o for o in outcomes if o[0] not in ("toggled", "toggle_failed")]
+            if renamed and idle:
+                self._dirty = True  # re-enable the Rename submenu
+            not_saved = False
+            toggled = renamed_ok = False
+            for outcome in outcomes:
+                kind = outcome[0]
+                if kind == "toggled":
+                    toggled = True
+                elif kind == "toggle_failed":
+                    rumps.alert(title="claude-swap", message=outcome[1])
+                elif kind == "ok":
+                    self._apply_rename(*outcome[1:])
+                    renamed_ok = True
+                elif kind == "gone":
+                    rumps.alert(title="claude-swap", message="Account changed, rename cancelled")
+                elif kind in ("busy", "abandoned"):
+                    not_saved = True
+                elif kind == "failed":
+                    rumps.alert(title="claude-swap", message=f"Could not rename: {outcome[1]}")
+                else:
+                    rumps.alert(title="claude-swap", message=outcome[1])
+            if not_saved and quitting:
+                # A notification would not outlive the process.
+                rumps.alert(
+                    title="claude-swap",
+                    message="Rename not saved: another cswap process was busy",
+                )
+            elif not_saved:
+                rumps.notification(
+                    "claude-swap", "Could not rename", "Another cswap process is busy, try again"
+                )
+            if toggled:
+                # A refresh already in flight read the roster before this
+                # change: the bump drops its reading. (A rename bumps as it
+                # is applied, in one step with the change it shows.)
+                with self._snapshot_lock:
+                    self._snapshot_gen += 1
+            if (toggled or renamed_ok) and not quitting:
+                # One read for the whole batch, after every change in it.
+                self._request_refresh()
+
+        def _apply_rename(self, slot, email, org, alias):
+            # Show it now, on the row showing the renamed account: the next
+            # tick rebuilds from this snapshot. The generation bump makes any
+            # refresh already in flight discard its older reading; the drain
+            # then asks for one refresh that reads the store back.
+            with self._snapshot_lock:  # one step with the refresh's compare-and-publish
+                snap = dict(self.snapshot)
+                orgs = snap.get("orgs") or {}
+
+                def renamed(entry):
+                    # An account is its email and organization together: the
+                    # same email can sit in two rows, and after a swap the
+                    # store's slot need not be this snapshot's slot for it.
+                    if entry[1] != email:
+                        return False
+                    if org is None:  # a caller that never saw the organization
+                        return str(entry[0]) == slot
+                    return (orgs.get(str(entry[0])) or "") == (org or "")
+
+                snap["accounts"] = [
+                    entry[:5] + (alias,) + entry[6:] if renamed(entry) else entry
+                    for entry in snap["accounts"]
+                ]
+                if any(entry[2] and renamed(entry) for entry in snap["accounts"]):
+                    snap["active_alias"] = alias
+                self._snapshot_gen += 1
+                self.snapshot = snap
+            self._dirty = True
+
+        def on_toggle_names_only(self, _sender):
+            self.settings.show_names_only = not self.settings.show_names_only
+            self._save_and_rebuild()
+
+        def on_toggle_codex(self, _sender):
+            self.settings.show_codex = not self.settings.show_codex
+            # Off also drops a read already asked for and stops one running
+            # short of its launch.
+            self._codex.enabled = self.settings.show_codex
+            if self.settings.show_codex:
+                self._request_codex()  # off stopped every read; catch up now
+            self._save_and_rebuild()
+
+        def on_toggle_title_codex(self, _sender):
+            self.settings.title_codex = not self.settings.title_codex
+            self._save_and_rebuild()
+
         def on_toggle_scoped(self, _sender):
             self.settings.title_scoped = not self.settings.title_scoped
+            self._save_and_rebuild()
+
+        def on_toggle_usage_bars(self, _sender):
+            self.settings.show_usage_bars = not self.settings.show_usage_bars
+            if self.settings.show_usage_bars:
+                self._bars_broken = False  # asked for again: try drawing them again
             self._save_and_rebuild()
 
         def _make_title_pct(self, mode):
@@ -1052,5 +2998,4 @@ def run(switcher) -> int:
                 self.rebuild_menu()
             return cb
 
-    MenuBarApp().run()
-    return 0
+    return MenuBarApp()

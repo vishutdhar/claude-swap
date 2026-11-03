@@ -1,8 +1,11 @@
 """Tests for the Palette value object and the light/dark themes."""
 from __future__ import annotations
 
+import pytest
+
 from claude_swap.tui import theme
 from claude_swap.tui.theme import CSWAP_DARK, CSWAP_LIGHT, Palette
+from claude_swap.tui.widgets import usage_bar
 
 
 def test_dark_palette_matches_constants():
@@ -25,12 +28,49 @@ def test_from_theme_reads_theme_object_including_track():
     assert p.track == theme.TRACK_LIGHT  # from Theme.variables["track"], not app cache
 
 
-def test_severity_ramp_and_none():
+_BANDS = [
+    (0.0, "sev_ok"),
+    (74.9, "sev_ok"),
+    (74.99, "sev_ok"),
+    (75.0, "sev_warn"),
+    (92.0, "sev_warn"),
+    (99.9, "sev_warn"),
+    (99.99, "sev_warn"),
+    (100.0, "sev_crit"),
+    (130.0, "sev_crit"),
+]
+_PALETTES = pytest.mark.parametrize(
+    "palette", [Palette.DARK, Palette.from_theme(CSWAP_LIGHT)], ids=["dark", "light"]
+)
+
+
+def test_band_edges():
+    # Green under 75%, yellow from 75% up to the limit, red at 100% and over.
+    assert (theme.WARN_PCT, theme.CRIT_PCT) == (75.0, 100.0)
+
+
+@_PALETTES
+def test_severity_of_none_is_muted(palette):
+    assert palette.severity(None) == palette.muted
+
+
+@_PALETTES
+@pytest.mark.parametrize("pct, band", _BANDS)
+def test_severity_bands(palette, pct, band):
+    assert palette.severity(pct) == getattr(palette, band)
+
+
+@pytest.mark.parametrize("pct, band", _BANDS)
+def test_dashboard_bar_and_percent_use_the_band(pct, band):
+    # The dashboard's usage line: the bar fill and the percent share the band.
     p = Palette.DARK
-    assert p.severity(None) == p.muted
-    assert p.severity(95.0) == p.sev_crit
-    assert p.severity(75.0) == p.sev_warn
-    assert p.severity(10.0) == p.sev_ok
+    line = usage_bar("5h", pct, None, 20, palette=p)
+    styles = {str(span.style) for span in line.spans if line.plain[span.start:span.end].strip() != "5h"}
+    assert getattr(p, band) in styles  # bar fill and percent
+    pct_spans = [s for s in line.spans if line.plain[s.start:s.end].strip() == f"{pct:.0f}%"]
+    assert [str(s.style) for s in pct_spans] == [getattr(p, band)]
+    other_bands = {p.sev_ok, p.sev_warn, p.sev_crit} - {getattr(p, band)}
+    assert not styles & other_bands
 
 
 def test_both_themes_expose_track_variable():

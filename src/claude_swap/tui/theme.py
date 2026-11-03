@@ -26,14 +26,23 @@ PANEL = "#262626"
 
 # Usage severity ramp (desaturated for dark backgrounds).
 SEV_OK = "#87af87"  # calm green: plenty of headroom
-SEV_WARN = "#d7af5f"  # amber: climbing (>= 70%)
-SEV_CRIT = "#d75f5f"  # soft red: near the limit (>= 90%)
+SEV_WARN = "#d7af5f"  # amber: climbing, from WARN_PCT up to CRIT_PCT
+SEV_CRIT = "#d75f5f"  # soft red: from CRIT_PCT, which is the limit today
 TRACK = "#3a3a3a"  # unfilled bar track
 
-# Severity band edges. WARN mirrors where a user starts caring; CRIT mirrors
-# the auto-switch default threshold so bar color and switch behavior agree.
-WARN_PCT = 70.0
-CRIT_PCT = 90.0
+# A window's limit. At or over it the account has hit its wall: a fact about
+# usage, not a colour edge. The menu bar's "over" state (spoken "over limit",
+# muted on an account not in use, no "(ahead)") starts here whatever the
+# colour bands say.
+LIMIT_PCT = 100.0
+
+# Severity band edges, a display rule only: green under WARN, yellow from WARN,
+# red from CRIT. Red starts at the limit, so today red means a window has run
+# out; moving CRIT changes only the colour, never when an account counts as
+# over its limit. The auto-switch threshold (default 90%) is a separate
+# setting, so at its default the switch fires while the bar is still yellow.
+WARN_PCT = 75.0
+CRIT_PCT = LIMIT_PCT
 
 
 @dataclass(frozen=True)

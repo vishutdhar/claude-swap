@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import time
+import re
 
 import pytest
 
-from claude_swap import oauth, usage_store
+from claude_swap import oauth, poll_policy, usage_store
 from claude_swap.usage_store import (
     BACKOFF_BASE_S,
     BACKOFF_CAP_S,
@@ -1155,7 +1157,7 @@ class TestPollPlan:
 
 
 class TestDueCandidate:
-    """Candidate selection shared by the auto engine and the TUI watch view."""
+    """The auto engine's one-alternate-per-tick candidate pick."""
 
     NOW = 1_000_000.0
 
@@ -1237,6 +1239,32 @@ class TestDueCandidate:
         # due_candidate has no current scoped-model selection: repair keys on
         # the impossible deadline shape rather than stale policy semantics.
         assert due_candidate(["2"], entries, self.NOW) == "2"
+
+    def test_attempted_but_unmeasured_slot_yields_to_an_older_due_row(self):
+        """A fetch-path sentinel (a live session's expired or refused
+        credential) records no measurement, plan or backoff. Keyed on
+        fetchedAt alone it stayed the stalest due row every tick and the
+        other alternates were never polled; the pick keys on the attempt
+        stamp reserve() writes, so a no-op pick rotates to the back."""
+        entries = {
+            "2": UsageEntry(fetched_at=self.NOW - 400, last_attempt_at=self.NOW - 400),
+            "3": UsageEntry(last_attempt_at=self.NOW - 60),  # picked last tick, no data
+        }
+        assert due_candidate(["2", "3"], entries, self.NOW) == "2"
+        # ...and comes back around once nothing was touched more recently,
+        # so a rotated credential is noticed on the next idle tick.
+        entries["2"] = UsageEntry(fetched_at=self.NOW - 30, last_attempt_at=self.NOW - 30)
+        assert due_candidate(["2", "3"], entries, self.NOW) == "3"
+
+    def test_adopted_reading_counts_as_a_touch(self):
+        """``UsageStore.adopt`` moves fetchedAt without an attempt: the later
+        of the two stamps is the touch, so a freshly adopted row is not the
+        least recent."""
+        entries = {
+            "2": UsageEntry(fetched_at=self.NOW - 30, last_attempt_at=self.NOW - 900),
+            "3": UsageEntry(fetched_at=self.NOW - 600, last_attempt_at=self.NOW - 600),
+        }
+        assert due_candidate(["2", "3"], entries, self.NOW) == "3"
 
     def test_none_when_no_candidates(self):
         assert due_candidate([], {}, self.NOW) is None
@@ -1379,6 +1407,353 @@ class TestReserve:
         store.record({"2": FetchRecord(usage=USAGE)}, IDENT)
         other = {"2": ("new@x.com", "org-9")}
         assert set(store.reserve(["2"], other, respect_plans=True)) == {"2"}
+
+
+class TestResetRowIsDueAtOnce:
+    """A row with no reading for its identity (what the store holds after a
+    slot's row is lost or replaced, and what the quarantine-lifting write of
+    a credential change then leaves) is due on the very next pass of every
+    read path: there is no cadence to wait out. The guards still apply."""
+
+    def _reset_row(self, store):
+        store.clear_dead_token(["1"], IDENT)  # the write a credential change makes
+        entry = store.entries(IDENT)["1"]
+        # premise: no reading, no plan, nothing holding it back
+        assert (entry.fetched_at, entry.last_good, entry.next_poll_at) == (None, None, None)
+        assert (entry.backoff_until, entry.auth_dead_strikes) == (None, 0)
+
+    def test_the_display_pass_wins_it_at_once(self, store):
+        # The exact call the menu bar's display refresh and `cswap list` make.
+        self._reset_row(store)
+        assert set(
+            store.reserve(["1"], IDENT, respect_plans=True, repair_overslept=True)
+        ) == {"1"}
+
+    @pytest.mark.parametrize("repair_overslept", [True, False])
+    def test_the_scheduler_wins_it_at_once(self, store, repair_overslept):
+        # The auto engine's baseline nomination (scheduled) and escalation.
+        self._reset_row(store)
+        assert set(
+            store.reserve(
+                ["1"], IDENT, respect_plans=False, repair_overslept=repair_overslept
+            )
+        ) == {"1"}
+
+    def test_due_candidate_nominates_it_first(self, store, clock):
+        # Slot 2 is measured and poll-due; the slot with no reading still
+        # goes first, so the engine's one alternate poll spends itself here.
+        store.record({"2": FetchRecord(usage=USAGE)}, IDENT)
+        clock.advance(poll_policy.EXHAUSTED_INTERVAL_S * 2)
+        self._reset_row(store)
+        assert due_candidate(["2", "1"], store.entries(IDENT), clock.now) == "1"
+
+    def test_it_still_waits_out_a_failure_backoff(self, store, clock):
+        self._reset_row(store)
+        claims = store.reserve(["1"], IDENT, respect_plans=True, repair_overslept=True)
+        store.record({"1": FetchRecord(error="timeout")}, IDENT, claims)
+        assert store.reserve(["1"], IDENT, respect_plans=True, repair_overslept=True) == {}
+        assert due_candidate(["1"], store.entries(IDENT), clock.now) is None
+        clock.advance(BACKOFF_BASE_S + 1)
+        assert set(
+            store.reserve(["1"], IDENT, respect_plans=True, repair_overslept=True)
+        ) == {"1"}
+
+    def test_it_is_still_quarantined_by_a_dead_grant(self, store, clock):
+        self._reset_row(store)
+        claims = store.reserve(["1"], IDENT, respect_plans=True, repair_overslept=True)
+        store.record({"1": FetchRecord(error="invalid_grant")}, IDENT, claims)
+        clock.advance(TRUST_MAX_AGE_S)  # any backoff long gone
+        assert store.reserve(["1"], IDENT, respect_plans=True, repair_overslept=True) == {}
+
+
+class TestReserveFresh:
+    """``cswap list --fresh``: re-measure now, past the serve TTL and the poll
+    plan, but never past the guards that protect the account or the request
+    budget. A quarantined token, a failure backoff, and another collector's
+    live claim still refuse the slot; a token that 429'd recently follows the
+    normal rule, so the post-429 cadence floor is not re-spent."""
+
+    def _reserve(self, store, *, fresh: bool):
+        # The exact call the list path makes (respect_plans + overslept repair).
+        return store.reserve(
+            ["1"], IDENT, respect_plans=True, repair_overslept=True, fresh=fresh
+        )
+
+    @staticmethod
+    def _poll(store, clock, interval=600.0, floor=False):
+        """A successful poll as the collector records it: always with a plan,
+        and with the floor field (the plan's end when the planner applied
+        the post-429 floor, null otherwise). Returns the plan's end."""
+        end = clock.now + interval
+        store.record(
+            {"1": FetchRecord(usage=USAGE)},
+            IDENT,
+            plans={"1": (end, interval)},
+            post_429_floors={"1"} if floor else (),
+        )
+        return end
+
+    @staticmethod
+    def _as_written_before_floors(store):
+        """Strip the floor field: the row exactly as the previous version,
+        which planned identically but never recorded floors, left it."""
+        table = json.loads(store.path.read_text())
+        del table["accounts"]["1"]["post429FloorUntil"]
+        store.path.write_text(json.dumps(table))
+
+    @staticmethod
+    def _raw_row(store):
+        return json.loads(store.path.read_text())["accounts"]["1"]
+
+    def test_fresh_wins_inside_the_serve_ttl(self, store, clock):
+        self._poll(store, clock)
+        clock.advance(SERVE_TTL_S / 2)
+        assert self._reserve(store, fresh=False) == {}
+        assert set(self._reserve(store, fresh=True)) == {"1"}
+
+    def test_fresh_wins_ahead_of_a_future_poll_plan(self, store, clock):
+        self._poll(store, clock, interval=poll_policy.CANDIDATE_MAX_INTERVAL_S)
+        clock.advance(SERVE_TTL_S + 1)  # stale, but the plan is not due
+        assert self._reserve(store, fresh=False) == {}
+        assert set(self._reserve(store, fresh=True)) == {"1"}
+
+    def test_fresh_stamps_a_claim_like_any_reservation(self, store, clock):
+        # The lease is what keeps a concurrent collector (the daemon, a second
+        # --fresh) off the slot while this fetch is in flight.
+        self._poll(store, clock)
+        assert set(self._reserve(store, fresh=True)) == {"1"}
+        assert self._reserve(store, fresh=True) == {}
+        assert store.reserve(["1"], IDENT, respect_plans=False) == {}
+
+    # The guard tests below start from a row this version has polled (floor
+    # field present and null) and keep it free of any recent 429, so the
+    # fresh bypass WOULD fire if it were reached. A row recorded into an
+    # empty store has no floor field, falls to the plain rules, and cannot
+    # tell whether a guard sits above or below the bypass.
+
+    def _assert_bypass_reachable(self, store, clock):
+        row = self._raw_row(store)
+        assert "post429FloorUntil" in row and row["post429FloorUntil"] is None
+        assert not store.entries(IDENT)["1"].recent_429(clock.now)
+
+    @pytest.mark.parametrize("error", sorted(usage_store.PERMANENT_AUTH_ERRORS))
+    def test_fresh_never_wins_a_dead_token(self, store, clock, error):
+        self._poll(store, clock)
+        store.record({"1": FetchRecord(error=error)}, IDENT)
+        clock.advance(TRUST_MAX_AGE_S)  # backoff long gone; quarantine stays
+        self._assert_bypass_reachable(store, clock)
+        assert self._reserve(store, fresh=True) == {}
+
+    def test_fresh_waits_out_a_429_backoff(self, store, clock):
+        # A live 429 is also recent, so here the bypass is unreachable either
+        # way; the backoff guard's place is pinned by the timeout test below.
+        self._poll(store, clock)
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, IDENT
+        )
+        clock.advance(3600.0)  # the server's deadline; the margin still holds
+        assert self._reserve(store, fresh=True) == {}
+
+    def test_fresh_waits_out_a_saturated_edge_429(self, store, clock):
+        self._poll(store, clock)
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=0.0)}, IDENT
+        )
+        clock.advance(usage_store.EDGE_BACKOFF_S - 1)
+        assert self._reserve(store, fresh=True) == {}
+
+    def test_fresh_waits_out_any_failure_backoff(self, store, clock):
+        self._poll(store, clock)
+        store.record({"1": FetchRecord(error="timeout")}, IDENT)
+        clock.advance(BACKOFF_BASE_S - 1)
+        self._assert_bypass_reachable(store, clock)
+        assert self._reserve(store, fresh=True) == {}
+        clock.advance(2)  # the backoff lifts; still inside the serve TTL
+        assert set(self._reserve(store, fresh=True)) == {"1"}
+
+    def test_fresh_skips_a_live_claim_until_it_ages_out(self, store, clock):
+        self._poll(store, clock)
+        assert set(self._reserve(store, fresh=True)) == {"1"}  # another --fresh
+        clock.advance(CLAIM_TTL_S - 1)
+        self._assert_bypass_reachable(store, clock)
+        assert self._reserve(store, fresh=True) == {}
+        clock.advance(2)  # a crashed claimer's lease has aged out
+        assert set(self._reserve(store, fresh=True)) == {"1"}
+
+    def _recovered_from_429(self, store, clock):
+        """A Retry-After: 0 block that lifted, then its first success, planned
+        on the post-429 floor (what the collector writes in that case)."""
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=0.0)}, IDENT
+        )
+        clock.advance(store.entries(IDENT)["1"].backoff_until - clock.now)
+        self._poll(
+            store, clock, interval=poll_policy.POST_429_MIN_INTERVAL_S, floor=True
+        )
+
+    def test_fresh_keeps_the_post_429_cadence(self, store, clock):
+        self._recovered_from_429(store, clock)
+        assert store.entries(IDENT)["1"].recent_429(clock.now)  # premise
+        clock.advance(1)  # inside the serve TTL
+        assert self._reserve(store, fresh=True) == {}
+        clock.advance(SERVE_TTL_S)  # stale, the post-429 plan not yet due
+        assert self._reserve(store, fresh=True) == {}
+        clock.advance(poll_policy.POST_429_MIN_INTERVAL_S)  # plan due
+        assert set(self._reserve(store, fresh=True)) == {"1"}
+
+    def test_recency_alone_holds_fresh_when_no_floor_is_pending(
+        self, store, clock
+    ):
+        # The last poll was planned without a floor (field null), then a 429
+        # landed on a later fetch. Once its backoff lifts only recency stands
+        # between --fresh and a budget that just saturated.
+        plan_end = self._poll(store, clock)
+        clock.advance(10)
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=0.0)}, IDENT
+        )
+        clock.advance(store.entries(IDENT)["1"].backoff_until - clock.now)
+        assert self._raw_row(store)["post429FloorUntil"] is None  # premise
+        assert store.entries(IDENT)["1"].recent_429(clock.now)  # premise
+        assert self._reserve(store, fresh=False) == {}  # plan still pending
+        assert self._reserve(store, fresh=True) == {}
+        clock.advance(plan_end - clock.now)  # the plan comes due
+        assert set(self._reserve(store, fresh=True)) == {"1"}
+
+    def test_fresh_resumes_once_the_429_is_no_longer_recent(self, store, clock):
+        self._recovered_from_429(store, clock)
+        clock.advance(usage_store.RECENT_429_WINDOW_S)
+        self._poll(store, clock)
+        assert not store.entries(IDENT)["1"].recent_429(clock.now)  # premise
+        assert self._reserve(store, fresh=False) == {}
+        assert set(self._reserve(store, fresh=True)) == {"1"}
+
+    def test_fresh_reads_recency_like_the_planner(self, store, clock):
+        # The locked predicate and UsageEntry.recent_429 are one rule: an old
+        # 429 whose only live backoff is an unrelated timeout's is NOT recent,
+        # so the timeout's lifted backoff must not hold --fresh to the plan.
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=0.0)}, IDENT
+        )
+        clock.advance(400)
+        self._poll(store, clock, interval=1e6)
+        clock.advance(usage_store.RECENT_429_WINDOW_S + 5000)
+        store.record({"1": FetchRecord(error="timeout")}, IDENT)
+        entry = store.entries(IDENT)["1"]
+        clock.advance(entry.backoff_until - clock.now)  # the timeout just lifted
+        entry = store.entries(IDENT)["1"]
+        # Premises: the timeout's backoff is the live one, the planner reads
+        # no recent 429, and the plain rule refuses (the plan is not due).
+        assert entry.last_error == "timeout" and entry.backoff_until == clock.now
+        assert not entry.recent_429(clock.now)
+        assert self._reserve(store, fresh=False) == {}
+        assert set(self._reserve(store, fresh=True)) == {"1"}
+
+    def _recovered_from_an_hour_block(self, store, clock):
+        """A Retry-After: 3600 block, then its first success, planned on the
+        post-429 floor. The block outlasts the 429's own recency window and
+        the success clears lastError/backoffUntil, so only the floor plan is
+        left protecting the budget. Returns the floor's end."""
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, IDENT
+        )
+        clock.advance(store.entries(IDENT)["1"].backoff_until - clock.now)
+        floor_end = self._poll(
+            store, clock, interval=poll_policy.POST_429_MIN_INTERVAL_S, floor=True
+        )
+        # Premise: recency alone no longer protects this row.
+        assert not store.entries(IDENT)["1"].recent_429(clock.now)
+        return floor_end
+
+    def test_fresh_honours_the_post_429_floor_after_an_hour_block(
+        self, store, clock
+    ):
+        floor_end = self._recovered_from_an_hour_block(store, clock)
+        clock.advance(1)
+        assert self._reserve(store, fresh=True) == {}
+        clock.advance(SERVE_TTL_S)  # stale, the floor still pending
+        assert self._reserve(store, fresh=True) == {}
+        clock.advance(floor_end - clock.now)  # the floor ends
+        assert set(self._reserve(store, fresh=True)) == {"1"}
+
+    def test_a_non_floor_plan_ends_the_floor_early(self, store, clock):
+        # A success planned without the floor (an escalation fetch once the
+        # 429 is no longer recent) replaces the protective plan, so --fresh
+        # is free again even though the old floor's end is still ahead.
+        floor_end = self._recovered_from_an_hour_block(store, clock)
+        clock.advance(SERVE_TTL_S + 1)
+        self._poll(store, clock)
+        clock.advance(1)
+        assert clock.now < floor_end  # premise: the old floor would still hold
+        assert self._reserve(store, fresh=False) == {}
+        assert set(self._reserve(store, fresh=True)) == {"1"}
+
+    def test_a_plan_free_success_keeps_the_floor(self, store, clock):
+        # A success that installs no plan leaves the floor plan in force.
+        self._recovered_from_an_hour_block(store, clock)
+        clock.advance(1)
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        clock.advance(1)
+        assert self._reserve(store, fresh=True) == {}
+
+    def test_a_row_planned_before_floors_were_recorded_keeps_the_plain_rules(
+        self, store, clock
+    ):
+        # The previous version recovered from an hour block and installed the
+        # floor plan, but recorded no floor field. Whether the pending plan
+        # is protective is unknown, so --fresh must treat it as plain list.
+        floor_end = self._recovered_from_an_hour_block(store, clock)
+        self._as_written_before_floors(store)
+        assert "post429FloorUntil" not in self._raw_row(store)  # premise
+        clock.advance(1)
+        assert self._reserve(store, fresh=True) == {}
+        clock.advance(SERVE_TTL_S)  # stale, the old plan still pending
+        assert self._reserve(store, fresh=False) == {}
+        assert self._reserve(store, fresh=True) == {}
+        clock.advance(floor_end - clock.now)  # plain rules: the plan is due
+        assert set(self._reserve(store, fresh=True)) == {"1"}
+
+    def test_one_poll_by_this_version_settles_an_old_row(self, store, clock):
+        # The first success under this version writes the field (null: no
+        # floor), and from then on --fresh re-measures inside the serve TTL.
+        floor_end = self._recovered_from_an_hour_block(store, clock)
+        self._as_written_before_floors(store)
+        clock.advance(floor_end - clock.now)
+        self._poll(store, clock)
+        assert self._raw_row(store)["post429FloorUntil"] is None  # premise
+        clock.advance(1)
+        assert self._reserve(store, fresh=False) == {}
+        assert set(self._reserve(store, fresh=True)) == {"1"}
+
+    def test_a_plan_free_success_leaves_an_old_row_unknown(self, store, clock):
+        # A success that installs no plan says nothing about the stored plan,
+        # so it must not mark an old row's plan as floor-free.
+        self._recovered_from_an_hour_block(store, clock)
+        self._as_written_before_floors(store)
+        clock.advance(1)
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        assert "post429FloorUntil" not in self._raw_row(store)
+        clock.advance(1)
+        assert self._reserve(store, fresh=True) == {}
+
+    def test_an_unreadable_floor_field_is_as_unknown_as_a_missing_one(
+        self, store, clock
+    ):
+        self._poll(store, clock)
+        table = json.loads(store.path.read_text())
+        table["accounts"]["1"]["post429FloorUntil"] = "garbled"
+        store.path.write_text(json.dumps(table))
+        clock.advance(1)
+        assert self._reserve(store, fresh=True) == {}
+
+    def test_fresh_defaults_off(self, store, clock):
+        # Every existing caller omits the keyword: the default must be the
+        # plain serve rule, never the bypass.
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        assert store.reserve(["1"], IDENT, respect_plans=True) == {}
+        assert store.reserve(
+            ["1"], IDENT, respect_plans=True, repair_overslept=True
+        ) == {}
 
 
 class TestLast429Marker:
@@ -1696,3 +2071,781 @@ class TestStruckFingerprintHygiene:
         )
         store.clear_dead_token(["1"], ident)
         assert store.entries(ident)["1"].struck_fingerprint is None
+
+
+# ---- limit resets beside the windows -------------------------------------------------
+
+def _cedar_with(left=1, ends_at="2099-01-01T00:00:00+00:00", **grant):
+    g = {"label": "Free limit reset", "resets_total": max(left, 1), "resets_left": left,
+         "ends_at": ends_at, "paused": False, "usable_now": True}
+    g.update(grant)
+    return {"eligible": True, "ineligible_reason": None, "grants": [g]}
+
+
+NO_GRANT = {"eligible": False, "ineligible_reason": "no_grant", "grants": []}
+
+
+# Each test slot's stored account uuid: the key its resets pacing lives under.
+UUIDS = {"1": "acct-1", "2": "acct-2"}
+
+
+def _attested(cedar):
+    """An answered read the server attested (the profile probe named an account)."""
+    return oauth.LimitResetsRead(cedar, "acct-1", "")
+
+
+def _stamps(store) -> dict:
+    """The per-account resets try stamps (times), as stored in their own file."""
+    return store.attempts.read()
+
+
+def _stamp_of(store, num="1"):
+    return _stamps(store).get(UUIDS[num])
+
+
+def _resets_pass(store, num, read, usage=USAGE, every=3600.0):
+    """One fetch of ``num`` as the collector makes it: the usage lease, the
+    resets read reserved (and so stamped) right before it is sent, then the
+    record of what it answered."""
+    claim = store.claim([num], IDENT)[num]
+    assert store.reserve_limit_resets(num, IDENT[num], claim, every, account_uuid=UUIDS[num])
+    store.record({num: FetchRecord(usage=usage, limit_resets=read)}, IDENT, claims={num: claim})
+
+
+class TestLimitResetsRecord:
+    """``record`` keeps the resets entry under ``lastGood`` with its own time."""
+
+    def _row(self, store, num="1"):
+        return json.loads(store.path.read_text(encoding="utf-8"))["accounts"][num]
+
+    def test_a_read_with_a_grant_is_stored_beside_the_windows(self, store, clock):
+        _resets_pass(store, "1", _attested(_cedar_with()))
+        row = self._row(store)
+        entry = row["lastGood"]["limit_resets"]
+        assert entry["grants"][0]["left"] == 1 and entry["fetched_at"] == clock.now
+        assert (entry["account_uuid"], entry["org_uuid"]) == ("acct-1", "")  # the attested ids
+        assert {k: v for k, v in row["lastGood"].items() if k != "limit_resets"} == USAGE
+        assert _stamp_of(store) == clock.now
+        assert store.entries(IDENT)["1"].last_good["limit_resets"] == entry
+
+    def test_later_usage_reads_without_a_resets_read_carry_the_entry(self, store, clock):
+        _resets_pass(store, "1", _attested(_cedar_with()))
+        first = self._row(store)["lastGood"]["limit_resets"]
+        clock.advance(400)
+        newer = {"five_hour": {"pct": 30.0}, "seven_day": {"pct": 11.0}}
+        store.record({"1": FetchRecord(usage=newer)}, IDENT)
+        row = self._row(store)
+        assert row["lastGood"]["five_hour"]["pct"] == 30.0  # the windows moved on
+        assert row["lastGood"]["limit_resets"] == first  # the entry, and its own time, did not
+        assert _stamp_of(store) == clock.now - 400
+
+    def test_an_adopted_reading_carries_the_entry_like_a_local_read(self, store, clock):
+        # import-usage hands over another machine's windows, never a resets
+        # entry (list --json does not export one): the slot's own entry and
+        # its time stay, as they do across a local usage read.
+        _resets_pass(store, "1", _attested(_cedar_with()))
+        first = self._row(store)["lastGood"]["limit_resets"]
+        clock.advance(400)
+        newer = {"five_hour": {"pct": 30.0}, "seven_day": {"pct": 11.0}}
+        assert store.adopt({"1": (newer, 0.0)}, IDENT) == {"1"}
+        row = self._row(store)
+        assert row["lastGood"]["five_hour"]["pct"] == 30.0  # the adopted windows landed
+        assert row["lastGood"]["limit_resets"] == first
+        assert {k: v for k, v in row["lastGood"].items() if k != "limit_resets"} == newer
+
+    def test_an_adopted_reading_for_another_account_inherits_no_entry(self, store, clock):
+        _resets_pass(store, "1", _attested(_cedar_with()))
+        clock.advance(400)
+        other = {"1": ("someone-else@x.com", "")}
+        store.adopt({"1": (USAGE, 0.0)}, other)
+        assert "limit_resets" not in self._row(store)["lastGood"]
+
+    def test_a_failed_resets_read_keeps_the_old_entry_and_notes_the_try(self, store, clock):
+        _resets_pass(store, "1", _attested(_cedar_with()))
+        first = self._row(store)["lastGood"]["limit_resets"]
+        clock.advance(4000)
+        _resets_pass(store, "1", oauth.LimitResetsRead(None))
+        row = self._row(store)
+        assert row["lastGood"]["limit_resets"] == first
+        assert _stamp_of(store) == clock.now  # paced from the try, not the success
+        entry = store.entries(IDENT)["1"]
+        assert entry.consecutive_failures == 0 and entry.last_error is None  # the usage read stands
+
+    def test_a_no_grant_answer_removes_the_entry(self, store, clock):
+        _resets_pass(store, "1", _attested(_cedar_with()))
+        clock.advance(4000)
+        _resets_pass(store, "1", _attested(NO_GRANT))
+        row = self._row(store)
+        assert "limit_resets" not in row["lastGood"]
+        assert row["lastGood"] == USAGE
+        assert _stamp_of(store) == clock.now
+
+    def test_a_no_grant_account_keeps_a_plain_last_good(self, store, clock):
+        _resets_pass(store, "1", _attested(NO_GRANT))
+        row = self._row(store)
+        assert row["lastGood"] == USAGE  # no key at all for the three accounts without a grant
+        assert _stamp_of(store) == clock.now
+
+    def test_the_entry_survives_a_usage_429_like_the_windows(self, store, clock):
+        _resets_pass(store, "1", _attested(_cedar_with()))
+        before, stamp = self._row(store), _stamp_of(store)
+        clock.advance(120)
+        store.record({"1": FetchRecord(error="http-429", retry_after_s=30.0)}, IDENT)
+        after = self._row(store)
+        assert after["lastGood"] == before["lastGood"]
+        assert _stamp_of(store) == stamp
+        assert after["lastError"] == "http-429"
+
+    def test_a_success_without_windows_drops_the_entry_with_last_good(self, store, clock):
+        _resets_pass(store, "1", _attested(_cedar_with()))
+        store.record({"1": FetchRecord(usage=None)}, IDENT)
+        assert self._row(store)["lastGood"] is None  # never a dict of resets alone
+
+    def test_a_new_account_in_the_slot_inherits_nothing(self, store, clock):
+        _resets_pass(store, "1", _attested(_cedar_with()))
+        other = {"1": ("someone@else.com", "")}
+        store.record({"1": FetchRecord(usage=USAGE)}, other)
+        row = self._row(store)
+        assert row["email"] == "someone@else.com"
+        assert "limit_resets" not in row["lastGood"]
+        # The try stamp is the previous account's, kept under its uuid; the
+        # new account's interval starts with its own first read.
+        assert set(_stamps(store)) == {"acct-1"}
+
+    def test_the_entry_is_parsed_with_the_store_clock(self, store, clock):
+        # The fake clock stands at 1_000_000 s. A grant ending a second later
+        # is live by it (and long over by the wall clock); one that ended a
+        # second earlier is not.
+        live = _cedar_with(ends_at="1970-01-12T13:46:41+00:00")  # 1_000_001 s
+        _resets_pass(store, "1", _attested(live))
+        assert self._row(store)["lastGood"]["limit_resets"]["grants"][0]["left"] == 1
+        ended = _cedar_with(ends_at="1970-01-12T13:46:39+00:00")  # 999_999 s
+        _resets_pass(store, "2", _attested(ended))
+        assert "limit_resets" not in self._row(store, "2")["lastGood"]
+
+
+class TestLimitResetsDue:
+    """Which claimed slots get the rare resets read this pass."""
+
+    def _seed(self, store, read=None, num="1"):
+        if read is None:
+            store.record({num: FetchRecord(usage=USAGE)}, IDENT)
+        else:
+            _resets_pass(store, num, read)
+
+    def test_a_slot_never_read_is_due(self, store):
+        assert store.limit_resets_due({"1": "acct-1", "2": "acct-2"}, usage_store.LIMIT_RESETS_EVERY_S) == {"1", "2"}
+        self._seed(store)  # a usage read without a resets read
+        assert store.limit_resets_due({"1": "acct-1"}, usage_store.LIMIT_RESETS_EVERY_S) == {"1"}
+
+    def test_paced_hourly_from_the_last_try(self, store, clock):
+        self._seed(store, _attested(NO_GRANT))
+        every = usage_store.LIMIT_RESETS_EVERY_S
+        assert every == 3600.0
+        clock.advance(every - 1)
+        assert store.limit_resets_due({"1": "acct-1"}, every) == set()
+        clock.advance(1)
+        assert store.limit_resets_due({"1": "acct-1"}, every) == {"1"}
+
+    def test_a_failed_try_paces_like_a_success(self, store, clock):
+        self._seed(store, oauth.LimitResetsRead(None))
+        clock.advance(60)
+        assert store.limit_resets_due({"1": "acct-1"}, usage_store.LIMIT_RESETS_EVERY_S) == set()
+
+    def test_the_manual_pace_is_ten_minutes(self, store, clock):
+        self._seed(store, _attested(_cedar_with()))
+        manual = usage_store.LIMIT_RESETS_MANUAL_EVERY_S
+        assert manual == 600.0
+        clock.advance(manual - 1)
+        assert store.limit_resets_due({"1": "acct-1"}, manual) == set()
+        clock.advance(1)
+        assert store.limit_resets_due({"1": "acct-1"}, manual) == {"1"}
+        assert store.limit_resets_due({"1": "acct-1"}, usage_store.LIMIT_RESETS_EVERY_S) == set()
+
+    def test_the_entry_time_never_paces(self, store, clock):
+        # Only the reservation's own stamp paces: an entry, however recent,
+        # with no try stamp beside it is due.
+        self._seed(store, _attested(_cedar_with()))
+        store.attempts.path.write_text(json.dumps({"attempts": {}}), encoding="utf-8")
+        clock.advance(60)
+        assert store.limit_resets_due({"1": "acct-1"}, usage_store.LIMIT_RESETS_EVERY_S) == {"1"}
+
+    def test_future_entry_failed_refresh_is_paced_from_new_reservation(self, store, clock):
+        # The clock is put back two hours after a good read: the entry and the
+        # stamp are now dated ahead. The stamp is dropped (a wrong clock's), so
+        # the next fetch reserves a read; it fails and carries the entry, still
+        # dated ahead, forward. The fetches after it are paced from the new
+        # reservation, not kept due by the entry's time.
+        every = usage_store.LIMIT_RESETS_EVERY_S
+        self._seed(store, _attested(_cedar_with()))
+        clock.advance(-7200)
+        assert store.limit_resets_due({"1": "acct-1"}, every) == {"1"}
+        _resets_pass(store, "1", oauth.LimitResetsRead(None))
+        row = json.loads(store.path.read_text())["accounts"]["1"]
+        assert row["lastGood"]["limit_resets"]["fetched_at"] > clock.now + 7000  # still ahead
+        for _ in range(3):
+            clock.advance(60)
+            claim = store.claim(["1"], IDENT)["1"]
+            assert store.limit_resets_due({"1": "acct-1"}, every) == set()
+            assert store.reserve_limit_resets("1", IDENT["1"], claim, every, account_uuid=UUIDS["1"]) is None
+        clock.advance(every)
+        assert store.limit_resets_due({"1": "acct-1"}, every) == {"1"}
+
+    def test_a_stamp_a_little_ahead_counts_as_just_made(self, store, clock):
+        # Within the slack the other clocks allow (codex_usage.dated_ahead),
+        # a stamp ahead of the clock is a try just made, not a wrong clock's.
+        self._seed(store, _attested(NO_GRANT))
+        clock.advance(-200)
+        assert store.limit_resets_due({"1": "acct-1"}, usage_store.LIMIT_RESETS_EVERY_S) == set()
+
+    def test_a_stamp_dated_ahead_of_the_clock_is_due(self, store, clock):
+        self._seed(store, _attested(NO_GRANT))
+        clock.advance(-7200)  # the clock was put back two hours
+        assert store.limit_resets_due({"1": "acct-1"}, usage_store.LIMIT_RESETS_EVERY_S) == {"1"}
+
+    @pytest.mark.parametrize("stamp", ["soon", None, True, float("nan")])
+    def test_an_unreadable_stamp_is_due(self, store, clock, stamp):
+        self._seed(store)
+        store.attempts.path.parent.mkdir(parents=True, exist_ok=True)
+        store.attempts.path.write_text(json.dumps({"attempts": {"acct-1": stamp}}), encoding="utf-8")
+        assert store.limit_resets_due({"1": "acct-1"}, usage_store.LIMIT_RESETS_EVERY_S) == {"1"}
+
+    def test_failed_old_shape_migration_honors_resets_attempt_interval(self, store, clock):
+        # An entry in the older, summed shape (written before each grant was
+        # kept) is replaced at the next read, which waits out the interval
+        # from the last try like any other: a failing read that carries the
+        # old entry forward must not let every fetch try again.
+        self._seed(store, _attested(_cedar_with()))
+        table = json.loads(store.path.read_text(encoding="utf-8"))
+        table["accounts"]["1"]["lastGood"]["limit_resets"] = {
+            "left": 1, "total": 1, "ends_at": "2099-01-01T00:00:00+00:00", "fetched_at": clock.now,
+        }
+        store.path.write_text(json.dumps(table), encoding="utf-8")
+        every = usage_store.LIMIT_RESETS_EVERY_S
+        clock.advance(60)
+        assert store.limit_resets_due({"1": "acct-1"}, every) == set()
+        clock.advance(every)
+        _resets_pass(store, "1", oauth.LimitResetsRead(None))  # the migrating read fails
+        assert "grants" not in json.loads(store.path.read_text())["accounts"]["1"]["lastGood"]["limit_resets"]
+        for _ in range(3):  # the next fetches, a minute apart, under one lease
+            clock.advance(60)
+            claim = store.claim(["1"], IDENT)["1"]
+            assert store.limit_resets_due({"1": "acct-1"}, every) == set()
+            assert store.reserve_limit_resets("1", IDENT["1"], claim, every, account_uuid=UUIDS["1"]) is None
+        clock.advance(every)
+        assert store.limit_resets_due({"1": "acct-1"}, every) == {"1"}
+
+    def test_another_account_in_the_slot_has_its_own_interval(self, store, clock):
+        self._seed(store, _attested(NO_GRANT))
+        every = usage_store.LIMIT_RESETS_EVERY_S
+        assert store.limit_resets_due({"1": "acct-9"}, every) == {"1"}
+        # ... and the same account under a new slot identity keeps its own.
+        assert store.limit_resets_due({"1": "acct-1"}, every) == set()
+
+
+class TestLimitResetsReservation:
+    """The resets try is stamped under the lock right before the request is
+    sent, fenced by the usage lease, so a read that is made always paces the
+    next one: whatever happens to its record afterwards."""
+
+    EVERY = 3600.0
+
+    def _lease(self, store, num="1"):
+        return store.reserve([num], IDENT, respect_plans=False)[num]
+
+    def _stamp(self, store, num="1"):
+        return _stamp_of(store, num)
+
+    def test_a_reservation_stamps_the_try_before_any_request(self, store, clock):
+        claim = self._lease(store)
+        assert store.reserve_limit_resets("1", IDENT["1"], claim, self.EVERY, account_uuid=UUIDS["1"]) is not None
+        assert self._stamp(store) == clock.now
+        # The same pass asking again (a retry inside the fetch) is refused.
+        assert store.reserve_limit_resets("1", IDENT["1"], claim, self.EVERY, account_uuid=UUIDS["1"]) is None
+
+    def test_resets_attempt_survives_collector_loss_and_lease_expiry(self, store, clock):
+        # Collector A wins the usage lease and the resets reservation, sends
+        # the request, and is killed before it records anything.
+        claim_a = self._lease(store)
+        assert store.reserve_limit_resets("1", IDENT["1"], claim_a, self.EVERY, account_uuid=UUIDS["1"]) is not None
+        clock.advance(usage_store.CLAIM_TTL_S + 1)  # A's lease runs out
+        claim_b = self._lease(store)  # collector B takes the slot over
+        assert claim_b != claim_a
+        assert store.reserve_limit_resets("1", IDENT["1"], claim_b, self.EVERY, account_uuid=UUIDS["1"]) is None
+        clock.advance(self.EVERY)
+        claim_c = self._lease(store)
+        assert store.reserve_limit_resets("1", IDENT["1"], claim_c, self.EVERY, account_uuid=UUIDS["1"]) is not None
+
+    def test_no_reservation_without_the_usage_lease(self, store, clock):
+        claim = self._lease(store)
+        assert store.reserve_limit_resets("1", IDENT["1"], "someone-elses", self.EVERY, account_uuid=UUIDS["1"]) is None
+        assert store.reserve_limit_resets("1", ("other@x.com", ""), claim, self.EVERY, account_uuid=UUIDS["1"]) is None
+        assert store.reserve_limit_resets("2", IDENT["2"], claim, self.EVERY, account_uuid=UUIDS["2"]) is None  # no row, no lease
+        assert self._stamp(store) is None
+
+    def test_a_lock_that_cannot_be_had_refuses_the_read(self, store, clock, monkeypatch):
+        from claude_swap.exceptions import LockError
+
+        claim = self._lease(store)
+
+        def busy():
+            raise LockError("held")
+
+        monkeypatch.setattr(store, "_lock", busy)
+        assert store.reserve_limit_resets("1", IDENT["1"], claim, self.EVERY, account_uuid=UUIDS["1"]) is None
+
+    def test_recording_an_answer_no_account_was_named_for_does_not_stamp(self, store, clock):
+        # The record fills in the result; it stamps only an account the
+        # server named (see TestLimitResetsStampsPerAccount), never on its own.
+        store.record({"1": FetchRecord(usage=USAGE, limit_resets=oauth.LimitResetsRead(_cedar_with()))}, IDENT)
+        assert _stamps(store) == {}
+
+
+
+class TestUnattestedLimitResets:
+    def test_an_answer_no_account_was_attested_for_is_not_kept(self, store, clock):
+        # The profile probe failed (no account named): the answer is kept no
+        # more than a failed read, the previous entry stays and the try stands.
+        _resets_pass(store, "1", _attested(_cedar_with()))
+        before = json.loads(store.path.read_text())["accounts"]["1"]
+        clock.advance(4000)
+        _resets_pass(store, "1", oauth.LimitResetsRead(_cedar_with(left=5)))
+        after = json.loads(store.path.read_text())["accounts"]["1"]
+        assert after["lastGood"]["limit_resets"] == before["lastGood"]["limit_resets"]
+        assert _stamp_of(store) == clock.now
+        clock.advance(4000)
+        _resets_pass(store, "1", oauth.LimitResetsRead(NO_GRANT))  # nor an unattested "no grant"
+        assert json.loads(store.path.read_text())["accounts"]["1"]["lastGood"]["limit_resets"]
+
+
+
+class TestLimitResetsAttemptsFile:
+    """The try stamps live in their own file, keyed by account uuid: nothing
+    that rewrites usage.json can touch them, and nothing in them can break a
+    usage read."""
+
+    EVERY = 3600.0
+
+    def test_the_file_sits_beside_usage_json_with_its_own_lock(self, store, clock):
+        _resets_pass(store, "1", _attested(_cedar_with()))
+        assert store.attempts.path == store.path.parent / "limit_resets_attempts.json"
+        stored = json.loads(store.attempts.path.read_text())["attempts"]
+        assert list(stored) == ["acct-1"] and stored["acct-1"]["t"] == clock.now
+        assert re.fullmatch(r"[0-9a-f]{32}", stored["acct-1"]["id"])  # the reservation's own token
+        assert "limitResetsAttempts" not in json.loads(store.path.read_text())
+        assert all("limitResetsAttemptAt" not in row for row in json.loads(store.path.read_text())["accounts"].values())
+
+    def test_usage_json_rewrite_cannot_erase_resets_attempts(self, store, clock):
+        # A writer that knows only schemaVersion and accounts (an older build's
+        # store) rewrites usage.json in full.
+        _resets_pass(store, "1", _attested(_cedar_with()))
+        table = json.loads(store.path.read_text())
+        store.path.write_text(json.dumps({"schemaVersion": table["schemaVersion"], "accounts": table["accounts"]}))
+        clock.advance(1)
+        assert store.limit_resets_due({"1": "acct-1"}, self.EVERY) == set()
+        claim = store.claim(["1"], IDENT)["1"]
+        assert store.reserve_limit_resets("1", IDENT["1"], claim, self.EVERY, account_uuid="acct-1") is None
+
+    def test_renew_heal_preserves_resets_attempts(self, store, clock):
+        # cswap-renew's heal writes back a usage.json of schemaVersion and the
+        # accounts it healed, nothing else.
+        _resets_pass(store, "1", _attested(_cedar_with()))
+        healed = {"schemaVersion": 2, "accounts": {"1": {"email": "a@x.com", "organizationUuid": "",
+                                                         "authDeadStrikes": 0, "lastError": None}}}
+        store.path.write_text(json.dumps(healed, indent=2))
+        clock.advance(1)
+        assert _stamps(store) == {"acct-1": clock.now - 1}
+        assert store.limit_resets_due({"1": "acct-1"}, self.EVERY) == set()
+
+    def test_oversized_attempt_integer_does_not_break_usage_reads(self, store, clock):
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        huge = "1" + "0" * 400  # valid JSON, too large for a float
+        store.attempts.path.write_text(
+            '{"attempts": {"acct-1": %s, "acct-2": "junk", "": 5, "acct-3": %r, "acct-4": true}}'
+            % (huge, clock.now)
+        )
+        assert store.attempts.read() == {"acct-3": clock.now}  # the rest dropped, nothing raised
+        assert store.entries(IDENT)["1"].last_good == USAGE
+        store.claim(["2"], IDENT)
+        store.clear_dead_token(["1"], IDENT)
+        assert store.limit_resets_due({"1": "acct-1", "3": "acct-3"}, self.EVERY) == {"1"}
+
+    @pytest.mark.parametrize("text", ["", "{not json", "[]", '{"attempts": []}', '{"attempts": {"a": NaN}}'])
+    def test_an_unreadable_file_reads_as_no_stamps(self, store, clock, text):
+        store.attempts.path.parent.mkdir(parents=True, exist_ok=True)
+        store.attempts.path.write_text(text)
+        assert store.attempts.read() == {}
+        assert store.limit_resets_due({"1": "acct-1"}, self.EVERY) == {"1"}
+
+    def test_the_stamp_survives_the_rows_replacement(self, store, clock):
+        _resets_pass(store, "1", _attested(_cedar_with()))
+        moved = {"1": ("a@x.com", "org-new")}  # the slot's identity changes: the row is replaced
+        store.record({"1": FetchRecord(usage=USAGE)}, moved)
+        clock.advance(60)
+        assert store.limit_resets_due({"1": "acct-1"}, self.EVERY) == set()
+        claim = store.claim(["1"], moved)["1"]
+        assert store.reserve_limit_resets("1", moved["1"], claim, self.EVERY, account_uuid="acct-1") is None
+
+    def test_stamps_older_than_a_week_are_dropped_on_write(self, store, clock):
+        _resets_pass(store, "1", _attested(_cedar_with()))
+        clock.advance(usage_store.LIMIT_RESETS_ATTEMPTS_KEEP_S - 10)
+        _resets_pass(store, "2", oauth.LimitResetsRead(None))
+        assert set(_stamps(store)) == {"acct-1", "acct-2"}  # a week old: still kept
+        clock.advance(20)
+        assert store.attempts.reserve("acct-3", self.EVERY)
+        assert set(_stamps(store)) == {"acct-2", "acct-3"}
+
+    def test_a_lock_that_cannot_be_had_refuses_the_reservation(self, store, clock, monkeypatch):
+        from claude_swap.exceptions import LockError
+
+        class Busy:
+            def __init__(self, *_a, **_k):
+                pass
+
+            def __enter__(self):
+                raise LockError("held")
+
+            def __exit__(self, *_a):
+                return False
+
+        monkeypatch.setattr(usage_store, "FileLock", Busy)
+        assert store.attempts.reserve("acct-1", self.EVERY) is None
+        assert _stamps(store) == {}
+
+    def test_a_slot_without_a_stored_uuid_is_never_due(self, store, clock):
+        assert store.limit_resets_due({"1": ""}, self.EVERY) == set()
+        claim = store.claim(["1"], IDENT)["1"]
+        assert store.reserve_limit_resets("1", IDENT["1"], claim, self.EVERY, account_uuid="") is None
+
+
+class TestLimitResetsReservationTokens:
+    """Each stamp carries the token of the reservation that wrote it."""
+
+    EVERY = 3600.0
+
+    def test_a_reservation_owns_its_stamp_until_a_newer_one_takes_it(self, store, clock):
+        first = store.attempts.reserve("acct-1", self.EVERY)
+        assert first and store.attempts.holds("acct-1", first)
+        clock.advance(self.EVERY)
+        second = store.attempts.reserve("acct-1", self.EVERY)
+        assert second and second != first
+        assert not store.attempts.holds("acct-1", first)
+        assert store.attempts.holds("acct-1", second)
+        assert not store.attempts.holds("acct-1", None) and not store.attempts.holds("acct-9", second)
+
+    def test_a_bare_number_entry_paces_but_is_never_owned(self, store, clock):
+        store.attempts.path.parent.mkdir(parents=True, exist_ok=True)
+        store.attempts.path.write_text(json.dumps({"attempts": {"acct-1": clock.now}}))
+        assert store.attempts.read() == {"acct-1": clock.now}
+        assert store.attempts.reserve("acct-1", self.EVERY) is None  # still paced by it
+        assert not store.attempts.holds("acct-1", "anything")
+
+    def test_the_slot_gate_admits_its_own_account_only_while_it_holds_the_stamp(self, store, clock):
+        claim = store.claim(["1"], IDENT)["1"]
+        gate = usage_store.SlotResetsGate(store, "1", IDENT["1"], claim, self.EVERY, "acct-1")
+        assert not gate.admit("acct-1")  # nothing reserved yet
+        assert gate.reserve()
+        assert gate.admit("acct-1")
+        clock.advance(self.EVERY)
+        assert store.attempts.reserve("acct-1", self.EVERY)  # a newer collector's reservation
+        assert not gate.admit("acct-1")
+
+    def test_the_slot_gate_reserves_another_account_it_is_handed(self, store, clock):
+        claim = store.claim(["1"], IDENT)["1"]
+        gate = usage_store.SlotResetsGate(store, "1", IDENT["1"], claim, self.EVERY, "acct-1")
+        assert gate.reserve()
+        assert gate.admit("acct-x")  # due: reserved and stamped
+        assert "acct-x" in store.attempts.read()
+        other = usage_store.SlotResetsGate(store, "2", IDENT["2"], store.claim(["2"], IDENT)["2"], self.EVERY, "acct-2")
+        assert other.reserve()
+        assert not other.admit("acct-x")  # already read this interval
+
+
+class TestLimitResetsTrimRoster:
+    """The trim spares every account in the roster."""
+
+    EVERY = 3600.0
+    WEEK = usage_store.LIMIT_RESETS_ATTEMPTS_KEEP_S
+
+    def _store(self, tmp_path, clock, roster):
+        return UsageStore(tmp_path / "rostered", clock=clock, roster=roster)
+
+    def test_only_departed_accounts_older_than_a_week_are_dropped(self, tmp_path, clock):
+        store = self._store(tmp_path, clock, lambda: {"acct-1"})
+        assert store.attempts.reserve("acct-1", self.EVERY)  # in the roster
+        assert store.attempts.reserve("acct-old", self.EVERY)  # left, and will age out
+        clock.advance(self.WEEK - 60)
+        assert store.attempts.reserve("acct-new", self.EVERY)  # left recently
+        clock.advance(120)
+        assert store.attempts.reserve("acct-2", self.EVERY)  # a write, a week and a minute on
+        assert set(store.attempts.read()) == {"acct-1", "acct-new", "acct-2"}
+
+    @pytest.mark.parametrize("roster", [lambda: None, lambda: (_ for _ in ()).throw(OSError("torn"))],
+                             ids=["unreadable", "raises"])
+    def test_an_unreadable_roster_drops_nothing(self, tmp_path, clock, roster):
+        store = self._store(tmp_path, clock, roster)
+        assert store.attempts.reserve("acct-1", self.EVERY)
+        clock.advance(self.WEEK * 3)
+        assert store.attempts.reserve("acct-2", self.EVERY)
+        assert set(store.attempts.read()) == {"acct-1", "acct-2"}
+
+    def test_the_switcher_hands_its_roster_to_the_trim(self, temp_home, sample_sequence_data):
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        sample_sequence_data["accounts"]["2"]["uuid"] = ""  # a token-only slot has no uuid to keep
+        s._write_json(s.sequence_file, sample_sequence_data)
+        assert s._usage_store.attempts._roster_now() == {"uuid-1"}
+        s.sequence_file.write_text("{torn")
+        assert s._usage_store.attempts._roster_now() is None
+
+
+class TestLimitResetsAttemptsConcurrency:
+    def test_concurrent_attempts_writers_preserve_all_accounts(self, tmp_path):
+        import threading
+
+        store = UsageStore(tmp_path / "cache")  # the real clock and the real file
+        accounts = [f"acct-{i}" for i in range(12)]
+        start = threading.Barrier(len(accounts))
+        tokens = {}
+
+        def reserve(account):
+            start.wait()
+            tokens[account] = store.attempts.reserve(account, 3600.0)
+
+        threads = [threading.Thread(target=reserve, args=(a,)) for a in accounts]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        assert all(tokens[a] for a in accounts)  # every writer got its turn
+        assert set(store.attempts.read()) == set(accounts)  # and no write lost another's
+        assert all(store.attempts.holds(a, tokens[a]) for a in accounts)
+
+
+_RESERVE_IN_A_PROCESS = """
+import json, os, sys, time
+from pathlib import Path
+from claude_swap.usage_store import UsageStore
+cache, here, accounts = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3].split(",")
+store = UsageStore(cache)
+(here / f"ready-{os.getpid()}").write_text("")
+deadline = time.monotonic() + 20
+while not (here / "go").exists() and time.monotonic() < deadline:
+    time.sleep(0.001)
+print(json.dumps({a: store.attempts.reserve(a, 3600.0) for a in accounts}))
+"""
+
+
+class TestLimitResetsAttemptsAcrossReadersAndProcesses:
+    def test_holds_during_atomic_replace_sees_complete_entry(self, tmp_path):
+        import threading
+
+        store = UsageStore(tmp_path / "cache")  # the real clock and the real file
+        attempts = store.attempts
+        token = attempts.reserve("acct-1", 3600.0)
+        now = time.time()
+        # Two complete versions of a large file, both holding acct-1's
+        # reservation, written over each other as fast as they go.
+        small = {"acct-1": (now, token), **{f"acct-{i}": (now, f"{i:032x}") for i in range(2, 50)}}
+        large = {"acct-1": (now, token), **{f"acct-{i}": (now, f"{i:032x}") for i in range(2, 900)}}
+        attempts._write(small, time.time())  # the reader starts on one of the two
+        stop = threading.Event()
+
+        def writer():
+            while not stop.is_set():
+                attempts._write(large, time.time())
+                attempts._write(small, time.time())
+
+        thread = threading.Thread(target=writer)
+        thread.start()
+        holds, sizes = [], set()
+        try:
+            for _ in range(600):
+                holds.append(attempts.holds("acct-1", token))
+                sizes.add(len(attempts.read()))
+        finally:
+            stop.set()
+            thread.join(10)
+        assert all(holds)  # never a torn or empty file ...
+        assert sizes <= {len(small), len(large)}  # ... only the old version or the new one
+
+    def test_multiprocess_same_account_reservation_has_one_winner(self, tmp_path):
+        import subprocess
+        import sys
+
+        cache = tmp_path / "cache"
+        script = tmp_path / "reserve_in_a_process.py"
+        script.write_text(_RESERVE_IN_A_PROCESS)
+        accounts = [f"acct-{i}" for i in range(50)]
+        procs = [
+            subprocess.Popen(
+                [sys.executable, str(script), str(cache), str(tmp_path), ",".join(accounts)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            for _ in range(2)
+        ]
+        deadline = time.monotonic() + 30
+        while len(list(tmp_path.glob("ready-*"))) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        (tmp_path / "go").write_text("")  # both start reserving at once
+        results = []
+        for proc in procs:
+            out, err = proc.communicate(timeout=60)
+            assert proc.returncode == 0, err
+            results.append(json.loads(out))
+        stored = json.loads((cache / "limit_resets_attempts.json").read_text())["attempts"]
+        for account in accounts:
+            winners = [r[account] for r in results if r[account]]
+            assert len(winners) == 1, (account, results[0][account], results[1][account])
+            assert stored[account]["id"] == winners[0]  # the file holds the winner's token
+
+
+class TestAdopt:
+    """Readings another machine took for the same account (``import-usage``)."""
+
+    def test_reading_is_backdated_by_its_age(self, store, clock):
+        assert store.adopt({"1": (USAGE, 40.0)}, IDENT) == {"1"}
+        entry = store.entries(IDENT)["1"]
+        assert entry.last_good == USAGE
+        assert entry.fetched_at == clock.now - 40.0
+        assert entry.age_s == 40.0
+
+    def test_never_downgrades_a_newer_local_reading(self, store, clock):
+        local = {"five_hour": {"pct": 60.0}}
+        store.record({"1": FetchRecord(usage=local)}, IDENT)
+        clock.advance(10)
+        # Measured 30s ago elsewhere: older than this machine's own fetch.
+        assert store.adopt({"1": (USAGE, 30.0)}, IDENT) == set()
+        assert store.entries(IDENT)["1"].last_good == local
+
+    def test_fetch_state_is_left_alone(self, store, clock):
+        # Failures, backoff and the 429 marker describe this machine's own
+        # requests; a reading from elsewhere is no evidence about them.
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=0.0)}, IDENT
+        )
+        before = store.entries(IDENT)["1"]
+        store.adopt({"1": (USAGE, 0.0)}, IDENT)
+        after = store.entries(IDENT)["1"]
+        assert after.last_good == USAGE
+        assert after.consecutive_failures == before.consecutive_failures == 1
+        assert after.last_error == "http-429"
+        assert after.backoff_until == before.backoff_until
+        assert after.last_429_at == before.last_429_at
+
+    def test_hold_keeps_every_mode_off_until_it_lapses(self, store, clock):
+        store.adopt({"1": (USAGE, 0.0)}, IDENT, hold_s=600.0)
+        clock.advance(SERVE_TTL_S + 1)  # stale: every mode would fetch now
+        assert store.reserve(["1"], IDENT, respect_plans=True) == {}
+        assert store.reserve(["1"], IDENT, respect_plans=False) == {}
+        assert store.reserve(
+            ["1"], IDENT, respect_plans=False, repair_overslept=True
+        ) == {}
+        clock.advance(600.0)  # nobody renewed it
+        assert set(store.reserve(["1"], IDENT, respect_plans=True)) == {"1"}
+
+    def test_held_reading_stays_decision_trusted(self, store, clock):
+        store.adopt({"1": (USAGE, 0.0)}, IDENT, hold_s=900.0)
+        clock.advance(STALE_OK_S + 1)
+        entry = store.entries(IDENT)["1"]
+        assert entry.held(clock.now)
+        assert entry.decision_value() == USAGE
+        clock.advance(900.0)
+        assert store.entries(IDENT)["1"].decision_value() is None
+
+    def test_hold_never_outlives_the_trust_ceiling(self, store, clock):
+        # A reading already 3000s old may be trusted for 600s more, so a 3600s
+        # hold is cut to that: a slot never sits unfetched on data too old to
+        # act on.
+        store.adopt({"1": (USAGE, 3000.0)}, IDENT, hold_s=3600.0)
+        entry = store.entries(IDENT)["1"]
+        assert entry.held_until == pytest.approx(entry.fetched_at + TRUST_MAX_AGE_S)
+        clock.advance(TRUST_MAX_AGE_S - 3000.0)
+        assert set(store.reserve(["1"], IDENT, respect_plans=True)) == {"1"}
+
+    def test_latest_hold_wins(self, store, clock):
+        store.adopt({"1": (USAGE, 0.0)}, IDENT, hold_s=900.0)
+        store.adopt({"1": (USAGE, 0.0)}, IDENT, hold_s=60.0)
+        assert store.entries(IDENT)["1"].held_until == clock.now + 60.0
+
+    def _usage_resetting_in(self, clock, five_hour_s, scoped_s=None):
+        from datetime import datetime, timezone
+
+        def iso(ahead):
+            return (
+                datetime.fromtimestamp(clock.now + ahead, tz=timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+
+        usage = {
+            "five_hour": {"pct": 25.0, "resets_at": iso(five_hour_s)},
+            "seven_day": {"pct": 10.0, "resets_at": iso(86_400.0)},
+        }
+        if scoped_s is not None:
+            usage["scoped"] = [{"name": "Fable", "pct": 5.0, "resets_at": iso(scoped_s)}]
+        return usage
+
+    def test_hold_stops_at_the_readings_earliest_reset(self, store, clock):
+        # Once a window rolls over, the held reading no longer describes it:
+        # the hold must not keep this machine from reading the new window.
+        usage = self._usage_resetting_in(clock, 300.0)
+        store.adopt({"1": (usage, 0.0)}, IDENT, hold_s=900.0)
+        assert store.entries(IDENT)["1"].held_until == pytest.approx(clock.now + 300.0)
+        clock.advance(300.0)
+        assert set(store.reserve(["1"], IDENT, respect_plans=True)) == {"1"}
+
+    def test_a_scoped_windows_reset_caps_the_hold_too(self, store, clock):
+        # A scoped window counts whichever models this machine watches.
+        usage = self._usage_resetting_in(clock, 3000.0, scoped_s=120.0)
+        store.adopt({"1": (usage, 0.0)}, IDENT, hold_s=900.0)
+        assert store.entries(IDENT)["1"].held_until == pytest.approx(clock.now + 120.0)
+
+    def test_the_cap_comes_from_the_reading_kept(self, store, clock):
+        # This machine's own reading is newer, so it is the one kept, and its
+        # reset is the one the hold must not outrun.
+        store.record({"1": FetchRecord(usage=self._usage_resetting_in(clock, 120.0))}, IDENT)
+        imported = self._usage_resetting_in(clock, 3000.0)
+        assert store.adopt({"1": (imported, 30.0)}, IDENT, hold_s=900.0) == set()
+        assert store.entries(IDENT)["1"].held_until == pytest.approx(clock.now + 120.0)
+
+    def test_a_reading_from_before_a_reset_is_not_held(self, store, clock):
+        usage = self._usage_resetting_in(clock, -60.0)
+        assert store.adopt({"1": (usage, 600.0)}, IDENT, hold_s=900.0) == {"1"}
+        assert store.entries(IDENT)["1"].held_until is None
+
+    def test_zero_hold_lifts_an_existing_hold(self, store, clock):
+        store.adopt({"1": (USAGE, 0.0)}, IDENT, hold_s=900.0)
+        store.adopt({"1": (USAGE, 0.0)}, IDENT, hold_s=0.0)
+        assert store.entries(IDENT)["1"].held_until is None
+        clock.advance(SERVE_TTL_S + 1)
+        assert set(store.reserve(["1"], IDENT, respect_plans=True)) == {"1"}
+
+    def test_no_hold_leaves_an_existing_hold_alone(self, store, clock):
+        store.adopt({"1": (USAGE, 0.0)}, IDENT, hold_s=900.0)
+        store.adopt({"1": (USAGE, 0.0)}, IDENT)
+        assert store.entries(IDENT)["1"].held_until == clock.now + 900.0
+
+    def test_due_candidate_skips_a_held_slot(self, store, clock):
+        store.adopt({"1": (USAGE, 0.0), "2": (USAGE, 0.0)}, IDENT, hold_s=600.0)
+        plan = (clock.now + 60.0, 60.0)
+        store.set_poll_plan({"1": plan, "2": plan}, IDENT)
+        clock.advance(61)  # both plans due
+        assert due_candidate(["1", "2"], store.entries(IDENT), clock.now) is None
+
+    def test_a_claimed_fetch_still_records(self, store, clock):
+        # A local collector already won the fetch when the reading arrives:
+        # its lease is untouched, and its own newer result lands normally.
+        claims = store.reserve(["1"], IDENT, respect_plans=True)
+        store.adopt({"1": (USAGE, 5.0)}, IDENT, hold_s=600.0)
+        local = {"five_hour": {"pct": 61.0}}
+        assert store.record({"1": FetchRecord(usage=local)}, IDENT, claims) == {"1"}
+        assert store.entries(IDENT)["1"].last_good == local
+
+    def test_row_of_another_account_is_replaced(self, store):
+        store.record({"2": FetchRecord(usage=USAGE)}, {"2": ("old@x.com", "")})
+        store.adopt({"2": (USAGE, 0.0)}, IDENT)
+        row = json.loads(store.path.read_text(encoding="utf-8"))["accounts"]["2"]
+        assert (row["email"], row["organizationUuid"]) == IDENT["2"]

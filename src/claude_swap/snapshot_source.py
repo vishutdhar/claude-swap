@@ -18,7 +18,7 @@ from __future__ import annotations
 import threading
 from dataclasses import replace
 
-from claude_swap.json_output import USAGE_TOKEN_EXPIRED
+from claude_swap.json_output import DEAD_LOGIN_SENTINELS, USAGE_TOKEN_EXPIRED
 from claude_swap.models import AccountSnapshot, AccountsSnapshot
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import UsageEntry
@@ -27,10 +27,13 @@ from claude_swap.usage_store import UsageEntry
 class SnapshotSource:
     """Takes one coherent snapshot per call; the store paces the network.
 
-    ``full=True`` (the user's explicit refresh) is accepted for API
-    stability but is no faster than a normal pass: even an explicit refresh
-    is capped by the store's serve TTL and poll plans. ``store_only=True``
-    reads the store without any network eligibility.
+    ``full=True`` is accepted for API stability but is no faster than a
+    normal pass: it is capped by the store's serve TTL and poll plans.
+    ``fresh=True`` (the menu bar's Refresh now) re-measures every candidate
+    past the serve TTL and the poll plans, exactly as ``cswap list --fresh``
+    does; the store still refuses quarantined, backed-off, claimed and
+    recently-429'd slots. ``store_only=True`` reads the store without any
+    network eligibility.
     """
 
     def __init__(self, switcher: ClaudeAccountSwitcher) -> None:
@@ -39,11 +42,15 @@ class SnapshotSource:
         self._lock = threading.Lock()
 
     def take(
-        self, *, full: bool = False, store_only: bool = False
+        self, *, full: bool = False, store_only: bool = False, fresh: bool = False
     ) -> AccountsSnapshot:
         """Blocking snapshot pass; call from a thread worker."""
         fetch: set[str] | None = set() if store_only else None
-        snap = self.switcher.accounts_snapshot(fetch=fetch)
+        # `fresh` rides along only when asked for, as `cswap list --fresh`
+        # does, so every other take stays the call it always was.
+        snap = self.switcher.accounts_snapshot(
+            fetch=fetch, **({"fresh": True} if fresh else {})
+        )
         with self._lock:
             snap = self._reconcile(snap)
             self._last = snap
@@ -71,7 +78,25 @@ class SnapshotSource:
         prev_fetched = prev.usage.fetched_at
         fetched = acc.usage.fetched_at
         if prev_fetched is not None and (fetched is None or fetched < prev_fetched):
-            return replace(acc, usage=_with_current_age(prev.usage, taken_at))
+            # The read is behind the one already shown (a late worker, or a
+            # read with no reading at all): keep showing the newer reading.
+            carried = _with_current_age(prev.usage, taken_at)
+            if (
+                prev.usage.sentinel in DEAD_LOGIN_SENTINELS
+                and acc.usage.sentinel != prev.usage.sentinel
+            ):
+                # Except a dead login the current read no longer reports.
+                # Only a change of the slot's credential ends one, and a
+                # held verdict tells the user to log in again, so it is
+                # never carried. A read with an older reading of its own
+                # keeps the newer numbers under its own verdict. A read with
+                # no reading keeps nothing of the dead entry: the slot shows
+                # it has no reading yet, and such a row is due on the next
+                # pass.
+                if fetched is None:
+                    return acc
+                carried = replace(carried, sentinel=acc.usage.sentinel)
+            return replace(acc, usage=carried)
         if acc.usage.sentinel is not None:
             return acc
 

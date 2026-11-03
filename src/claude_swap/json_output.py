@@ -8,9 +8,11 @@ the single ``json.dumps`` (see cli.py).
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 
 from claude_swap import oauth, pace
+from claude_swap.models import AccountPolicy
 
 # Bump only on a breaking change to any payload shape. Scripts key off this.
 SCHEMA_VERSION = 1
@@ -40,6 +42,12 @@ USAGE_RELOGIN_REQUIRED = "re-login needed"
 # (stash the foreign credential, restore the slot's backup), so autoswitch
 # should treat the active as unknown-headroom and fail over.
 USAGE_FOREIGN_CREDENTIAL = "foreign credential"
+# A dead login: only the user can fix it (a re-login, ``cswap add``/import),
+# so it ends only when the slot's stored credential changes. The menu bar
+# marks these rows urgent, and a snapshot never carries one forward from an
+# earlier read (``snapshot_source``). Token expired retries on its own and a
+# foreign credential is repaired by a switch, so neither is here.
+DEAD_LOGIN_SENTINELS = frozenset({USAGE_RELOGIN_REQUIRED, USAGE_NO_CREDENTIALS})
 
 
 def _window_to_json(entry: dict) -> dict:
@@ -129,6 +137,80 @@ def usage_to_json(usage: dict, fetched_at: float | None = None) -> dict:
         out["spend"] = spend_out
     if "scoped" in usage:
         out["scoped"] = [_scoped_window_to_json(w, fetched_at) for w in usage["scoped"]]
+    return out
+
+
+def _is_number(value: object) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
+
+
+def _window_from_json(window: object, label: str) -> dict:
+    """One JSON window back to the internal shape, fetch-time strings rebuilt."""
+    if not isinstance(window, dict):
+        raise ValueError(f"{label} must be an object")
+    pct = window.get("pct")
+    if not _is_number(pct) or pct < 0:
+        raise ValueError(f"{label}.pct must be a non-negative number")
+    out: dict = {"pct": float(pct)}
+    resets_at = window.get("resetsAt")
+    if resets_at is not None:
+        if not isinstance(resets_at, str):
+            raise ValueError(f"{label}.resetsAt must be an ISO-8601 string")
+        try:
+            out["countdown"], out["clock"] = oauth.format_reset(resets_at)
+        except (ValueError, TypeError):
+            raise ValueError(f"{label}.resetsAt is not an ISO-8601 time: {resets_at!r}")
+        out["resets_at"] = resets_at
+    return out
+
+
+def usage_from_json(usage: object) -> dict:
+    """Read a ``usage`` object from ``list --json`` back into the internal dict.
+
+    The inverse of :func:`usage_to_json` for what the API measured: ``pct``,
+    ``resetsAt``, the spend amounts and the scoped model names. Everything
+    derived at serialization (countdown, clock, pace fields) is dropped, and
+    the fetch-time strings are rebuilt from ``resets_at``, which gives the
+    shape :func:`oauth.build_usage_result` stores. Raises ``ValueError`` on
+    anything malformed, so an importer can refuse a document before writing
+    any of it.
+    """
+    if not isinstance(usage, dict):
+        raise ValueError("usage must be an object")
+    out: dict = {}
+    if "fiveHour" in usage:
+        out["five_hour"] = _window_from_json(usage["fiveHour"], "fiveHour")
+    if "sevenDay" in usage:
+        out["seven_day"] = _window_from_json(usage["sevenDay"], "sevenDay")
+    if "spend" in usage:
+        spend = usage["spend"]
+        out_spend = _window_from_json(spend, "spend")
+        for key in ("used", "limit"):
+            if not _is_number(spend.get(key)):
+                raise ValueError(f"spend.{key} must be a number")
+            out_spend[key] = float(spend[key])
+        if not isinstance(spend.get("currency"), str):
+            raise ValueError("spend.currency must be a string")
+        out_spend["currency"] = spend["currency"]
+        out["spend"] = out_spend
+    if "scoped" in usage:
+        if not isinstance(usage["scoped"], list):
+            raise ValueError("scoped must be a list")
+        scoped = []
+        for i, window in enumerate(usage["scoped"]):
+            label = f"scoped[{i}]"
+            entry = _window_from_json(window, label)
+            name = window.get("name")
+            if not isinstance(name, str) or not name:
+                raise ValueError(f"{label}.name must be a non-empty string")
+            scoped.append({"name": name, **entry})
+        out["scoped"] = scoped
+    if not out:
+        raise ValueError("usage carries no windows")
     return out
 
 
@@ -242,6 +324,7 @@ def account_row(
     backoff_until: float | None = None,
     alias: str = "",
     disabled: bool = False,
+    policy: AccountPolicy = AccountPolicy(),
     login_expires_at: str | None = None,
 ) -> dict:
     """A full account row for ``--list``. ``backoff_until`` is the live
@@ -263,6 +346,11 @@ def account_row(
     # existing consumers keying on the base schema are unaffected.
     if disabled:
         row["disabled"] = True
+    # Same convention for the per-account policy: a slot on the global default
+    # emits neither key, so a fleet that never sets a policy produces rows
+    # byte-identical to those from before this feature existed.
+    if policy.threshold is not None:
+        row["threshold"] = policy.threshold
     # Additive field: when the stored login records the expiry of its refresh
     # token (see ``oauth.login_expires_at_iso``), scripts can warn ahead of the
     # ``relogin_required`` that follows; absent when the login carries none.

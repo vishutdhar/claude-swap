@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import atexit
+import gc
 import json
 import os
 import shutil
@@ -573,6 +575,46 @@ def block_real_oauth_profile_fetch(request, monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def block_real_limit_resets_read(request, monkeypatch):
+    """Safety net: no test may make a live limit-resets read or start ``claude``.
+
+    Every usage fetch that is due for its rare limit-resets read calls
+    ``oauth.request_limit_resets``, so any test driving the real fetch path
+    would open an HTTPS connection with Claude Code's User-Agent. It answers
+    None here (a failed read, which keeps whatever was stored). Tests of
+    the read itself opt out with ``@pytest.mark.no_limit_resets_fake`` and
+    mock ``urlopen`` beneath it. The version lookup's ``claude --version``
+    is never run by any test (the throwaway home has no versions folder,
+    so the lookup would reach the real binary on the PATH), and the
+    once-per-process User-Agent is forgotten so no test inherits another's.
+    """
+    monkeypatch.setattr("claude_swap.oauth._run_claude_version", lambda *a, **k: None)
+    monkeypatch.setattr("claude_swap.oauth._CLAUDE_CODE_UA", None)
+    if request.node.get_closest_marker("no_limit_resets_fake"):
+        yield
+        return
+    monkeypatch.setattr("claude_swap.oauth.request_limit_resets", lambda token: None)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _no_real_codex(monkeypatch):
+    """Safety net: no test may find or start the real ``codex`` CLI.
+
+    The menu bar looks for ``codex`` in Homebrew, /usr/local/bin and
+    ~/.local/bin (``codex_usage.default_codex_dirs``) and launches what it
+    finds as ``codex app-server``, which talks to the real Codex account
+    and leaves a folder in ~/.codex/.tmp each time. Every test gets an empty
+    search list, so an app built by a test finds no binary; a test that needs
+    one passes the fake server's path itself. ``~/.codex/sessions`` is the
+    throwaway home's (``_isolate_real_home``), and ``CODEX_HOME`` is cleared
+    so it cannot point anywhere else.
+    """
+    monkeypatch.setattr("claude_swap.codex_usage.default_codex_dirs", lambda: [])
+    monkeypatch.delenv("CODEX_HOME", raising=False)  # nor a developer's own Codex home
+
+
 @pytest.fixture
 def temp_home(tmp_path: Path):
     """Create a temporary home directory for testing."""
@@ -721,6 +763,13 @@ def _deterministic_poll_jitter(monkeypatch):
     """Zero the poll-plan jitter so cadence tests are clock-exact; the jitter
     itself is exercised in test_poll_policy via an injected rng."""
     monkeypatch.setattr("claude_swap.poll_policy.JITTER_FRAC", 0.0)
+
+
+@pytest.fixture(autouse=True)
+def _no_fsync(monkeypatch):
+    """Durability is not under test, and one real fsync per atomic write is
+    most of the suite's I/O. Tests that inject at fsync patch over this."""
+    monkeypatch.setattr(os, "fsync", lambda fd: None)
 
 
 @pytest.fixture(autouse=True)
@@ -878,3 +927,11 @@ def pytest_collection_modifyitems(items):
     for item in items:
         if item.get_closest_marker("no_keychain_fake"):
             item.add_marker(pytest.mark.xdist_group("real-keychain"))
+
+
+def pytest_configure():
+    # A disposable xdist worker skips the exit-time collection of the heap the
+    # session built. atexit runs after pytest's whole cleanup stack, the final
+    # unraisable-exception sweep included; the controller and -n 0 never freeze.
+    if os.environ.get("PYTEST_XDIST_WORKER"):
+        atexit.register(gc.freeze)
