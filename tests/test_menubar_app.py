@@ -623,6 +623,77 @@ def test_a_pause_draining_with_a_read_owed_reads_once(app, monkeypatch, owed):
     assert not app._refresh_again and not app._fresh_again
 
 
+def _refuse_thread_starts(monkeypatch, target_name, times=1):
+    """Make ``times`` starts of threads running ``target_name`` raise, as when
+    the process can start no more threads; every other thread starts."""
+    real = threading.Thread
+    left = {"n": times}
+
+    class Refusing(real):
+        def start(self):
+            target = getattr(self, "_target", None)
+            if getattr(target, "__name__", "") == target_name and left["n"] > 0:
+                left["n"] -= 1
+                raise RuntimeError("can't start new thread")
+            return super().start()
+
+    monkeypatch.setattr(threading, "Thread", Refusing)
+
+
+def test_a_pause_whose_worker_cannot_start_alerts_once_and_unwinds(app, monkeypatch):
+    alerts, calls = [], []
+    monkeypatch.setattr(rumps, "alert", lambda **kw: alerts.append(kw["message"]) or 1)
+    app.switcher.set_account_disabled = lambda num, disabled: calls.append((num, disabled))
+    _refuse_thread_starts(monkeypatch, "_rename_loop")
+    app._set_disabled("2", True)  # nothing escapes the click
+    assert (app._toggles_in_flight, app._rename_worker_running, app._rename_queue) == (0, False, [])
+    _settle(app)
+    assert alerts == ["Could not pause or resume the account: can't start new thread"]
+    assert calls == []
+    app._set_disabled("2", True)  # a later pause works
+    _settle(app)
+    assert calls == [("2", True)] and alerts == alerts[:1]
+    quits, quit_alerts, took = _quit(app, monkeypatch)
+    assert quits == [1] and quit_alerts == [] and took < 1.0  # nothing left to wait for
+
+
+def test_a_rename_whose_worker_cannot_start_alerts_once_and_unwinds(app, monkeypatch):
+    alerts = []
+    monkeypatch.setattr(rumps, "alert", lambda **kw: alerts.append(kw["message"]) or 1)
+    app.snapshot = _snap(_entry_alias("1", "a@x.com", None, active=True))
+    app.rebuild_menu()
+    _refuse_thread_starts(monkeypatch, "_rename_loop")
+    app._rename_account("1", "a@x.com", "home")
+    assert (app._renames_in_flight, app._rename_worker_running, app._rename_queue) == (0, False, [])
+    _settle(app)
+    assert alerts == ["Could not rename: can't start new thread"]
+    assert getattr(app.switcher, "renames", []) == []
+    items = _submenu(app, "Rename account").itemArray()
+    assert all(not i.title().endswith("(saving…)") for i in items)  # usable again
+    app._rename_account("1", "a@x.com", "home")  # a later rename works
+    _settle(app)
+    assert app.switcher.renames == [("set", "1", "home", "a@x.com", None)]
+    quits, quit_alerts, took = _quit(app, monkeypatch)
+    assert quits == [1] and quit_alerts == [] and took < 1.0
+
+
+def test_a_read_back_that_cannot_start_stays_owed(app, monkeypatch):
+    # The read owed after a change (here with a Refresh now's re-measure
+    # already owed) finds no thread: nothing is stuck and nothing is lost;
+    # the tick starts it once a thread can start.
+    monkeypatch.setattr(menubar, "_adapt_snapshot", lambda raw: raw)
+    source = _CountingSource(_snap(_entry("1", "a@x.com", active=True)))
+    app._snapshot_source = source
+    _refuse_thread_starts(monkeypatch, "_worker")
+    app._refresh_again, app._fresh_again = True, True
+    app._request_refresh()  # nothing escapes
+    assert not app._refreshing  # no reading is in flight, so none blocks the next
+    assert app._refresh_again and app._fresh_again  # the owed re-measure is still owed
+    _tick_until_idle(app)
+    assert [r.get("fresh") for r in source.reads] == [True]
+    assert not app._refresh_again and not app._fresh_again
+
+
 def test_quit_waits_for_a_pending_pause(app, monkeypatch):
     calls = []
 

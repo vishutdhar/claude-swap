@@ -1702,9 +1702,13 @@ def create_app(switcher, codex_monitor=None):
                 return  # in-flight guard: one worker at a time (SnapshotSource
                         # pacing state is only touched by this single worker)
             self._refreshing = True
-            threading.Thread(
-                target=self._worker, args=(full, self._snapshot_gen, fresh), daemon=True
-            ).start()
+            try:
+                threading.Thread(
+                    target=self._worker, args=(full, self._snapshot_gen, fresh), daemon=True
+                ).start()
+            except BaseException:
+                self._refreshing = False  # no worker started; do not block the next read
+                raise
 
         def _request_refresh(self):
             """Refresh now, or right after the refresh already running.
@@ -1721,7 +1725,25 @@ def create_app(switcher, codex_monitor=None):
             if self._refresh_again:
                 self._refresh_again = False
                 fresh, self._fresh_again = self._fresh_again, False
-            self.refresh_async(full=fresh, fresh=fresh)
+            self._start_owed_read(fresh)
+
+        def _start_owed_read(self, fresh):
+            """Start a read that is owed, already taken off the owed flags.
+
+            When no thread can start (the process is out of threads), the
+            read stays owed, with its re-measure, and the next sync tick
+            tries again: nothing in flight blocks it (``refresh_async``
+            clears its own flag) and nothing owed is lost. Returns whether
+            the read started.
+            """
+            try:
+                self.refresh_async(full=fresh, fresh=fresh)
+                return True
+            except Exception:
+                self.switcher._logger.debug("could not start a refresh; it stays owed", exc_info=True)
+                self._refresh_again = True
+                self._fresh_again = self._fresh_again or fresh
+                return False
 
         def _worker(self, full, generation=0, fresh=False):
             # Lock-free handoff: worker only rebinds plain attributes (atomic in
@@ -2036,7 +2058,7 @@ def create_app(switcher, codex_monitor=None):
             if self._refresh_again and not self._refreshing:
                 self._refresh_again = False
                 fresh, self._fresh_again = self._fresh_again, False
-                self.refresh_async(full=fresh, fresh=fresh)
+                self._start_owed_read(fresh)
             elif self._press_pending and not self._refreshing:
                 self._refresh_finished()  # its hop has not landed yet, or never will
             dashboard_error = self._dashboard.take_error()
@@ -2563,14 +2585,46 @@ def create_app(switcher, codex_monitor=None):
             The tick reports the outcome (``_drain_rename_outcomes``): a
             refresh on success, the store's message in an alert on failure.
             """
+            self._queue_store_job("toggle", (str(num), disabled))
+
+        def _queue_store_job(self, kind, job):
+            """Queue a ``"rename"`` or ``"toggle"`` job for the store worker,
+            starting the worker when none runs.
+
+            When no thread can start (the process is out of threads), the job
+            is taken back under the same lock, nothing is left counted as in
+            flight or the worker as running (or later jobs would wait forever
+            and Quit with them), and one failure outcome goes through the
+            usual drain, so the user sees one alert.
+            """
             with self._event_lock:
-                self._rename_queue.append(("toggle", (str(num), disabled)))
-                self._toggles_in_flight += 1
+                self._rename_queue.append((kind, job))
+                if kind == "toggle":
+                    self._toggles_in_flight += 1
+                else:
+                    self._renames_in_flight += 1
                 start = not self._rename_worker_running
                 if start:
                     self._rename_worker_running = True
-            if start:
+            if not start:
+                return
+            try:
                 threading.Thread(target=self._rename_loop, daemon=True).start()
+            except Exception as e:
+                self.switcher._logger.warning("could not start the store worker", exc_info=True)
+                reason = str(e) or type(e).__name__
+                with self._event_lock:
+                    # No worker ran since the queue was last empty, so this
+                    # job is the only one queued.
+                    self._rename_queue.remove((kind, job))
+                    self._rename_worker_running = False
+                    if kind == "toggle":
+                        self._toggles_in_flight -= 1
+                        failure = ("toggle_failed", f"Could not pause or resume the account: {reason}")
+                    else:
+                        self._renames_in_flight -= 1
+                        failure = ("failed", reason)  # shown as "Could not rename: ..."
+                    self._rename_outcomes.append(failure)
 
         def on_add_login(self, _sender):
             if self._guard(self.switcher.add_account):
@@ -2708,16 +2762,8 @@ def create_app(switcher, codex_monitor=None):
             account, not whatever now sits in slot ``num``. Outcomes are
             handled on the sync tick (``_drain_rename_outcomes``).
             """
-            job = (num, email, clean_alias_text(text), org)
-            with self._event_lock:
-                self._rename_queue.append(("rename", job))
-                self._renames_in_flight += 1
-                start = not self._rename_worker_running
-                if start:
-                    self._rename_worker_running = True
             self._dirty = True  # show the Rename submenu as saving
-            if start:
-                threading.Thread(target=self._rename_loop, daemon=True).start()
+            self._queue_store_job("rename", (num, email, clean_alias_text(text), org))
 
         def _rename_loop(self):
             while True:
