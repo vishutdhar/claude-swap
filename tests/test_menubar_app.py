@@ -3000,3 +3000,62 @@ def test_engine_gets_no_gate_without_a_label(rotation, monkeypatch):
     rotation(auto_switch_enabled=True)
     assert seen["gate"] is None  # the engine runs exactly as it does today
 
+
+
+def test_stale_toggle_then_daemon_gone_restarts_on_the_next_tick(rotation):
+    app = rotation(auto_switch_enabled=True, external_rotation_label=_LABEL)
+    rotation.plist.write_text("x", encoding="utf-8")
+    _open(app)  # no redraw can record the mode
+    app.on_toggle_autoswitch(None)
+    assert app._engine is None
+    rotation.plist.unlink()  # gone again before any sync tick
+    _close(app)
+    app.on_sync_tick(None)
+    assert _running(app)
+    assert _settings_titles(app) == _NORMAL_SETTINGS
+
+
+def test_stale_threshold_then_daemon_gone_restarts_on_the_next_tick(rotation):
+    app = rotation(auto_switch_enabled=True, external_rotation_label=_LABEL)
+    rotation.plist.write_text("x", encoding="utf-8")
+    _open(app)
+    app._make_threshold(95)(None)
+    assert app._engine is None
+    rotation.plist.unlink()
+    _close(app)
+    app.on_sync_tick(None)
+    assert _running(app)
+
+
+def test_refused_restart_then_daemon_gone_restarts_on_the_next_tick(rotation):
+    app = rotation(auto_switch_enabled=True, external_rotation_label=_LABEL)
+    first = app._engine
+    rotation.plist.write_text("x", encoding="utf-8")
+    _open(app)
+    app._restart_engine()  # stops, and the start is refused
+    assert first.stopped.is_set() and app._engine is None
+    rotation.plist.unlink()
+    _close(app)
+    app.on_sync_tick(None)
+    assert _running(app)
+
+
+def test_refused_after_build_then_daemon_gone_restarts_on_the_next_tick(rotation, monkeypatch):
+    class Slow(_FakeEngine):
+        landed = False
+
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            if not Slow.landed:
+                Slow.landed = True
+                rotation.plist.write_text("x", encoding="utf-8")
+
+    monkeypatch.setattr("claude_swap.autoswitch.AutoSwitchEngine", Slow)
+    app = rotation(auto_switch_enabled=False, external_rotation_label=_LABEL)
+    _open(app)
+    app.on_toggle_autoswitch(None)  # on; the plist lands while the engine is built
+    assert app._engine is None
+    rotation.plist.unlink()
+    _close(app)
+    app.on_sync_tick(None)
+    assert _running(app)

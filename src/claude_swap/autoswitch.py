@@ -61,7 +61,7 @@ from claude_swap.poll_policy import (
     binding_pct,
 )
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
-from claude_swap.switcher import ClaudeAccountSwitcher
+from claude_swap.switcher import SWITCH_ABANDONED, ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
 STATE_FILENAME = "autoswitch_state.json"
@@ -2519,7 +2519,15 @@ class AutoSwitchEngine:
             if not self._may_switch():
                 return TickOutcome.NO_ACTION
 
-            result = self.switcher.switch_to(number, json_output=True)
+            # The same question once more inside switch_to, after it holds the
+            # account lock and Claude Code's credential and config locks and
+            # before it writes anything: those waits are where a daemon's
+            # install or a stop can still land.
+            result = self.switcher.switch_to(
+                number, json_output=True, proceed=self._may_switch
+            )
+            if result and result.get("reason") == SWITCH_ABANDONED:
+                return TickOutcome.NO_ACTION  # nothing changed: no event, no stamp
             if not result or not result.get("switched"):
                 self._emit(
                     NoSwitchEvent(

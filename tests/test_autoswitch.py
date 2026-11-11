@@ -7361,3 +7361,184 @@ class TestMayActGate:
         assert len(ticks) == 3
         reads.assert_not_called()
         switch.assert_not_called()
+
+
+class TestSwitchProceedCheck:
+    """``switch_to(proceed=...)``: a last word, asked once every lock the switch
+    waits on is held and before anything is written.
+
+    The engine passes one that is closed once it is stopped or its gate
+    closes, so a daemon installed while ``switch_to`` waits on the account
+    lock or Claude Code's credential and config locks still gets no switch.
+    """
+
+    _SWITCHING = TestMayActGate._SWITCHING
+
+    @staticmethod
+    def _files(home: Path) -> dict:
+        """Every file the switch could write, by path; lock and log files left out."""
+        out = {}
+        for path in sorted(home.rglob("*")):
+            if path.is_file() and "lock" not in path.name and not path.name.endswith(".log"):
+                out[str(path.relative_to(home))] = path.read_bytes()
+        return out
+
+    @staticmethod
+    def _flip_inside(which: str, flip):
+        """Patch the switch's lock ``which`` to run ``flip`` once it is held.
+
+        Stands for "the gate closed while the switch waited on this lock".
+        Only the account lock taken by ``_perform_switch`` itself flips; the
+        other holders of that lock (session adoption) are left alone.
+        """
+        import contextlib
+        import sys as _sys
+
+        import claude_swap.switcher as sw
+
+        if which == "account":
+            real = sw.FileLock
+
+            class Flipping:
+                def __init__(self, *a, **k):
+                    self._lock = real(*a, **k)
+                    self._flip = _sys._getframe(1).f_code.co_name == "_perform_switch"
+
+                def __enter__(self):
+                    held = self._lock.__enter__()
+                    if self._flip:
+                        flip()
+                    return held
+
+                def __exit__(self, *exc):
+                    return self._lock.__exit__(*exc)
+
+                def __getattr__(self, name):
+                    return getattr(self._lock, name)
+
+            return patch.object(sw, "FileLock", Flipping)
+
+        name = {"credentials": "claude_credentials_lock", "config": "claude_config_lock"}[which]
+        real_cm = getattr(sw, name)
+
+        @contextlib.contextmanager
+        def flipping(*a, **k):
+            with real_cm(*a, **k):
+                flip()
+                yield
+
+        return patch.object(sw, name, flipping)
+
+    # -- the switcher alone -------------------------------------------------------
+
+    def test_no_check_switches_as_before(self, harness):
+        result = harness.switcher.switch_to("2", json_output=True)
+        assert result["switched"] is True
+        assert harness.active_number() == 2
+
+    def test_open_check_switches(self, harness):
+        result = harness.switcher.switch_to("2", json_output=True, proceed=lambda: True)
+        assert result["switched"] is True
+        assert harness.active_number() == 2
+
+    @pytest.mark.parametrize("which", ["account", "credentials", "config"])
+    def test_check_closing_while_a_lock_is_awaited_writes_nothing(self, harness, temp_home, which):
+        gate = {"open": True}
+        before = self._files(temp_home)
+        with self._flip_inside(which, lambda: gate.update(open=False)):
+            result = harness.switcher.switch_to("2", json_output=True, proceed=lambda: gate["open"])
+        assert result["switched"] is False
+        assert result["reason"] == "abandoned"
+        assert self._files(temp_home) == before  # no credential, config, sequence or backup write
+        assert harness.active_number() == 1
+        # Every lock was let go: an ordinary switch goes through at once.
+        assert harness.switcher.switch_to("2", json_output=True)["switched"] is True
+        assert harness.active_number() == 2
+
+    def test_closed_check_runs_no_org_field_migration(self, harness):
+        data = harness.switcher._get_sequence_data()
+        del data["accounts"]["2"]["organizationUuid"]  # an old store, due a backfill
+        harness.switcher._write_json(harness.switcher.sequence_file, data)
+        with patch.object(harness.switcher, "_migrate_org_fields") as migrate:
+            result = harness.switcher.switch_to("2", json_output=True, proceed=lambda: False)
+        migrate.assert_not_called()
+        assert result["reason"] == "abandoned"
+
+    def test_closed_check_adopts_no_session_credential(self, harness):
+        answers = iter([True, False])  # open on entry, closed before the adoption
+        with patch.object(
+            harness.switcher, "_adopt_session_credential", return_value=False
+        ) as adopt:
+            result = harness.switcher.switch_to(
+                "2", json_output=True, proceed=lambda: next(answers)
+            )
+        adopt.assert_not_called()
+        assert result["reason"] == "abandoned"
+        with patch.object(
+            harness.switcher, "_adopt_session_credential", return_value=False
+        ) as adopt:
+            harness.switcher.switch_to("2", json_output=True, proceed=lambda: True)
+        adopt.assert_called_once()  # reached when the check is open: the spy can see it
+
+    def test_a_raising_check_counts_as_closed(self, harness, temp_home):
+        def broken():
+            raise RuntimeError("gone")
+
+        before = self._files(temp_home)
+        result = harness.switcher.switch_to("2", json_output=True, proceed=broken)
+        assert result["reason"] == "abandoned"
+        assert self._files(temp_home) == before
+
+    def test_abandoned_without_json_output_prints_nothing_and_returns_none(self, harness, capsys):
+        assert harness.switcher.switch_to("2", proceed=lambda: False) is None
+        assert capsys.readouterr().out == ""
+        assert harness.active_number() == 1
+
+    # -- through the engine -------------------------------------------------------
+
+    def _entries(self, harness):
+        return {num: _entry_for(v, harness.clock.now) for num, v in self._SWITCHING.items()}
+
+    def _no_switch_trace(self, harness):
+        assert not any(isinstance(e, (SwitchEvent, NoSwitchEvent, QuarantineEvent)) for e in harness.events)
+        state = harness.state()
+        assert "lastSwitchAt" not in state and "lastSwitchTo" not in state
+        assert not state.get("quarantine")
+
+    @pytest.mark.parametrize("which", ["account", "credentials", "config"])
+    def test_gate_closing_during_a_switch_lock_wait_makes_no_switch(self, harness, temp_home, which):
+        gate = {"open": True}
+        harness.engine = harness._make_engine(may_act=lambda: gate["open"])
+        live = (temp_home / ".claude" / ".credentials.json").read_bytes()
+        with self._flip_inside(which, lambda: gate.update(open=False)):
+            outcome = harness.tick_with_entries(self._entries(harness))
+        assert outcome is TickOutcome.NO_ACTION
+        self._no_switch_trace(harness)
+        assert (temp_home / ".claude" / ".credentials.json").read_bytes() == live
+        assert harness.active_number() == 1
+        gate["open"] = True  # the locks were let go: the next tick switches
+        assert harness.tick_with_entries(self._entries(harness)) is TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+
+    @pytest.mark.parametrize("which", ["account", "credentials", "config"])
+    def test_stop_during_a_switch_lock_wait_makes_no_switch(self, harness, temp_home, which):
+        engine = harness.engine  # no gate: the stop alone holds the switch back
+        live = (temp_home / ".claude" / ".credentials.json").read_bytes()
+        with self._flip_inside(which, engine.stop):
+            outcome = harness.tick_with_entries(self._entries(harness))
+        assert outcome is TickOutcome.NO_ACTION
+        self._no_switch_trace(harness)
+        assert (temp_home / ".claude" / ".credentials.json").read_bytes() == live
+        assert harness.active_number() == 1
+        assert harness.switcher.switch_to("2", json_output=True)["switched"] is True
+
+    def test_engine_maps_an_abandoned_switch_to_no_action_without_events(self, harness):
+        with patch.object(
+            harness.switcher,
+            "switch_to",
+            return_value={"switched": False, "reason": "abandoned"},
+        ) as switch:
+            outcome = harness.tick_with_entries(self._entries(harness))
+        assert outcome is TickOutcome.NO_ACTION
+        assert callable(switch.call_args.kwargs["proceed"])
+        self._no_switch_trace(harness)

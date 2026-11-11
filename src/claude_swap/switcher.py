@@ -11,7 +11,7 @@ import shutil
 import threading
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -116,6 +116,21 @@ KEYRING_SERVICE = "claude-code"
 # Setup-tokens are inference-only server-side; wider scopes trigger 403s
 # on profile endpoints. Matches Claude Code's CLAUDE_CODE_OAUTH_TOKEN path.
 SETUP_TOKEN_SCOPES = ("user:inference",)
+
+# The ``reason`` of a switch its caller's ``proceed`` check called off before
+# anything was written (``switch_to``). Distinct from "already-active": the
+# switch was wanted, and nothing about the accounts says it is done.
+SWITCH_ABANDONED = "abandoned"
+
+
+def _may_proceed(proceed: Callable[[], bool] | None) -> bool:
+    """What a switch's ``proceed`` check says; one that raises counts as closed."""
+    if proceed is None:
+        return True
+    try:
+        return bool(proceed())
+    except Exception:
+        return False
 
 # Delay between successive usage-request launches in one collect pass, so N
 # accounts never burst the shared usage endpoint from one IP in the same
@@ -6740,16 +6755,32 @@ class ClaudeAccountSwitcher:
         )
 
     def switch_to(
-        self, identifier: str, json_output: bool = False, force: bool = False
+        self,
+        identifier: str,
+        json_output: bool = False,
+        force: bool = False,
+        *,
+        proceed: Callable[[], bool] | None = None,
     ) -> dict | None:
         """Switch to specific account.
 
         ``force`` activates the target's stored credentials directly, skipping
         both the already-active no-op guard and the backup-current step —
         the recovery path for a live login gone stale (e.g. after --import).
+
+        ``proceed``, when given, may call the switch off: it is asked before
+        each write the switch can make outside its locks, and again once
+        every lock is held, before the first write under them. Closed (or
+        raising), nothing is written, the locks are let go as usual, and the
+        result is a ``switched: false`` no-op with reason ``abandoned``
+        (``None`` without ``json_output``). ``None`` never calls it off.
         """
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
+
+        # The org-field migration below writes the sequence file.
+        if not _may_proceed(proceed):
+            return self._switch_abandoned(json_output)
 
         # Ensure org fields are migrated before resolving accounts
         self._get_sequence_data_migrated()
@@ -6840,12 +6871,18 @@ class ClaudeAccountSwitcher:
                         message=f"Already on Account-{target_account} ({email})",
                     )
 
+        # Forwarded only when given: a caller without a check makes the very
+        # call it always made.
+        checked = {} if proceed is None else {"proceed": proceed}
         op = self._perform_switch(
             target_account,
             emit_output=not json_output,
             force_activate=force,
             provenance=provenance,
+            **checked,
         )
+        if op is None:
+            return self._switch_abandoned(json_output)
         result = self._switch_result_from_op(op, "direct") if json_output else None
         # A forced self-activation really rewrote the live credentials from the
         # stored backup — "already-active" would misdescribe that mutation.
@@ -6858,6 +6895,16 @@ class ClaudeAccountSwitcher:
                 f"Activated Account-{to['number']} ({to['email']}) from stored backup"
             )
         return result
+
+    def _switch_abandoned(self, json_output: bool) -> dict | None:
+        """The result of a switch its ``proceed`` called off: nothing changed."""
+        if not json_output:
+            return None
+        return self._switch_noop(
+            strategy="direct",
+            reason=SWITCH_ABANDONED,
+            message="Switch called off before anything was changed",
+        )
 
     def _live_matches_slot_backup(self, slot: str, email: str) -> bool:
         """Whether the live credential is provably the slot's stored lineage.
@@ -7231,7 +7278,8 @@ class ClaudeAccountSwitcher:
         emit_output: bool = True,
         force_activate: bool = False,
         provenance: dict | None = None,
-    ) -> dict:
+        proceed: Callable[[], bool] | None = None,
+    ) -> dict | None:
         """Perform the actual account switch with transaction support.
 
         Returns ``{"from": ref|None, "to": ref, "warnings": [...]}``, capturing the
@@ -7248,10 +7296,17 @@ class ClaudeAccountSwitcher:
 
         The post-switch display runs after the lock releases so that persist
         callbacks inside list_accounts() can re-acquire it.
+
+        ``proceed`` (see ``switch_to``) is asked before the session adoption,
+        the one write made before the switch's locks, and again once all
+        three locks are held, before the first write under them. Closed, the
+        switch returns ``None`` having written nothing.
         """
         from claude_swap.session import scan_live_sessions
 
         self._refuse_session_shell()
+        if not _may_proceed(proceed):
+            return None  # before the session adoption below writes the backup
         warnings_out: list[str] = []
         # Session-mode drift. Switching the default login to an account that
         # also has a live session profile puts the same refresh token in two
@@ -7349,6 +7404,10 @@ class ClaudeAccountSwitcher:
         # interleaving with Claude Code's own config writes. Everything under
         # here is local I/O — no network while locks are held.
         with FileLock(self.lock_file), claude_credentials_lock(), claude_config_lock():
+            # Every lock this switch waits on is held, and nothing is written
+            # yet: the last moment a caller can still call it off cleanly.
+            if not _may_proceed(proceed):
+                return None
             data = self._get_sequence_data()
             active_account = data.get("activeAccountNumber")
             current_account = str(active_account) if active_account is not None else None

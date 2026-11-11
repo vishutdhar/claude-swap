@@ -2119,8 +2119,7 @@ def create_app(switcher, codex_monitor=None, launch_agents_dir=None):
             # rotation daemon is installed, even while a redraw is deferred or
             # reads are failing. (rumps timers pause while the menu is being
             # tracked; the engine's own gate holds it back until this runs.)
-            if self._follow_external_rotation():
-                self._dirty = True
+            self._follow_external_rotation()  # a flip marks the menu dirty
             if self._dirty or (self._rebuild_pending and not self._menu_open):
                 self._dirty = False
                 self.rebuild_menu()  # defers again by itself while the menu is open
@@ -2166,7 +2165,12 @@ def create_app(switcher, codex_monitor=None, launch_agents_dir=None):
             Never while an external daemon rotates accounts: two switchers
             with different thresholds would fight over the active account.
             """
-            if self._engine is not None or self._rotation_is_external():
+            if self._engine is not None:
+                return
+            if self._rotation_is_external():
+                # Refused, and the refusal recorded where the mode lives, or
+                # the daemon going away again would never bring the engine back.
+                self._follow_external_rotation()
                 return
             try:
                 engine = AutoSwitchEngine(
@@ -2184,6 +2188,7 @@ def create_app(switcher, codex_monitor=None, launch_agents_dir=None):
                 # Installed while the engine was built (settings and policy
                 # reads block); from here on the engine's own gate covers it.
                 engine.stop()
+                self._follow_external_rotation()
                 return
             self._engine = engine
             threading.Thread(target=self._run_engine, args=(engine,), daemon=True).start()
@@ -2220,15 +2225,17 @@ def create_app(switcher, codex_monitor=None, launch_agents_dir=None):
 
             It appearing stops a running engine; it going starts the engine
             again when "Auto-switch accounts" is on. ``auto_switch_enabled``
-            itself is never rewritten. Returns whether the mode changed, so
-            the caller can redraw the Settings menu.
+            itself is never rewritten. The one place the mode is recorded:
+            anything that stops or refuses the engine on the mode goes through
+            here. A change marks the menu dirty so Settings is redrawn.
             """
             was, self._external_rotation = self._external_rotation, self._rotation_is_external()
+            if was != self._external_rotation:
+                self._dirty = True
             if self._external_rotation:
                 self._stop_engine()
             elif was and self.settings.auto_switch_enabled:
                 self._start_engine()
-            return was != self._external_rotation
 
         def _restart_engine(self):
             """Apply changed core settings by restarting the running engine."""
@@ -3103,7 +3110,7 @@ def create_app(switcher, codex_monitor=None, launch_agents_dir=None):
         def on_toggle_autoswitch(self, _sender):
             if self._rotation_is_external():
                 # An item left from before the daemon: stop now, redraw when it can.
-                self._stop_engine()
+                self._follow_external_rotation()
                 self.rebuild_menu()
                 return
             self.settings.auto_switch_enabled = not self.settings.auto_switch_enabled
@@ -3118,7 +3125,7 @@ def create_app(switcher, codex_monitor=None, launch_agents_dir=None):
             def cb(_sender):
                 if self._rotation_is_external():
                     # The daemon keeps its own threshold: stop now, redraw when it can.
-                    self._stop_engine()
+                    self._follow_external_rotation()
                     self.rebuild_menu()
                     return
                 try:
