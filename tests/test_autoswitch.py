@@ -7200,3 +7200,164 @@ class TestWeeklyThreshold:
         h.engine.apply_threshold(72.0)
         assert h.switcher._poll_inputs_override == (72.0, 97.0, ())
         assert h.engine.settings.weekly_threshold == 97.0
+
+
+class TestMayActGate:
+    """``may_act``: a frontend's say over whether this engine may act at all.
+
+    The menu bar passes one that closes while an external rotation daemon is
+    installed. It is consulted at the start of every tick and again inside
+    ``_perform`` just before the switch, after the state lock wait, because a
+    daemon can appear while a tick is reading usage or waiting on a lock.
+    """
+
+    _SWITCHING = {"1": _usage(95), "2": _usage(10), "3": _usage(20)}
+
+    def _entries(self, harness):
+        return {num: _entry_for(v, harness.clock.now) for num, v in self._SWITCHING.items()}
+
+    def _gated(self, harness, gate, **kwargs):
+        harness.engine = harness._make_engine(may_act=gate, **kwargs)
+        return harness.engine
+
+    def test_no_gate_switches_as_before(self, harness):
+        assert harness.tick_with_usage(self._SWITCHING) is TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+
+    def test_open_gate_switches(self, harness):
+        self._gated(harness, lambda: True)
+        assert harness.tick_with_usage(self._SWITCHING) is TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+
+    def test_closed_gate_at_tick_start_reads_nothing_and_switches_nothing(self, harness):
+        engine = self._gated(harness, lambda: False)
+        with patch.object(harness.switcher, "usage_entries_by_account") as reads, \
+             patch.object(harness.switcher, "switch_to") as switch:
+            outcome = engine.tick()
+        assert outcome is TickOutcome.NO_ACTION
+        reads.assert_not_called()
+        switch.assert_not_called()
+        assert harness.events == []
+        assert harness.active_number() == 1
+        assert harness.state() == {}  # not even the health counters are written
+
+    def test_gate_closing_during_the_usage_read_abandons_the_switch(self, harness):
+        gate = {"open": True}
+        engine = self._gated(harness, lambda: gate["open"])
+        entries = self._entries(harness)
+
+        def read(**_kw):
+            gate["open"] = False  # the daemon's plist lands mid-tick
+            return entries
+
+        with patch.object(harness.switcher, "usage_entries_by_account", side_effect=read), \
+             patch.object(harness.switcher, "switch_to", wraps=harness.switcher.switch_to) as switch:
+            outcome = engine.tick()
+        assert outcome is TickOutcome.NO_ACTION
+        switch.assert_not_called()
+        assert not any(isinstance(e, SwitchEvent) for e in harness.events)
+        assert harness.active_number() == 1
+        assert "lastSwitchAt" not in harness.state()
+
+    def test_gate_closing_during_the_state_lock_wait_abandons_the_switch(self, harness):
+        gate = {"open": True}
+        engine = self._gated(harness, lambda: gate["open"])
+        real_lock = engine._state_lock
+
+        class Waited:
+            def __enter__(self):
+                self.lock = real_lock()
+                self.lock.__enter__()
+                gate["open"] = False  # closed while this engine waited its turn
+                return self
+
+            def __exit__(self, *exc):
+                return self.lock.__exit__(*exc)
+
+        with patch.object(engine, "_state_lock", Waited), \
+             patch.object(harness.switcher, "switch_to") as switch:
+            outcome = harness.tick_with_entries(self._entries(harness))
+        assert outcome is TickOutcome.NO_ACTION
+        switch.assert_not_called()
+        assert harness.active_number() == 1
+
+    def test_stop_during_a_tick_abandons_the_switch(self, harness):
+        engine = harness.engine  # no gate: stop alone must hold the switch back
+        entries = self._entries(harness)
+
+        def read(**_kw):
+            engine.stop()
+            return entries
+
+        with patch.object(harness.switcher, "usage_entries_by_account", side_effect=read), \
+             patch.object(harness.switcher, "switch_to") as switch:
+            outcome = engine.tick()
+        assert outcome is TickOutcome.NO_ACTION
+        switch.assert_not_called()
+        assert not any(isinstance(e, SwitchEvent) for e in harness.events)
+        assert harness.active_number() == 1
+
+    def test_a_raising_gate_counts_as_closed_and_is_logged_once(self, harness, caplog):
+        def broken():
+            raise OSError("stat failed")
+
+        engine = self._gated(harness, broken)
+        with caplog.at_level("WARNING", logger="claude-swap"), \
+             patch.object(harness.switcher, "usage_entries_by_account") as reads, \
+             patch.object(harness.switcher, "switch_to") as switch:
+            assert engine.tick() is TickOutcome.NO_ACTION
+            assert engine.tick() is TickOutcome.NO_ACTION
+        reads.assert_not_called()
+        switch.assert_not_called()
+        lines = [r for r in caplog.records if "gate" in r.getMessage()]
+        assert len(lines) == 1
+
+    def test_a_gate_that_starts_raising_mid_tick_abandons_the_switch(self, harness):
+        calls = []
+
+        def gate():
+            calls.append(1)
+            if len(calls) > 1:
+                raise RuntimeError("gone")
+            return True
+
+        engine = self._gated(harness, gate)
+        with patch.object(harness.switcher, "switch_to") as switch:
+            outcome = harness.tick_with_entries(self._entries(harness))
+        assert outcome is TickOutcome.NO_ACTION
+        switch.assert_not_called()
+        assert len(calls) >= 2
+
+    def test_dry_run_reports_no_switch_once_the_gate_closes(self, harness):
+        gate = {"open": True}
+        engine = self._gated(harness, lambda: gate["open"], dry_run=True)
+        entries = self._entries(harness)
+
+        def read(**_kw):
+            gate["open"] = False
+            return entries
+
+        with patch.object(harness.switcher, "usage_entries_by_account", side_effect=read):
+            outcome = engine.tick()
+        assert outcome is TickOutcome.NO_ACTION
+        assert not any(isinstance(e, SwitchEvent) for e in harness.events)
+
+    def test_run_loop_with_a_closed_gate_never_reads_or_switches(self, harness):
+        engine = self._gated(harness, lambda: False)
+        ticks = []
+        real_tick = engine.tick
+
+        def counted():
+            ticks.append(1)
+            if len(ticks) >= 3:
+                engine.stop()
+            return real_tick()
+
+        with patch.object(engine, "tick", side_effect=counted), \
+             patch.object(engine, "_next_delay", return_value=0.0), \
+             patch.object(harness.switcher, "usage_entries_by_account") as reads, \
+             patch.object(harness.switcher, "switch_to") as switch:
+            assert engine.run_loop() == 0
+        assert len(ticks) == 3
+        reads.assert_not_called()
+        switch.assert_not_called()

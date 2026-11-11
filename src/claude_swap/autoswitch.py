@@ -659,6 +659,12 @@ class AutoSwitchEngine:
     ``on_event`` receives every :class:`AutoSwitchEvent`; exceptions it raises
     are not caught (a broken frontend should fail loudly in tests). ``clock``
     is wall time (persisted cooldown timestamps must survive processes).
+
+    ``may_act``, when given, is asked whether this engine may act at all: at
+    the start of every tick (closed: the tick reads nothing and does
+    nothing) and again in ``_perform`` just before the switch (closed: the
+    switch is abandoned). It runs on the engine's thread. One that raises
+    counts as closed. ``None`` (the CLI) never holds the engine back.
     """
 
     def __init__(
@@ -670,6 +676,7 @@ class AutoSwitchEngine:
         dry_run: bool = False,
         state_path: Path | None = None,
         clock: Callable[[], float] = time.time,
+        may_act: Callable[[], bool] | None = None,
     ):
         self.switcher = switcher
         self.settings = settings
@@ -694,6 +701,8 @@ class AutoSwitchEngine:
         self.dry_run = dry_run
         self.state_path = state_path or (switcher.backup_dir / STATE_FILENAME)
         self.clock = clock
+        self._may_act = may_act
+        self._may_act_failed = False  # its first failure is logged, the rest are not
         self._stop = threading.Event()
         # Cuts the current inter-tick sleep short (a session threshold change
         # from the TUI should show a fresh decision now, not next interval).
@@ -907,8 +916,32 @@ class AutoSwitchEngine:
 
     # -- tick -----------------------------------------------------------------
 
+    def _gate_open(self) -> bool:
+        """What ``may_act`` says, closed when it raises; open without one."""
+        if self._may_act is None:
+            return True
+        try:
+            return bool(self._may_act())
+        except Exception as e:
+            if not self._may_act_failed:
+                self._may_act_failed = True
+                _logger.warning("auto-switch gate failed, holding the engine back: %r", e)
+            return False
+
+    def _may_switch(self) -> bool:
+        """Whether a switch decided this tick may still be made: not stopped, gate open."""
+        return not self._stop.is_set() and self._gate_open()
+
     def tick(self) -> TickOutcome:
         """Evaluate once: poll usage, maybe switch. Never raises."""
+        if not self._gate_open():
+            # Held back before anything is read or written. The per-tick
+            # sleep inputs are cleared as _tick_inner would clear them, so
+            # the next delay is the plain interval.
+            self._sleep_until_ts = None
+            self._blocked_wait_long = False
+            self._idle_hold_slow = False
+            return TickOutcome.NO_ACTION
         try:
             outcome = self._tick_inner()
             self._persist_health_counters(self._health_account)
@@ -2453,6 +2486,8 @@ class AutoSwitchEngine:
         left: tuple[float | None, float],
     ) -> TickOutcome:
         if self.dry_run:
+            if not self._may_switch():
+                return TickOutcome.NO_ACTION
             current = self.switcher.current_account_number()
             current_email = self.switcher.account_email(current) if current else ""
             self._emit(
@@ -2475,6 +2510,13 @@ class AutoSwitchEngine:
             state = self._read_state()
             if trigger in ("proactive", "consume-first", "priority") and self._in_cooldown(state):
                 self._emit(NoSwitchEvent(reason="cooldown"))
+                return TickOutcome.NO_ACTION
+
+            # Asked again here, after the lock wait and as late as this
+            # engine can before the switch writes credentials: a stop or a
+            # closed gate can land while the tick read usage or waited on
+            # the lock, and run_loop only looks at stop between ticks.
+            if not self._may_switch():
                 return TickOutcome.NO_ACTION
 
             result = self.switcher.switch_to(number, json_output=True)

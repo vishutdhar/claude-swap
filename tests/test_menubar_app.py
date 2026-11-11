@@ -2895,3 +2895,108 @@ def test_rebuild_under_the_daemon_runs_no_process(rotation, monkeypatch):
         monkeypatch.setattr(subprocess, name, refuse)
     app.rebuild_menu()
     assert _settings_titles(app)[-1] == "Rotation: external daemon"
+
+
+def test_engine_stops_on_the_sync_tick_while_the_menu_is_open(rotation):
+    app = rotation(auto_switch_enabled=True, external_rotation_label=_LABEL, external_rotation_summary="d")
+    app.rebuild_menu()
+    first = app._engine
+    _open(app)
+    rotation.plist.write_text("x", encoding="utf-8")
+    app.on_sync_tick(None)  # no refresh is due and nothing is dirty
+    assert first.stopped.is_set() and app._engine is None
+    assert _settings_titles(app) == _NORMAL_SETTINGS  # the redraw waits for the close
+    _close(app)
+    app.on_sync_tick(None)
+    assert _settings_titles(app)[-1] == "Rotation: d"
+
+
+def test_sync_tick_brings_the_engine_back_when_the_daemon_goes(rotation):
+    rotation.plist.write_text("x", encoding="utf-8")
+    app = rotation(auto_switch_enabled=True, external_rotation_label=_LABEL)
+    assert app._engine is None
+    rotation.plist.unlink()
+    app.on_sync_tick(None)
+    assert _running(app)
+    assert _settings_titles(app) == _NORMAL_SETTINGS
+
+
+def test_sync_tick_without_a_label_never_looks_for_a_plist(rotation, monkeypatch):
+    app = rotation(auto_switch_enabled=True)
+    looked = []
+    monkeypatch.setattr(menubar, "external_rotation_active", lambda *a: looked.append(a) or False)
+    app.on_sync_tick(None)
+    assert _running(app)
+    assert all(label == "" for label, _dir in looked)  # an empty label never reaches a stat
+
+
+def test_stale_toggle_stops_a_running_engine(rotation):
+    app = rotation(auto_switch_enabled=True, external_rotation_label=_LABEL)
+    first = app._engine
+    rotation.plist.write_text("x", encoding="utf-8")  # no tick or rebuild has seen it yet
+    _open(app)  # the redraw cannot run: the stop must not wait for it
+    app.on_toggle_autoswitch(None)
+    assert first.stopped.is_set() and app._engine is None
+    assert app.settings.auto_switch_enabled is True
+
+
+def test_stale_threshold_stops_a_running_engine(rotation):
+    app = rotation(auto_switch_enabled=True, external_rotation_label=_LABEL)
+    first = app._engine
+    rotation.plist.write_text("x", encoding="utf-8")
+    _open(app)
+    app._make_threshold(95)(None)
+    assert first.stopped.is_set() and app._engine is None
+
+
+def test_no_engine_runs_when_the_daemon_appears_while_one_is_built(rotation, monkeypatch):
+    runs = []
+
+    class Slow(_FakeEngine):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            rotation.plist.write_text("x", encoding="utf-8")  # lands during construction
+
+        def run_loop(self):
+            runs.append(self)
+            super().run_loop()
+
+    monkeypatch.setattr("claude_swap.autoswitch.AutoSwitchEngine", Slow)
+    app = rotation(auto_switch_enabled=False, external_rotation_label=_LABEL)
+    app.on_toggle_autoswitch(None)  # turned on: the check passes, then the plist lands
+    time.sleep(0.05)
+    assert app._engine is None
+    assert runs == []
+    assert _FakeEngine.made[-1].stopped.is_set()
+
+
+def test_engine_gets_a_gate_that_follows_the_plist(rotation, monkeypatch):
+    seen = {}
+
+    class Gated(_FakeEngine):
+        def __init__(self, *a, may_act=None, **k):
+            super().__init__(*a, **k)
+            seen["gate"] = may_act
+
+    monkeypatch.setattr("claude_swap.autoswitch.AutoSwitchEngine", Gated)
+    rotation(auto_switch_enabled=True, external_rotation_label=_LABEL)
+    gate = seen["gate"]
+    assert gate() is True
+    rotation.plist.write_text("x", encoding="utf-8")
+    assert gate() is False  # closed from the engine thread, before any rebuild or tick
+    rotation.plist.unlink()
+    assert gate() is True
+
+
+def test_engine_gets_no_gate_without_a_label(rotation, monkeypatch):
+    seen = {}
+
+    class Gated(_FakeEngine):
+        def __init__(self, *a, may_act="unset", **k):
+            super().__init__(*a, **k)
+            seen["gate"] = may_act
+
+    monkeypatch.setattr("claude_swap.autoswitch.AutoSwitchEngine", Gated)
+    rotation(auto_switch_enabled=True)
+    assert seen["gate"] is None  # the engine runs exactly as it does today
+

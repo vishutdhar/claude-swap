@@ -2115,6 +2115,12 @@ def create_app(switcher, codex_monitor=None, launch_agents_dir=None):
             item._menuitem.setAccessibilityTitle_(accessibility_label(panel))
 
         def on_sync_tick(self, _timer):
+            # Every tick, rebuild or not: an engine must stop promptly when a
+            # rotation daemon is installed, even while a redraw is deferred or
+            # reads are failing. (rumps timers pause while the menu is being
+            # tracked; the engine's own gate holds it back until this runs.)
+            if self._follow_external_rotation():
+                self._dirty = True
             if self._dirty or (self._rebuild_pending and not self._menu_open):
                 self._dirty = False
                 self.rebuild_menu()  # defers again by itself while the menu is open
@@ -2168,10 +2174,16 @@ def create_app(switcher, codex_monitor=None, launch_agents_dir=None):
                     load_settings(self.switcher.backup_dir),
                     self._on_engine_event,
                     dry_run=False,
+                    may_act=self._engine_gate(),
                 )
             except Exception as e:  # never let a bad start crash the menu bar
                 self.switcher._logger.warning("auto-switch engine failed to start: %s", e)
                 rumps.notification("claude-swap", "Auto-switch failed to start", str(e))
+                return
+            if self._rotation_is_external():
+                # Installed while the engine was built (settings and policy
+                # reads block); from here on the engine's own gate covers it.
+                engine.stop()
                 return
             self._engine = engine
             threading.Thread(target=self._run_engine, args=(engine,), daemon=True).start()
@@ -2190,18 +2202,33 @@ def create_app(switcher, codex_monitor=None, launch_agents_dir=None):
         def _rotation_is_external(self) -> bool:
             return external_rotation_active(self.settings.external_rotation_label, agents_dir)
 
-        def _follow_external_rotation(self):
+        def _engine_gate(self):
+            """The engine's ``may_act``: open unless the rotation daemon is installed.
+
+            It runs on the engine thread, so it holds only the label string
+            (fixed for the app's life) and the folder, and costs one stat.
+            With no usable label the mode can never turn on, and the engine
+            gets no gate at all: it runs exactly as it always has.
+            """
+            label = self.settings.external_rotation_label
+            if not safe_launchd_label(label):
+                return None
+            return lambda: not external_rotation_active(label, agents_dir)
+
+        def _follow_external_rotation(self) -> bool:
             """Hand rotation to the external daemon while its plist is installed.
 
             It appearing stops a running engine; it going starts the engine
             again when "Auto-switch accounts" is on. ``auto_switch_enabled``
-            itself is never rewritten.
+            itself is never rewritten. Returns whether the mode changed, so
+            the caller can redraw the Settings menu.
             """
             was, self._external_rotation = self._external_rotation, self._rotation_is_external()
             if self._external_rotation:
                 self._stop_engine()
             elif was and self.settings.auto_switch_enabled:
                 self._start_engine()
+            return was != self._external_rotation
 
         def _restart_engine(self):
             """Apply changed core settings by restarting the running engine."""
@@ -3075,7 +3102,9 @@ def create_app(switcher, codex_monitor=None, launch_agents_dir=None):
 
         def on_toggle_autoswitch(self, _sender):
             if self._rotation_is_external():
-                self.rebuild_menu()  # an item left from before the daemon: show its line
+                # An item left from before the daemon: stop now, redraw when it can.
+                self._stop_engine()
+                self.rebuild_menu()
                 return
             self.settings.auto_switch_enabled = not self.settings.auto_switch_enabled
             self.settings.save(settings_path)
@@ -3088,7 +3117,9 @@ def create_app(switcher, codex_monitor=None, launch_agents_dir=None):
         def _make_threshold(self, pct):
             def cb(_sender):
                 if self._rotation_is_external():
-                    self.rebuild_menu()  # the daemon keeps its own threshold
+                    # The daemon keeps its own threshold: stop now, redraw when it can.
+                    self._stop_engine()
+                    self.rebuild_menu()
                     return
                 try:
                     set_setting(self.switcher.backup_dir, "autoswitch.threshold", str(pct))
