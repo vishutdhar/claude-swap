@@ -2705,3 +2705,452 @@ def test_title_stays_ur_free_after_in_place_refresh(capp, codex, cshown, on_scre
     _close(capp)  # and after the full rebuild the close owes
     capp.on_sync_tick(None)
     assert capp.title == "⇄ a · 55% · Codex 56%"
+
+
+# --- external rotation: a launchd daemon rotates accounts, the menu bar stands back --
+
+import json  # noqa: E402
+
+_LABEL = "com.example.rotate"
+_NORMAL_SETTINGS = [
+    "Show account name in menu bar", "Title percentage", "Show model limits in title",
+    "Show usage bars", "Show names only", "Show Codex", "Codex in title", "Refresh interval",
+    "Auto-switch accounts", "Auto-switch threshold",
+]
+
+
+class _FakeEngine:
+    """Stands in for AutoSwitchEngine: records every start and stop, switches nothing."""
+
+    made: list = []
+
+    def __init__(self, switcher, settings, on_event, *, dry_run=False, **_kw):
+        self.stopped = threading.Event()
+        _FakeEngine.made.append(self)
+
+    def run_loop(self):
+        self.stopped.wait(10)
+
+    def stop(self):
+        self.stopped.set()
+
+
+@pytest.fixture
+def rotation(tmp_path, monkeypatch):
+    """Build the app over a temp LaunchAgents folder, with settings written first.
+
+    Returns ``make(**settings) -> app``; ``make.agents`` is the folder and
+    ``make.plist`` the daemon's plist path (absent until a test writes it).
+    """
+    monkeypatch.setattr(rumps.rumps, "application_support", lambda _name: str(tmp_path))
+    monkeypatch.setattr("claude_swap.snapshot_source.SnapshotSource", _NoFetch)
+    monkeypatch.setattr(rumps, "notification", lambda *a, **k: None)
+    monkeypatch.setattr(rumps, "alert", lambda *a, **k: 1)
+    _FakeEngine.made = []
+    monkeypatch.setattr("claude_swap.autoswitch.AutoSwitchEngine", _FakeEngine)
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+    built = []
+
+    def make(**settings):
+        (tmp_path / "menubar_settings.json").write_text(json.dumps(settings), encoding="utf-8")
+        app = menubar.create_app(_FakeSwitcher(tmp_path), launch_agents_dir=agents)
+        built.append(app)
+        _wait_idle(app)
+        return app
+
+    make.agents = agents
+    make.plist = agents / f"{_LABEL}.plist"
+    make.settings_file = tmp_path / "menubar_settings.json"
+    yield make
+    for app in built:
+        app.refresh_timer.stop()
+        app.sync_timer.stop()
+        app._stop_engine()
+
+
+def _settings_titles(app):
+    return [i.title() for i in _submenu(app, "Settings").itemArray()]
+
+
+def _settings_item(app, title):
+    return next(i for i in _submenu(app, "Settings").itemArray() if i.title() == title)
+
+
+def _running(app):
+    return app._engine is not None and not app._engine.stopped.is_set()
+
+
+def test_settings_menu_unchanged_without_a_label(rotation):
+    app = rotation()
+    app.rebuild_menu()
+    assert _settings_titles(app) == _NORMAL_SETTINGS
+    thresholds = [i.title() for i in _settings_item(app, "Auto-switch threshold").submenu().itemArray()]
+    assert thresholds == ["80%", "90%", "95%", "98%"]
+
+
+def test_settings_menu_unchanged_while_the_plist_is_missing(rotation):
+    app = rotation(external_rotation_label=_LABEL, external_rotation_summary="daemon")
+    app.rebuild_menu()
+    assert _settings_titles(app) == _NORMAL_SETTINGS
+
+
+def test_settings_menu_unchanged_for_an_unsafe_label(rotation):
+    (rotation.agents.parent / "outside.plist").write_text("x", encoding="utf-8")
+    app = rotation(external_rotation_label="../outside")
+    app.rebuild_menu()
+    assert _settings_titles(app) == _NORMAL_SETTINGS
+
+
+def test_settings_menu_names_the_daemon_instead_of_the_auto_switch_items(rotation):
+    rotation.plist.write_text("x", encoding="utf-8")
+    app = rotation(external_rotation_label=_LABEL, external_rotation_summary="cswap auto at 99.9%")
+    app.rebuild_menu()
+    assert _settings_titles(app) == [*_NORMAL_SETTINGS[:-2], "Rotation: cswap auto at 99.9%"]
+    item = _settings_item(app, "Rotation: cswap auto at 99.9%")
+    assert item.action() is None  # a statement, not a control
+    assert item.submenu() is None
+
+
+def test_settings_menu_names_an_unnamed_daemon(rotation):
+    rotation.plist.write_text("x", encoding="utf-8")
+    app = rotation(external_rotation_label=_LABEL, external_rotation_summary="  \n ")
+    app.rebuild_menu()
+    assert _settings_titles(app)[-1] == "Rotation: external daemon"
+
+
+def test_engine_never_starts_at_launch_under_the_daemon(rotation):
+    rotation.plist.write_text("x", encoding="utf-8")
+    app = rotation(auto_switch_enabled=True, external_rotation_label=_LABEL)
+    assert _FakeEngine.made == []
+    assert app._engine is None
+    assert app.settings.auto_switch_enabled is True  # overridden at run time only
+    assert json.loads(rotation.settings_file.read_text())["auto_switch_enabled"] is True
+
+
+def test_engine_starts_at_launch_without_the_daemon(rotation):
+    app = rotation(auto_switch_enabled=True, external_rotation_label=_LABEL)
+    assert len(_FakeEngine.made) == 1 and _running(app)
+
+
+def test_engine_stops_when_the_daemon_appears_and_returns_when_it_goes(rotation):
+    app = rotation(auto_switch_enabled=True, external_rotation_label=_LABEL, external_rotation_summary="d")
+    first = app._engine
+    assert _running(app)
+    before = rotation.settings_file.read_bytes()
+    rotation.plist.write_text("x", encoding="utf-8")
+    app.rebuild_menu()
+    assert first.stopped.is_set() and app._engine is None
+    assert _settings_titles(app)[-1] == "Rotation: d"
+    app.rebuild_menu()  # still there: nothing starts
+    assert len(_FakeEngine.made) == 1
+    assert rotation.settings_file.read_bytes() == before  # the file is never rewritten
+    rotation.plist.unlink()
+    app.rebuild_menu()
+    assert len(_FakeEngine.made) == 2 and _running(app) and app._engine is not first
+    assert _settings_titles(app) == _NORMAL_SETTINGS
+    assert _settings_item(app, "Auto-switch accounts").state() == 1
+
+
+def test_engine_stays_off_when_the_daemon_goes_and_the_toggle_is_off(rotation):
+    rotation.plist.write_text("x", encoding="utf-8")
+    app = rotation(auto_switch_enabled=False, external_rotation_label=_LABEL)
+    rotation.plist.unlink()
+    app.rebuild_menu()
+    assert _FakeEngine.made == [] and app._engine is None
+    assert _settings_titles(app) == _NORMAL_SETTINGS
+
+
+def test_restart_paths_never_start_the_engine_under_the_daemon(rotation, monkeypatch):
+    from claude_swap.settings import load_settings
+
+    app = rotation(auto_switch_enabled=True, external_rotation_label=_LABEL)
+    rotation.plist.write_text("x", encoding="utf-8")
+    app.rebuild_menu()
+    assert app._engine is None
+    threshold_before = load_settings(app.switcher.backup_dir).threshold
+    file_before = rotation.settings_file.read_bytes()
+    app._start_engine()
+    app._restart_engine()
+    app._make_threshold(80 if threshold_before != 80 else 95)(None)  # a stale threshold item
+    app.on_toggle_autoswitch(None)  # a stale toggle item
+    app.on_toggle_autoswitch(None)
+    assert len(_FakeEngine.made) == 1 and app._engine is None
+    assert load_settings(app.switcher.backup_dir).threshold == threshold_before
+    assert app.settings.auto_switch_enabled is True
+    assert rotation.settings_file.read_bytes() == file_before
+    assert _settings_titles(app)[-1] == "Rotation: external daemon"
+
+
+def test_rebuild_under_the_daemon_runs_no_process(rotation, monkeypatch):
+    import subprocess
+
+    rotation.plist.write_text("x", encoding="utf-8")
+    app = rotation(external_rotation_label=_LABEL)
+
+    def refuse(*a, **k):
+        raise AssertionError("the mode check must be a stat, not a process")
+
+    for name in ("run", "Popen", "check_output", "call", "check_call"):
+        monkeypatch.setattr(subprocess, name, refuse)
+    app.rebuild_menu()
+    assert _settings_titles(app)[-1] == "Rotation: external daemon"
+
+
+def test_engine_stops_on_the_sync_tick_while_the_menu_is_open(rotation):
+    app = rotation(auto_switch_enabled=True, external_rotation_label=_LABEL, external_rotation_summary="d")
+    app.rebuild_menu()
+    first = app._engine
+    _open(app)
+    rotation.plist.write_text("x", encoding="utf-8")
+    app.on_sync_tick(None)  # no refresh is due and nothing is dirty
+    assert first.stopped.is_set() and app._engine is None
+    assert _settings_titles(app) == _NORMAL_SETTINGS  # the redraw waits for the close
+    _close(app)
+    app.on_sync_tick(None)
+    assert _settings_titles(app)[-1] == "Rotation: d"
+
+
+def test_sync_tick_brings_the_engine_back_when_the_daemon_goes(rotation):
+    rotation.plist.write_text("x", encoding="utf-8")
+    app = rotation(auto_switch_enabled=True, external_rotation_label=_LABEL)
+    assert app._engine is None
+    rotation.plist.unlink()
+    app.on_sync_tick(None)
+    assert _running(app)
+    assert _settings_titles(app) == _NORMAL_SETTINGS
+
+
+def test_sync_tick_without_a_label_never_looks_for_a_plist(rotation, monkeypatch):
+    app = rotation(auto_switch_enabled=True)
+    looked = []
+    monkeypatch.setattr(menubar, "external_rotation_active", lambda *a: looked.append(a) or False)
+    app.on_sync_tick(None)
+    assert _running(app)
+    assert all(label == "" for label, _dir in looked)  # an empty label never reaches a stat
+
+
+def test_stale_toggle_stops_a_running_engine(rotation):
+    app = rotation(auto_switch_enabled=True, external_rotation_label=_LABEL)
+    first = app._engine
+    rotation.plist.write_text("x", encoding="utf-8")  # no tick or rebuild has seen it yet
+    _open(app)  # the redraw cannot run: the stop must not wait for it
+    app.on_toggle_autoswitch(None)
+    assert first.stopped.is_set() and app._engine is None
+    assert app.settings.auto_switch_enabled is True
+
+
+def test_stale_threshold_stops_a_running_engine(rotation):
+    app = rotation(auto_switch_enabled=True, external_rotation_label=_LABEL)
+    first = app._engine
+    rotation.plist.write_text("x", encoding="utf-8")
+    _open(app)
+    app._make_threshold(95)(None)
+    assert first.stopped.is_set() and app._engine is None
+
+
+def test_no_engine_runs_when_the_daemon_appears_while_one_is_built(rotation, monkeypatch):
+    runs = []
+
+    class Slow(_FakeEngine):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            rotation.plist.write_text("x", encoding="utf-8")  # lands during construction
+
+        def run_loop(self):
+            runs.append(self)
+            super().run_loop()
+
+    monkeypatch.setattr("claude_swap.autoswitch.AutoSwitchEngine", Slow)
+    app = rotation(auto_switch_enabled=False, external_rotation_label=_LABEL)
+    app.on_toggle_autoswitch(None)  # turned on: the check passes, then the plist lands
+    time.sleep(0.05)
+    assert app._engine is None
+    assert runs == []
+    assert _FakeEngine.made[-1].stopped.is_set()
+
+
+def test_engine_gets_a_gate_that_follows_the_plist(rotation, monkeypatch):
+    seen = {}
+
+    class Gated(_FakeEngine):
+        def __init__(self, *a, may_act=None, **k):
+            super().__init__(*a, **k)
+            seen["gate"] = may_act
+
+    monkeypatch.setattr("claude_swap.autoswitch.AutoSwitchEngine", Gated)
+    rotation(auto_switch_enabled=True, external_rotation_label=_LABEL)
+    gate = seen["gate"]
+    assert gate() is True
+    rotation.plist.write_text("x", encoding="utf-8")
+    assert gate() is False  # closed from the engine thread, before any rebuild or tick
+    rotation.plist.unlink()
+    assert gate() is True
+
+
+def test_engine_gets_no_gate_without_a_label(rotation, monkeypatch):
+    seen = {}
+
+    class Gated(_FakeEngine):
+        def __init__(self, *a, may_act="unset", **k):
+            super().__init__(*a, **k)
+            seen["gate"] = may_act
+
+    monkeypatch.setattr("claude_swap.autoswitch.AutoSwitchEngine", Gated)
+    rotation(auto_switch_enabled=True)
+    assert seen["gate"] is None  # the engine runs exactly as it does today
+
+
+
+def test_stale_toggle_then_daemon_gone_restarts_on_the_next_tick(rotation):
+    app = rotation(auto_switch_enabled=True, external_rotation_label=_LABEL)
+    rotation.plist.write_text("x", encoding="utf-8")
+    _open(app)  # no redraw can record the mode
+    app.on_toggle_autoswitch(None)
+    assert app._engine is None
+    rotation.plist.unlink()  # gone again before any sync tick
+    _close(app)
+    app.on_sync_tick(None)
+    assert _running(app)
+    assert _settings_titles(app) == _NORMAL_SETTINGS
+
+
+def test_stale_threshold_then_daemon_gone_restarts_on_the_next_tick(rotation):
+    app = rotation(auto_switch_enabled=True, external_rotation_label=_LABEL)
+    rotation.plist.write_text("x", encoding="utf-8")
+    _open(app)
+    app._make_threshold(95)(None)
+    assert app._engine is None
+    rotation.plist.unlink()
+    _close(app)
+    app.on_sync_tick(None)
+    assert _running(app)
+
+
+def test_refused_restart_then_daemon_gone_restarts_on_the_next_tick(rotation):
+    app = rotation(auto_switch_enabled=True, external_rotation_label=_LABEL)
+    first = app._engine
+    rotation.plist.write_text("x", encoding="utf-8")
+    _open(app)
+    app._restart_engine()  # stops, and the start is refused
+    assert first.stopped.is_set() and app._engine is None
+    rotation.plist.unlink()
+    _close(app)
+    app.on_sync_tick(None)
+    assert _running(app)
+
+
+def test_refused_after_build_then_daemon_gone_restarts_on_the_next_tick(rotation, monkeypatch):
+    class Slow(_FakeEngine):
+        landed = False
+
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            if not Slow.landed:
+                Slow.landed = True
+                rotation.plist.write_text("x", encoding="utf-8")
+
+    monkeypatch.setattr("claude_swap.autoswitch.AutoSwitchEngine", Slow)
+    app = rotation(auto_switch_enabled=False, external_rotation_label=_LABEL)
+    _open(app)
+    app.on_toggle_autoswitch(None)  # on; the plist lands while the engine is built
+    assert app._engine is None
+    rotation.plist.unlink()
+    _close(app)
+    app.on_sync_tick(None)
+    assert _running(app)
+
+
+def _mode_reads(monkeypatch, *answers):
+    """Make the app's plist stat answer ``answers`` in turn, then False for good.
+
+    Stands for a plist that vanishes between two reads of the mode.
+    """
+    queue = list(answers)
+    calls = []
+
+    def read(label, _agents):
+        calls.append(label)
+        return queue.pop(0) if queue else False
+
+    monkeypatch.setattr(menubar, "external_rotation_active", read)
+    return calls
+
+
+def test_start_refusal_decides_and_records_on_one_read(rotation, monkeypatch):
+    app = rotation(auto_switch_enabled=False, external_rotation_label=_LABEL)
+    app.settings.auto_switch_enabled = True
+    _mode_reads(monkeypatch, True)  # the plist is there for this read only
+    app._start_engine()
+    assert app._engine is None  # refused on that read
+    app.on_sync_tick(None)  # gone now: the recorded mode flips back
+    assert _running(app)
+
+
+def test_refusal_after_build_decides_and_records_on_one_read(rotation, monkeypatch):
+    app = rotation(auto_switch_enabled=False, external_rotation_label=_LABEL)
+    app.settings.auto_switch_enabled = True
+    _mode_reads(monkeypatch, False, True)  # absent at the first check, there after the build
+    app._start_engine()
+    assert app._engine is None
+    assert _FakeEngine.made[-1].stopped.is_set()
+    app.on_sync_tick(None)
+    assert _running(app)
+
+
+def test_refused_restart_decides_and_records_on_one_read(rotation, monkeypatch):
+    app = rotation(auto_switch_enabled=True, external_rotation_label=_LABEL)
+    first = app._engine
+    _mode_reads(monkeypatch, True)
+    app._restart_engine()
+    assert first.stopped.is_set() and app._engine is None
+    app.on_sync_tick(None)
+    assert _running(app)
+
+
+def test_leaving_the_mode_starts_exactly_one_engine(rotation):
+    rotation.plist.write_text("x", encoding="utf-8")
+    app = rotation(auto_switch_enabled=True, external_rotation_label=_LABEL)
+    assert _FakeEngine.made == []
+    rotation.plist.unlink()
+    app._start_engine()  # records the flip and starts; the flip must not start a second
+    assert len(_FakeEngine.made) == 1 and _running(app)
+    app.on_sync_tick(None)
+    app.rebuild_menu()
+    assert len(_FakeEngine.made) == 1
+
+
+def test_sync_tick_leaving_the_mode_starts_exactly_one_engine(rotation):
+    rotation.plist.write_text("x", encoding="utf-8")
+    app = rotation(auto_switch_enabled=True, external_rotation_label=_LABEL)
+    rotation.plist.unlink()
+    app.on_sync_tick(None)
+    app.on_sync_tick(None)
+    assert len(_FakeEngine.made) == 1 and _running(app)
+
+
+def test_the_mode_is_read_once_per_decision(rotation, monkeypatch):
+    app = rotation(auto_switch_enabled=True, external_rotation_label=_LABEL)
+    calls = _mode_reads(monkeypatch)
+    app.on_sync_tick(None)
+    assert len(calls) == 1
+    calls.clear()
+    app._restart_engine()  # one stop, one start: one read before the build, one after
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("press", ["toggle", "threshold"])
+def test_stale_item_decides_and_records_on_one_read(rotation, monkeypatch, press):
+    app = rotation(auto_switch_enabled=True, external_rotation_label=_LABEL)
+    first = app._engine
+    _mode_reads(monkeypatch, True)  # there for the item's read, gone after
+    _open(app)  # the redraw waits, so only the item's own read decides
+    if press == "toggle":
+        app.on_toggle_autoswitch(None)
+    else:
+        app._make_threshold(95)(None)
+    assert first.stopped.is_set()  # stopped on the read that saw the daemon
+    assert app.settings.auto_switch_enabled is True
+    _close(app)
+    app.on_sync_tick(None)
+    assert _running(app) and app._engine is not first

@@ -2666,3 +2666,131 @@ class TestFrameworkBuildWarning:
         # The symptom is that everything looks healthy, so say so.
         msg = menubar.framework_build_warning("Python", "uv", "26.6.2")
         assert "logs nothing" in msg
+
+
+# --- external rotation (a launchd daemon that rotates accounts itself) -----------
+
+def test_settings_round_trip_external_rotation_keys(tmp_path: Path):
+    defaults = menubar.MenuBarSettings()
+    assert (defaults.external_rotation_label, defaults.external_rotation_summary) == ("", "")
+    path = tmp_path / "menubar_settings.json"
+    original = menubar.MenuBarSettings(
+        external_rotation_label="com.example.rotate",
+        external_rotation_summary="cswap auto, 99.9%",
+    )
+    original.save(path)
+    assert menubar.MenuBarSettings.load(path) == original
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["external_rotation_label"] == "com.example.rotate"
+    assert saved["external_rotation_summary"] == "cswap auto, 99.9%"
+
+
+def test_settings_ignore_wrong_type_external_rotation_keys(tmp_path: Path):
+    path = tmp_path / "menubar_settings.json"
+    path.write_text(
+        json.dumps({"external_rotation_label": ["com.example.rotate"], "external_rotation_summary": 7,
+                    "auto_switch_enabled": True}),
+        encoding="utf-8",
+    )
+    s = menubar.MenuBarSettings.load(path)
+    assert (s.external_rotation_label, s.external_rotation_summary) == ("", "")
+    assert s.auto_switch_enabled is True  # a valid neighbour is kept
+
+
+@pytest.mark.parametrize("label", [
+    "com.example.rotate",
+    "com.example.cswap-rotate",
+    "local_rotate.v2",
+    "rotate",
+])
+def test_safe_launchd_label_accepts_plain_labels(label):
+    assert menubar.safe_launchd_label(label) is True
+
+
+@pytest.mark.parametrize("label", [
+    "",
+    "   ",
+    ".hidden",
+    "..",
+    "com..example",
+    "../escape",
+    "com/example",
+    "com\\example",
+    "/abs/path",
+    "com.example\n",
+    "com.example\x00",
+    "com.\x07example",
+    "com.example\u200b",  # invisible format character
+    "has space",
+    "x" * 300,  # longer than a file name may be
+    7,
+    None,
+])
+def test_safe_launchd_label_refuses_unsafe_labels(label):
+    assert menubar.safe_launchd_label(label) is False
+
+
+def test_external_rotation_active_needs_a_label(tmp_path: Path):
+    (tmp_path / ".plist").write_text("x", encoding="utf-8")
+    assert menubar.external_rotation_active("", tmp_path) is False
+
+
+def test_external_rotation_active_needs_the_plist(tmp_path: Path):
+    assert menubar.external_rotation_active("com.example.rotate", tmp_path) is False
+    assert menubar.external_rotation_active("com.example.rotate", tmp_path / "missing") is False
+
+
+def test_external_rotation_active_with_the_plist(tmp_path: Path):
+    (tmp_path / "com.example.rotate.plist").write_bytes(plistlib.dumps({"Label": "com.example.rotate"}))
+    assert menubar.external_rotation_active("com.example.rotate", tmp_path) is True
+    assert menubar.external_rotation_active("com.example.other", tmp_path) is False
+
+
+def test_external_rotation_active_refuses_a_directory_named_like_the_plist(tmp_path: Path):
+    (tmp_path / "com.example.rotate.plist").mkdir()
+    assert menubar.external_rotation_active("com.example.rotate", tmp_path) is False
+
+
+def test_external_rotation_active_refuses_an_unsafe_label_even_when_its_file_exists(tmp_path: Path):
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+    (tmp_path / "outside.plist").write_text("x", encoding="utf-8")
+    (agents / ".hidden.plist").write_text("x", encoding="utf-8")
+    assert menubar.external_rotation_active("../outside", agents) is False
+    assert menubar.external_rotation_active(".hidden", agents) is False
+
+
+def test_external_rotation_active_does_not_raise_on_an_unreadable_folder(tmp_path: Path, monkeypatch):
+    def denied(_self, *a, **k):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(Path, "stat", denied)
+    assert menubar.external_rotation_active("com.example.rotate", tmp_path) is False
+
+
+def test_default_launch_agents_dir_is_under_the_home(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    assert menubar.default_launch_agents_dir() == tmp_path / "Library" / "LaunchAgents"
+
+
+@pytest.mark.parametrize("summary, shown", [
+    ("", "Rotation: external daemon"),
+    ("   ", "Rotation: external daemon"),
+    ("\u200b\n\t", "Rotation: external daemon"),
+    ("cswap auto, 99.9%", "Rotation: cswap auto, 99.9%"),
+    ("  two\nlines\there  ", "Rotation: two lines here"),
+    ("a \u200b b", "Rotation: a b"),
+    ("\uff46\uff55\uff4c\uff4c", "Rotation: full"),  # compatibility forms folded, as an alias is
+])
+def test_external_rotation_text(summary, shown):
+    assert menubar.external_rotation_text(summary) == shown
+
+
+def test_external_rotation_text_is_bounded():
+    text = menubar.external_rotation_text("word " * 100)
+    body = text.removeprefix("Rotation: ")
+    assert len(body) == menubar.ROTATION_SUMMARY_MAX
+    assert body.endswith("\u2026")
+    assert "\n" not in text
+    exact = "y" * menubar.ROTATION_SUMMARY_MAX
+    assert menubar.external_rotation_text(exact) == f"Rotation: {exact}"  # at the limit: whole
