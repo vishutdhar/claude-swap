@@ -118,6 +118,10 @@ class MenuBarSettings:
     show_codex: bool = True  # the Codex block after the accounts; off stops every Codex read
     title_codex: bool = True  # append Codex's weekly pct to the title
     codex_alias: str = ""  # the Codex block's name; empty is "Codex" (display only)
+    # A launchd daemon that rotates accounts itself (``external_rotation_active``).
+    # While its plist is installed the menu bar never runs its own engine.
+    external_rotation_label: str = ""  # the daemon's launchd label; empty is none
+    external_rotation_summary: str = ""  # what it does, for the Settings menu (display only)
 
     @classmethod
     def load(cls, path: Path) -> "MenuBarSettings":
@@ -567,6 +571,61 @@ def codex_alias_name(text: str) -> str | None:
         return normalize_alias(text)
     except (TypeError, ValueError):
         return None
+
+
+ROTATION_SUMMARY_MAX = 60  # the longest daemon summary the Settings menu shows
+_LAUNCHD_LABEL_RE = re.compile(r"[A-Za-z0-9_.-]+")
+_LAUNCHD_LABEL_MAX = 249  # a file name is at most 255 bytes, and ".plist" takes 6
+
+
+def default_launch_agents_dir() -> Path:
+    """The per-user LaunchAgents folder, where an external rotation daemon's plist lives."""
+    return Path.home() / "Library" / "LaunchAgents"
+
+
+def safe_launchd_label(label: object) -> bool:
+    """Whether ``label`` is a plain launchd label that names one file safely.
+
+    The label becomes ``<label>.plist`` inside the LaunchAgents folder, so
+    it may hold only letters, digits, ``.``, ``_`` and ``-``: no path
+    separator, no control or invisible character, no space. A leading dot
+    (a hidden file) and ``..`` anywhere are refused as well.
+    """
+    if not isinstance(label, str) or not label or len(label) > _LAUNCHD_LABEL_MAX:
+        return False
+    if label.startswith(".") or ".." in label:
+        return False
+    return _LAUNCHD_LABEL_RE.fullmatch(label) is not None  # a "$" anchor would pass a final newline
+
+
+def external_rotation_active(label: str, launch_agents_dir: Path) -> bool:
+    """Whether an external daemon rotates accounts: a safe label whose plist exists.
+
+    A single stat, cheap enough for every menu rebuild. An empty or unsafe
+    label is off without touching the disk; a folder that cannot be read is
+    off too.
+    """
+    if not safe_launchd_label(label):
+        return False
+    try:
+        return (launch_agents_dir / f"{label}.plist").is_file()
+    except (OSError, ValueError):
+        return False
+
+
+def external_rotation_text(summary: str) -> str:
+    """The Settings menu line for the daemon: ``Rotation: <summary>``.
+
+    The summary is free text from the settings file, held to one line the
+    way an alias is cleaned: line breaks and tabs become spaces, invisible
+    characters are dropped, runs of spaces close up, and anything past
+    ``ROTATION_SUMMARY_MAX`` characters is cut with an ellipsis. Nothing
+    left reads "external daemon".
+    """
+    text = " ".join(clean_alias_text(" ".join(summary.split())).split())
+    if len(text) > ROTATION_SUMMARY_MAX:
+        text = text[: ROTATION_SUMMARY_MAX - 1].rstrip() + "\u2026"
+    return f"Rotation: {text or 'external daemon'}"
 
 
 def codex_title_segments(
@@ -1599,12 +1658,14 @@ def plain_text_entry(prompt) -> None:
         field.setAutomaticTextCompletionEnabled_(False)
 
 
-def create_app(switcher, codex_monitor=None):
+def create_app(switcher, codex_monitor=None, launch_agents_dir=None):
     """Build the menu bar app for ``switcher`` without starting its event loop.
 
     ``run`` starts it; tests drive the returned app directly (rebuilds, the
     sync tick, panel activation) with a fake switcher. ``codex_monitor``
-    replaces the Codex monitor (``default_codex_monitor``), for tests.
+    replaces the Codex monitor (``default_codex_monitor``), and
+    ``launch_agents_dir`` the folder an external rotation daemon's plist is
+    looked for in (``default_launch_agents_dir``), for tests.
     """
     import rumps
 
@@ -1614,6 +1675,7 @@ def create_app(switcher, codex_monitor=None):
 
     settings_path = switcher.backup_dir / "menubar_settings.json"
     log_path = switcher.backup_dir / "claude-swap.log"
+    agents_dir = launch_agents_dir if launch_agents_dir is not None else default_launch_agents_dir()
 
     class MenuBarApp(rumps.App):
         def __init__(self):
@@ -1637,6 +1699,10 @@ def create_app(switcher, codex_monitor=None):
             # Auto-switch engine (the same one `cswap auto` runs), hosted in a
             # background thread while enabled.
             self._engine = None
+            # An external daemon rotates accounts while its plist is installed
+            # (``external_rotation_active``): the engine stays off and Settings
+            # names the daemon. Read again on every rebuild.
+            self._external_rotation = False
             self._engine_events: list = []
             self._event_lock = threading.Lock()
             self._dashboard = DashboardLauncher(switcher._logger, switcher.backup_dir)
@@ -2089,8 +2155,12 @@ def create_app(switcher, codex_monitor=None):
 
         # ---- auto-switch engine ----------------------------------------------
         def _start_engine(self):
-            """Run the core AutoSwitchEngine (live) in a background thread."""
-            if self._engine is not None:
+            """Run the core AutoSwitchEngine (live) in a background thread.
+
+            Never while an external daemon rotates accounts: two switchers
+            with different thresholds would fight over the active account.
+            """
+            if self._engine is not None or self._rotation_is_external():
                 return
             try:
                 engine = AutoSwitchEngine(
@@ -2116,6 +2186,22 @@ def create_app(switcher, codex_monitor=None):
             if self._engine is not None:
                 self._engine.stop()
                 self._engine = None
+
+        def _rotation_is_external(self) -> bool:
+            return external_rotation_active(self.settings.external_rotation_label, agents_dir)
+
+        def _follow_external_rotation(self):
+            """Hand rotation to the external daemon while its plist is installed.
+
+            It appearing stops a running engine; it going starts the engine
+            again when "Auto-switch accounts" is on. ``auto_switch_enabled``
+            itself is never rewritten.
+            """
+            was, self._external_rotation = self._external_rotation, self._rotation_is_external()
+            if self._external_rotation:
+                self._stop_engine()
+            elif was and self.settings.auto_switch_enabled:
+                self._start_engine()
 
         def _restart_engine(self):
             """Apply changed core settings by restarting the running engine."""
@@ -2161,6 +2247,7 @@ def create_app(switcher, codex_monitor=None):
                 self._rebuild_pending = True
                 return
             self._rebuild_pending = False
+            self._follow_external_rotation()
             # Read once: a worker refresh can replace self.snapshot at any
             # moment, and every part of this menu must describe one snapshot.
             snap = self.snapshot
@@ -2507,6 +2594,14 @@ def create_app(switcher, codex_monitor=None):
                 choice.state = 1 if self.settings.refresh_interval == secs else 0
                 interval.add(choice)
             menu.add(interval)
+
+            if self._external_rotation:
+                # The daemon does the switching; a toggle or a threshold here
+                # would describe nothing that runs. A statement, not a control.
+                menu.add(rumps.MenuItem(
+                    external_rotation_text(self.settings.external_rotation_summary), callback=None
+                ))
+                return menu
 
             auto_item = rumps.MenuItem("Auto-switch accounts", callback=self.on_toggle_autoswitch)
             auto_item.state = 1 if self.settings.auto_switch_enabled else 0
@@ -2979,6 +3074,9 @@ def create_app(switcher, codex_monitor=None):
             return cb
 
         def on_toggle_autoswitch(self, _sender):
+            if self._rotation_is_external():
+                self.rebuild_menu()  # an item left from before the daemon: show its line
+                return
             self.settings.auto_switch_enabled = not self.settings.auto_switch_enabled
             self.settings.save(settings_path)
             if self.settings.auto_switch_enabled:
@@ -2989,6 +3087,9 @@ def create_app(switcher, codex_monitor=None):
 
         def _make_threshold(self, pct):
             def cb(_sender):
+                if self._rotation_is_external():
+                    self.rebuild_menu()  # the daemon keeps its own threshold
+                    return
                 try:
                     set_setting(self.switcher.backup_dir, "autoswitch.threshold", str(pct))
                 except Exception as e:

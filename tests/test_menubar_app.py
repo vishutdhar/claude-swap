@@ -2705,3 +2705,193 @@ def test_title_stays_ur_free_after_in_place_refresh(capp, codex, cshown, on_scre
     _close(capp)  # and after the full rebuild the close owes
     capp.on_sync_tick(None)
     assert capp.title == "⇄ a · 55% · Codex 56%"
+
+
+# --- external rotation: a launchd daemon rotates accounts, the menu bar stands back --
+
+import json  # noqa: E402
+
+_LABEL = "com.example.rotate"
+_NORMAL_SETTINGS = [
+    "Show account name in menu bar", "Title percentage", "Show model limits in title",
+    "Show usage bars", "Show names only", "Show Codex", "Codex in title", "Refresh interval",
+    "Auto-switch accounts", "Auto-switch threshold",
+]
+
+
+class _FakeEngine:
+    """Stands in for AutoSwitchEngine: records every start and stop, switches nothing."""
+
+    made: list = []
+
+    def __init__(self, switcher, settings, on_event, *, dry_run=False, **_kw):
+        self.stopped = threading.Event()
+        _FakeEngine.made.append(self)
+
+    def run_loop(self):
+        self.stopped.wait(10)
+
+    def stop(self):
+        self.stopped.set()
+
+
+@pytest.fixture
+def rotation(tmp_path, monkeypatch):
+    """Build the app over a temp LaunchAgents folder, with settings written first.
+
+    Returns ``make(**settings) -> app``; ``make.agents`` is the folder and
+    ``make.plist`` the daemon's plist path (absent until a test writes it).
+    """
+    monkeypatch.setattr(rumps.rumps, "application_support", lambda _name: str(tmp_path))
+    monkeypatch.setattr("claude_swap.snapshot_source.SnapshotSource", _NoFetch)
+    monkeypatch.setattr(rumps, "notification", lambda *a, **k: None)
+    monkeypatch.setattr(rumps, "alert", lambda *a, **k: 1)
+    _FakeEngine.made = []
+    monkeypatch.setattr("claude_swap.autoswitch.AutoSwitchEngine", _FakeEngine)
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+    built = []
+
+    def make(**settings):
+        (tmp_path / "menubar_settings.json").write_text(json.dumps(settings), encoding="utf-8")
+        app = menubar.create_app(_FakeSwitcher(tmp_path), launch_agents_dir=agents)
+        built.append(app)
+        _wait_idle(app)
+        return app
+
+    make.agents = agents
+    make.plist = agents / f"{_LABEL}.plist"
+    make.settings_file = tmp_path / "menubar_settings.json"
+    yield make
+    for app in built:
+        app.refresh_timer.stop()
+        app.sync_timer.stop()
+        app._stop_engine()
+
+
+def _settings_titles(app):
+    return [i.title() for i in _submenu(app, "Settings").itemArray()]
+
+
+def _settings_item(app, title):
+    return next(i for i in _submenu(app, "Settings").itemArray() if i.title() == title)
+
+
+def _running(app):
+    return app._engine is not None and not app._engine.stopped.is_set()
+
+
+def test_settings_menu_unchanged_without_a_label(rotation):
+    app = rotation()
+    app.rebuild_menu()
+    assert _settings_titles(app) == _NORMAL_SETTINGS
+    thresholds = [i.title() for i in _settings_item(app, "Auto-switch threshold").submenu().itemArray()]
+    assert thresholds == ["80%", "90%", "95%", "98%"]
+
+
+def test_settings_menu_unchanged_while_the_plist_is_missing(rotation):
+    app = rotation(external_rotation_label=_LABEL, external_rotation_summary="daemon")
+    app.rebuild_menu()
+    assert _settings_titles(app) == _NORMAL_SETTINGS
+
+
+def test_settings_menu_unchanged_for_an_unsafe_label(rotation):
+    (rotation.agents.parent / "outside.plist").write_text("x", encoding="utf-8")
+    app = rotation(external_rotation_label="../outside")
+    app.rebuild_menu()
+    assert _settings_titles(app) == _NORMAL_SETTINGS
+
+
+def test_settings_menu_names_the_daemon_instead_of_the_auto_switch_items(rotation):
+    rotation.plist.write_text("x", encoding="utf-8")
+    app = rotation(external_rotation_label=_LABEL, external_rotation_summary="cswap auto at 99.9%")
+    app.rebuild_menu()
+    assert _settings_titles(app) == [*_NORMAL_SETTINGS[:-2], "Rotation: cswap auto at 99.9%"]
+    item = _settings_item(app, "Rotation: cswap auto at 99.9%")
+    assert item.action() is None  # a statement, not a control
+    assert item.submenu() is None
+
+
+def test_settings_menu_names_an_unnamed_daemon(rotation):
+    rotation.plist.write_text("x", encoding="utf-8")
+    app = rotation(external_rotation_label=_LABEL, external_rotation_summary="  \n ")
+    app.rebuild_menu()
+    assert _settings_titles(app)[-1] == "Rotation: external daemon"
+
+
+def test_engine_never_starts_at_launch_under_the_daemon(rotation):
+    rotation.plist.write_text("x", encoding="utf-8")
+    app = rotation(auto_switch_enabled=True, external_rotation_label=_LABEL)
+    assert _FakeEngine.made == []
+    assert app._engine is None
+    assert app.settings.auto_switch_enabled is True  # overridden at run time only
+    assert json.loads(rotation.settings_file.read_text())["auto_switch_enabled"] is True
+
+
+def test_engine_starts_at_launch_without_the_daemon(rotation):
+    app = rotation(auto_switch_enabled=True, external_rotation_label=_LABEL)
+    assert len(_FakeEngine.made) == 1 and _running(app)
+
+
+def test_engine_stops_when_the_daemon_appears_and_returns_when_it_goes(rotation):
+    app = rotation(auto_switch_enabled=True, external_rotation_label=_LABEL, external_rotation_summary="d")
+    first = app._engine
+    assert _running(app)
+    before = rotation.settings_file.read_bytes()
+    rotation.plist.write_text("x", encoding="utf-8")
+    app.rebuild_menu()
+    assert first.stopped.is_set() and app._engine is None
+    assert _settings_titles(app)[-1] == "Rotation: d"
+    app.rebuild_menu()  # still there: nothing starts
+    assert len(_FakeEngine.made) == 1
+    assert rotation.settings_file.read_bytes() == before  # the file is never rewritten
+    rotation.plist.unlink()
+    app.rebuild_menu()
+    assert len(_FakeEngine.made) == 2 and _running(app) and app._engine is not first
+    assert _settings_titles(app) == _NORMAL_SETTINGS
+    assert _settings_item(app, "Auto-switch accounts").state() == 1
+
+
+def test_engine_stays_off_when_the_daemon_goes_and_the_toggle_is_off(rotation):
+    rotation.plist.write_text("x", encoding="utf-8")
+    app = rotation(auto_switch_enabled=False, external_rotation_label=_LABEL)
+    rotation.plist.unlink()
+    app.rebuild_menu()
+    assert _FakeEngine.made == [] and app._engine is None
+    assert _settings_titles(app) == _NORMAL_SETTINGS
+
+
+def test_restart_paths_never_start_the_engine_under_the_daemon(rotation, monkeypatch):
+    from claude_swap.settings import load_settings
+
+    app = rotation(auto_switch_enabled=True, external_rotation_label=_LABEL)
+    rotation.plist.write_text("x", encoding="utf-8")
+    app.rebuild_menu()
+    assert app._engine is None
+    threshold_before = load_settings(app.switcher.backup_dir).threshold
+    file_before = rotation.settings_file.read_bytes()
+    app._start_engine()
+    app._restart_engine()
+    app._make_threshold(80 if threshold_before != 80 else 95)(None)  # a stale threshold item
+    app.on_toggle_autoswitch(None)  # a stale toggle item
+    app.on_toggle_autoswitch(None)
+    assert len(_FakeEngine.made) == 1 and app._engine is None
+    assert load_settings(app.switcher.backup_dir).threshold == threshold_before
+    assert app.settings.auto_switch_enabled is True
+    assert rotation.settings_file.read_bytes() == file_before
+    assert _settings_titles(app)[-1] == "Rotation: external daemon"
+
+
+def test_rebuild_under_the_daemon_runs_no_process(rotation, monkeypatch):
+    import subprocess
+
+    rotation.plist.write_text("x", encoding="utf-8")
+    app = rotation(external_rotation_label=_LABEL)
+
+    def refuse(*a, **k):
+        raise AssertionError("the mode check must be a stat, not a process")
+
+    for name in ("run", "Popen", "check_output", "call", "check_call"):
+        monkeypatch.setattr(subprocess, name, refuse)
+    app.rebuild_menu()
+    assert _settings_titles(app)[-1] == "Rotation: external daemon"
