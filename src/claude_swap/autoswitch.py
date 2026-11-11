@@ -2527,7 +2527,9 @@ class AutoSwitchEngine:
                 number, json_output=True, proceed=self._may_switch
             )
             if result and result.get("reason") == SWITCH_ABANDONED:
-                return TickOutcome.NO_ACTION  # nothing changed: no event, no stamp
+                # The active account and the live login are as they were: no
+                # event, no stamp, no quarantine.
+                return TickOutcome.NO_ACTION
             if not result or not result.get("switched"):
                 self._emit(
                     NoSwitchEvent(

@@ -2167,10 +2167,11 @@ def create_app(switcher, codex_monitor=None, launch_agents_dir=None):
             """
             if self._engine is not None:
                 return
-            if self._rotation_is_external():
-                # Refused, and the refusal recorded where the mode lives, or
-                # the daemon going away again would never bring the engine back.
-                self._follow_external_rotation()
+            # Decided on the read that records the mode, or a plist gone again
+            # by a second read would leave the engine refused with the mode
+            # recorded off, and nothing would ever bring it back. This call is
+            # the start, so leaving the mode starts nothing more here.
+            if self._follow_external_rotation(start_on_leave=False):
                 return
             try:
                 engine = AutoSwitchEngine(
@@ -2184,11 +2185,10 @@ def create_app(switcher, codex_monitor=None, launch_agents_dir=None):
                 self.switcher._logger.warning("auto-switch engine failed to start: %s", e)
                 rumps.notification("claude-swap", "Auto-switch failed to start", str(e))
                 return
-            if self._rotation_is_external():
+            if self._follow_external_rotation(start_on_leave=False):
                 # Installed while the engine was built (settings and policy
                 # reads block); from here on the engine's own gate covers it.
                 engine.stop()
-                self._follow_external_rotation()
                 return
             self._engine = engine
             threading.Thread(target=self._run_engine, args=(engine,), daemon=True).start()
@@ -2204,9 +2204,6 @@ def create_app(switcher, codex_monitor=None, launch_agents_dir=None):
                 self._engine.stop()
                 self._engine = None
 
-        def _rotation_is_external(self) -> bool:
-            return external_rotation_active(self.settings.external_rotation_label, agents_dir)
-
         def _engine_gate(self):
             """The engine's ``may_act``: open unless the rotation daemon is installed.
 
@@ -2220,22 +2217,31 @@ def create_app(switcher, codex_monitor=None, launch_agents_dir=None):
                 return None
             return lambda: not external_rotation_active(label, agents_dir)
 
-        def _follow_external_rotation(self) -> bool:
-            """Hand rotation to the external daemon while its plist is installed.
+        def _follow_external_rotation(self, *, start_on_leave: bool = True) -> bool:
+            """Read the mode once, record it, act on it, and return it.
 
-            It appearing stops a running engine; it going starts the engine
-            again when "Auto-switch accounts" is on. ``auto_switch_enabled``
-            itself is never rewritten. The one place the mode is recorded:
-            anything that stops or refuses the engine on the mode goes through
-            here. A change marks the menu dirty so Settings is redrawn.
+            The app's only read of the mode (the engine thread's gate reads
+            on its own, and only ever holds the engine back). Every decision
+            that stops or refuses the engine on the mode is made on the
+            value returned here, never on a second read. The daemon
+            appearing stops a running engine; it going starts the engine
+            again when "Auto-switch accounts" is on, unless the caller is
+            ``_start_engine`` itself (``start_on_leave=False``), which keeps
+            the two from starting each other. ``auto_switch_enabled`` is
+            never rewritten. A change marks the menu dirty so Settings is
+            redrawn.
             """
-            was, self._external_rotation = self._external_rotation, self._rotation_is_external()
+            was = self._external_rotation
+            self._external_rotation = external_rotation_active(
+                self.settings.external_rotation_label, agents_dir
+            )
             if was != self._external_rotation:
                 self._dirty = True
             if self._external_rotation:
                 self._stop_engine()
-            elif was and self.settings.auto_switch_enabled:
+            elif was and start_on_leave and self.settings.auto_switch_enabled:
                 self._start_engine()
+            return self._external_rotation
 
         def _restart_engine(self):
             """Apply changed core settings by restarting the running engine."""
@@ -3108,9 +3114,8 @@ def create_app(switcher, codex_monitor=None, launch_agents_dir=None):
             return cb
 
         def on_toggle_autoswitch(self, _sender):
-            if self._rotation_is_external():
-                # An item left from before the daemon: stop now, redraw when it can.
-                self._follow_external_rotation()
+            if self._follow_external_rotation():
+                # An item left from before the daemon: stopped above, redrawn when it can.
                 self.rebuild_menu()
                 return
             self.settings.auto_switch_enabled = not self.settings.auto_switch_enabled
@@ -3123,9 +3128,8 @@ def create_app(switcher, codex_monitor=None, launch_agents_dir=None):
 
         def _make_threshold(self, pct):
             def cb(_sender):
-                if self._rotation_is_external():
-                    # The daemon keeps its own threshold: stop now, redraw when it can.
-                    self._follow_external_rotation()
+                if self._follow_external_rotation():
+                    # The daemon keeps its own threshold: stopped above, redrawn when it can.
                     self.rebuild_menu()
                     return
                 try:

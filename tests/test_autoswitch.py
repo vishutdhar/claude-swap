@@ -7365,7 +7365,8 @@ class TestMayActGate:
 
 class TestSwitchProceedCheck:
     """``switch_to(proceed=...)``: a last word, asked once every lock the switch
-    waits on is held and before anything is written.
+    waits on is held and before the live login is written. (What an
+    abandoned switch may leave behind is pinned in TestAbandonedSwitchContract.)
 
     The engine passes one that is closed once it is stopped or its gate
     closes, so a daemon installed while ``switch_to`` waits on the account
@@ -7442,14 +7443,18 @@ class TestSwitchProceedCheck:
         assert harness.active_number() == 2
 
     @pytest.mark.parametrize("which", ["account", "credentials", "config"])
-    def test_check_closing_while_a_lock_is_awaited_writes_nothing(self, harness, temp_home, which):
+    def test_check_closing_while_a_lock_is_awaited_leaves_every_file_as_it_was(
+        self, harness, temp_home, which
+    ):
+        # No migration or adoption is due in this store, so not even
+        # maintenance runs: every file stays as it was.
         gate = {"open": True}
         before = self._files(temp_home)
         with self._flip_inside(which, lambda: gate.update(open=False)):
             result = harness.switcher.switch_to("2", json_output=True, proceed=lambda: gate["open"])
         assert result["switched"] is False
         assert result["reason"] == "abandoned"
-        assert self._files(temp_home) == before  # no credential, config, sequence or backup write
+        assert self._files(temp_home) == before  # no credential, config, sequence or backup write here
         assert harness.active_number() == 1
         # Every lock was let go: an ordinary switch goes through at once.
         assert harness.switcher.switch_to("2", json_output=True)["switched"] is True
@@ -7542,3 +7547,128 @@ class TestSwitchProceedCheck:
         assert outcome is TickOutcome.NO_ACTION
         assert callable(switch.call_args.kwargs["proceed"])
         self._no_switch_trace(harness)
+
+
+class TestAbandonedSwitchContract:
+    """What an abandoned switch may and may not leave behind.
+
+    It never changes which account is active and never writes the live
+    credential, the live config, or the active marker in sequence.json.
+    Maintenance that is right whether or not the switch happens may
+    persist: the one-way org-field migration, and the adoption of the
+    target's own newer session credential into its own backup.
+    """
+
+    _ROTATED = json.dumps({
+        "claudeAiOauth": {
+            "accessToken": "sk-2-rotated",
+            "refreshToken": "rt-2-rotated",
+            "expiresAt": 9999999999999,
+        }
+    })
+
+    def _seed_adoptable_profile(self, harness) -> Path:
+        """Account 2's exited session profile, a newer generation than its backup."""
+        session_dir = harness.switcher._session_dir("2", "b@example.com")
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / ".credentials.json").write_text(self._ROTATED)
+        (session_dir / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "b@example.com",
+                "accountUuid": "uuid-2",
+                "organizationUuid": "",
+            },
+        }))
+        return session_dir
+
+    @staticmethod
+    def _live(home: Path) -> tuple[bytes, bytes]:
+        return (
+            (home / ".claude" / ".credentials.json").read_bytes(),
+            (home / ".claude.json").read_bytes(),
+        )
+
+    def _changed(self, before: dict, after: dict) -> set[str]:
+        return {p for p in before.keys() | after.keys() if before.get(p) != after.get(p)}
+
+    def test_the_profile_is_adopted_when_the_switch_goes_through(self, harness):
+        self._seed_adoptable_profile(harness)
+        result = harness.switcher.switch_to("2", json_output=True, proceed=lambda: True)
+        assert result["switched"] is True
+        assert harness.switcher.read_account_credentials("2", "b@example.com") == self._ROTATED
+
+    def test_check_closing_during_the_adoption_lock_wait_keeps_only_the_adoption(
+        self, harness, temp_home
+    ):
+        import sys as _sys
+
+        import claude_swap.switcher as sw
+
+        self._seed_adoptable_profile(harness)
+        gate = {"open": True}
+        real = sw.FileLock
+
+        class Waited:
+            def __init__(self, *a, **k):
+                self._lock = real(*a, **k)
+                self._flip = _sys._getframe(1).f_code.co_name == "_adopt_session_credential"
+
+            def __enter__(self):
+                held = self._lock.__enter__()
+                if self._flip:
+                    gate["open"] = False  # closed while the adoption waited its turn
+                return held
+
+            def __exit__(self, *exc):
+                return self._lock.__exit__(*exc)
+
+            def __getattr__(self, name):
+                return getattr(self._lock, name)
+
+        files = TestSwitchProceedCheck._files
+        before, live = files(temp_home), self._live(temp_home)
+        sequence = harness.switcher.sequence_file.read_bytes()
+        with patch.object(sw, "FileLock", Waited), \
+             patch.object(harness.switcher, "_prefetch_live_identity",
+                          wraps=harness.switcher._prefetch_live_identity) as identity:
+            result = harness.switcher.switch_to("2", json_output=True, proceed=lambda: gate["open"])
+        assert result["reason"] == "abandoned" and result["switched"] is False
+        identity.assert_not_called()  # stopped before the network identity lookup
+        assert harness.active_number() == 1
+        assert self._live(temp_home) == live  # live credential and live config, byte for byte
+        assert harness.switcher.sequence_file.read_bytes() == sequence  # active marker untouched
+        # The adopted backup (and the previous generation it retains) is all that changed.
+        assert harness.switcher.read_account_credentials("2", "b@example.com") == self._ROTATED
+        backup = ".claude-swap-backup/credentials/.creds-2-b@example.com.enc"
+        assert self._changed(before, files(temp_home)) == {backup, backup + ".prev"}
+
+    def test_check_closing_after_the_org_migration_keeps_only_the_migration(
+        self, harness, temp_home
+    ):
+        data = harness.switcher._get_sequence_data()
+        for acc in data["accounts"].values():
+            acc.pop("organizationUuid", None)
+            acc.pop("organizationName", None)
+        harness.switcher._write_json(harness.switcher.sequence_file, data)
+        gate = {"open": True}
+        real_migrate = harness.switcher._migrate_org_fields
+
+        def migrate():
+            real_migrate()
+            gate["open"] = False  # closed right after the migration wrote
+
+        files = TestSwitchProceedCheck._files
+        before, live = files(temp_home), self._live(temp_home)
+        with patch.object(harness.switcher, "_migrate_org_fields", side_effect=migrate):
+            result = harness.switcher.switch_to("2", json_output=True, proceed=lambda: gate["open"])
+        assert result["reason"] == "abandoned" and result["switched"] is False
+        assert harness.active_number() == 1
+        assert self._live(temp_home) == live
+        sequence = str(harness.switcher.sequence_file.relative_to(temp_home))
+        assert self._changed(before, files(temp_home)) == {sequence}  # the migrated file only
+        after = harness.switcher._get_sequence_data()
+        assert after["activeAccountNumber"] == data["activeAccountNumber"]
+        assert after["sequence"] == data["sequence"]
+        for num, acc in after["accounts"].items():
+            assert "organizationUuid" in acc and "organizationName" in acc
+            assert {k: v for k, v in acc.items() if not k.startswith("organization")} == data["accounts"][num]

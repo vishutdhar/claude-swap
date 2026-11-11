@@ -117,9 +117,12 @@ KEYRING_SERVICE = "claude-code"
 # on profile endpoints. Matches Claude Code's CLAUDE_CODE_OAUTH_TOKEN path.
 SETUP_TOKEN_SCOPES = ("user:inference",)
 
-# The ``reason`` of a switch its caller's ``proceed`` check called off before
-# anything was written (``switch_to``). Distinct from "already-active": the
-# switch was wanted, and nothing about the accounts says it is done.
+# The ``reason`` of a switch its caller's ``proceed`` check called off
+# (``switch_to``). The active account, the live credential, the live config
+# and the active marker in sequence.json are as they were; maintenance done
+# on the way (the org-field migration, a session credential adopted into the
+# target's own backup) may have persisted. Distinct from "already-active":
+# the switch was wanted, and nothing about the accounts says it is done.
 SWITCH_ABANDONED = "abandoned"
 
 
@@ -6768,12 +6771,19 @@ class ClaudeAccountSwitcher:
         both the already-active no-op guard and the backup-current step —
         the recovery path for a live login gone stale (e.g. after --import).
 
-        ``proceed``, when given, may call the switch off: it is asked before
-        each write the switch can make outside its locks, and again once
-        every lock is held, before the first write under them. Closed (or
-        raising), nothing is written, the locks are let go as usual, and the
-        result is a ``switched: false`` no-op with reason ``abandoned``
-        (``None`` without ``json_output``). ``None`` never calls it off.
+        ``proceed``, when given, may call the switch off. It is asked before
+        each maintenance write made outside the switch's locks (the org-field
+        migration here, the session credential adoption in
+        ``_perform_switch``), right after the adoption, and finally once every
+        lock is held, before the first write under them. Closed (or raising),
+        the locks are let go as usual and the result is a ``switched: false``
+        no-op with reason ``abandoned`` (``None`` without ``json_output``).
+        An abandoned switch never changes which account is active and never
+        writes the live credential, the live config, or the active marker in
+        sequence.json. Maintenance that already ran may persist: it is right
+        whether or not the switch happens (a one-way schema backfill, and the
+        target's own newer credential stored in its own backup), and undoing
+        it would lose data. ``None`` never calls it off.
         """
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
@@ -6897,13 +6907,17 @@ class ClaudeAccountSwitcher:
         return result
 
     def _switch_abandoned(self, json_output: bool) -> dict | None:
-        """The result of a switch its ``proceed`` called off: nothing changed."""
+        """The result of a switch its ``proceed`` called off.
+
+        The active account and the live login are as they were; maintenance
+        done on the way may have persisted (see ``SWITCH_ABANDONED``).
+        """
         if not json_output:
             return None
         return self._switch_noop(
             strategy="direct",
             reason=SWITCH_ABANDONED,
-            message="Switch called off before anything was changed",
+            message="Switch called off before the active account changed",
         )
 
     def _live_matches_slot_backup(self, slot: str, email: str) -> bool:
@@ -7298,9 +7312,13 @@ class ClaudeAccountSwitcher:
         callbacks inside list_accounts() can re-acquire it.
 
         ``proceed`` (see ``switch_to``) is asked before the session adoption,
-        the one write made before the switch's locks, and again once all
-        three locks are held, before the first write under them. Closed, the
-        switch returns ``None`` having written nothing.
+        the one write made before the switch's locks; again right after it,
+        which spares the identity lookup's network call; and finally once
+        all three locks are held, before the first write under them, which
+        is the check that guards the live login. Closed, the switch returns
+        ``None``: the active account, the live credential, the live config
+        and the active marker are untouched, and an adoption that already
+        ran stays (it stored the target's own newer credential).
         """
         from claude_swap.session import scan_live_sessions
 
@@ -7384,6 +7402,12 @@ class ClaudeAccountSwitcher:
                         "identity is rewritten, or switch to another account."
                     )
 
+        # Called off while the session scan or adoption ran: stop before the
+        # identity lookup's network call. The check under the locks below is
+        # still the one that guards the live login.
+        if not _may_proceed(proceed):
+            return None
+
         # Pre-lock identity resolution (may hit the network — must happen
         # before the locks). Callers that already resolved (self-switch
         # reconciliation) pass it in; force activation never backs up the
@@ -7404,8 +7428,9 @@ class ClaudeAccountSwitcher:
         # interleaving with Claude Code's own config writes. Everything under
         # here is local I/O — no network while locks are held.
         with FileLock(self.lock_file), claude_credentials_lock(), claude_config_lock():
-            # Every lock this switch waits on is held, and nothing is written
-            # yet: the last moment a caller can still call it off cleanly.
+            # Every lock this switch waits on is held, and nothing under them
+            # is written yet: the last moment a caller can call it off with
+            # the live login untouched.
             if not _may_proceed(proceed):
                 return None
             data = self._get_sequence_data()

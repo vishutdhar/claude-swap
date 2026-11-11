@@ -3059,3 +3059,98 @@ def test_refused_after_build_then_daemon_gone_restarts_on_the_next_tick(rotation
     _close(app)
     app.on_sync_tick(None)
     assert _running(app)
+
+
+def _mode_reads(monkeypatch, *answers):
+    """Make the app's plist stat answer ``answers`` in turn, then False for good.
+
+    Stands for a plist that vanishes between two reads of the mode.
+    """
+    queue = list(answers)
+    calls = []
+
+    def read(label, _agents):
+        calls.append(label)
+        return queue.pop(0) if queue else False
+
+    monkeypatch.setattr(menubar, "external_rotation_active", read)
+    return calls
+
+
+def test_start_refusal_decides_and_records_on_one_read(rotation, monkeypatch):
+    app = rotation(auto_switch_enabled=False, external_rotation_label=_LABEL)
+    app.settings.auto_switch_enabled = True
+    _mode_reads(monkeypatch, True)  # the plist is there for this read only
+    app._start_engine()
+    assert app._engine is None  # refused on that read
+    app.on_sync_tick(None)  # gone now: the recorded mode flips back
+    assert _running(app)
+
+
+def test_refusal_after_build_decides_and_records_on_one_read(rotation, monkeypatch):
+    app = rotation(auto_switch_enabled=False, external_rotation_label=_LABEL)
+    app.settings.auto_switch_enabled = True
+    _mode_reads(monkeypatch, False, True)  # absent at the first check, there after the build
+    app._start_engine()
+    assert app._engine is None
+    assert _FakeEngine.made[-1].stopped.is_set()
+    app.on_sync_tick(None)
+    assert _running(app)
+
+
+def test_refused_restart_decides_and_records_on_one_read(rotation, monkeypatch):
+    app = rotation(auto_switch_enabled=True, external_rotation_label=_LABEL)
+    first = app._engine
+    _mode_reads(monkeypatch, True)
+    app._restart_engine()
+    assert first.stopped.is_set() and app._engine is None
+    app.on_sync_tick(None)
+    assert _running(app)
+
+
+def test_leaving_the_mode_starts_exactly_one_engine(rotation):
+    rotation.plist.write_text("x", encoding="utf-8")
+    app = rotation(auto_switch_enabled=True, external_rotation_label=_LABEL)
+    assert _FakeEngine.made == []
+    rotation.plist.unlink()
+    app._start_engine()  # records the flip and starts; the flip must not start a second
+    assert len(_FakeEngine.made) == 1 and _running(app)
+    app.on_sync_tick(None)
+    app.rebuild_menu()
+    assert len(_FakeEngine.made) == 1
+
+
+def test_sync_tick_leaving_the_mode_starts_exactly_one_engine(rotation):
+    rotation.plist.write_text("x", encoding="utf-8")
+    app = rotation(auto_switch_enabled=True, external_rotation_label=_LABEL)
+    rotation.plist.unlink()
+    app.on_sync_tick(None)
+    app.on_sync_tick(None)
+    assert len(_FakeEngine.made) == 1 and _running(app)
+
+
+def test_the_mode_is_read_once_per_decision(rotation, monkeypatch):
+    app = rotation(auto_switch_enabled=True, external_rotation_label=_LABEL)
+    calls = _mode_reads(monkeypatch)
+    app.on_sync_tick(None)
+    assert len(calls) == 1
+    calls.clear()
+    app._restart_engine()  # one stop, one start: one read before the build, one after
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("press", ["toggle", "threshold"])
+def test_stale_item_decides_and_records_on_one_read(rotation, monkeypatch, press):
+    app = rotation(auto_switch_enabled=True, external_rotation_label=_LABEL)
+    first = app._engine
+    _mode_reads(monkeypatch, True)  # there for the item's read, gone after
+    _open(app)  # the redraw waits, so only the item's own read decides
+    if press == "toggle":
+        app.on_toggle_autoswitch(None)
+    else:
+        app._make_threshold(95)(None)
+    assert first.stopped.is_set()  # stopped on the read that saw the daemon
+    assert app.settings.auto_switch_enabled is True
+    _close(app)
+    app.on_sync_tick(None)
+    assert _running(app) and app._engine is not first
